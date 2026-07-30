@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 
 use wgpu::util::DeviceExt;
 
-use crate::configuration::Configuration;
+use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::state::State;
 
@@ -146,8 +146,16 @@ impl GpuChain {
         batch: usize,
     ) -> Self {
         assert!(batch > 0, "batch size must be positive");
+        // The shader indexes the neighbor table by site, so a link field would
+        // be silently misread rather than rejected; the cell kind is what makes
+        // that checkable at all.
         assert_eq!(
-            start.n_sites(),
+            start.cell(),
+            Cell::Site,
+            "the GPU checkerboard updates sites, so the start must be a site field"
+        );
+        assert_eq!(
+            start.n_vars(),
             lattice.n_sites(),
             "start configuration and lattice disagree on site count"
         );
@@ -168,7 +176,7 @@ impl GpuChain {
         let spins_init: Vec<u32> = start.variables().iter().map(|s| s.index() as u32).collect();
         let mut nbrs: Vec<u32> = Vec::with_capacity(n_sites * 4);
         for site in 0..n_sites {
-            for &nb in lattice.neighbors(site) {
+            for &nb in lattice.site_neighbors(site) {
                 nbrs.push(nb as u32);
             }
         }
@@ -361,7 +369,7 @@ impl GpuChain {
 
         for k in 0..self.batch {
             let chunk = &words[k * n..(k + 1) * n];
-            let mut cfg = Configuration::<2>::cold(&self.lattice);
+            let mut cfg = Configuration::<2>::cold(&self.lattice, Cell::Site);
             for (site, &v) in chunk.iter().enumerate() {
                 cfg.poke(
                     site,
@@ -444,7 +452,7 @@ mod tests {
         };
         let lat = Lattice::new([4, 4]);
         let mut rng = RandRng::seed_from_u64(0);
-        let start = Configuration::<2>::hot(&lat, &mut rng);
+        let start = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
         let mut chain = GpuChain::new(gpu, &lat, 1.0, 0.0, 0.5, 7, &start, 0, 1);
         let got = chain.next().expect("open-ended stream yields");
@@ -475,7 +483,7 @@ mod tests {
             use crate::updater::Checkerboard;
             let lat = Lattice::new(shape);
             let mut rng = RandRng::seed_from_u64(11);
-            let mut cfg = Configuration::<2>::hot(&lat, &mut rng);
+            let mut cfg = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
             let updater = Checkerboard;
             let mut chain = Chain::new(
                 &mut cfg,
@@ -495,7 +503,7 @@ mod tests {
         let (e_gpu, m_gpu) = {
             let lat = Lattice::new(shape);
             let mut rng = RandRng::seed_from_u64(22);
-            let start = Configuration::<2>::hot(&lat, &mut rng);
+            let start = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
             let mut chain = GpuChain::new(gpu, &lat, j, h, beta, 12345, &start, sweeps_between, 64);
             chain.advance(thermalize);
             let samples: Vec<_> = chain.take(n).map(|c| measure(&model, &lat, &c)).collect();

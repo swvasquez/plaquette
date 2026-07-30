@@ -13,3 +13,27 @@ rand_pcg = "0.10.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 wgpu = "26.0.1"
+
+# Examples are grouped by model, one directory per model, so that each run
+# config sits beside the example that reads it — `run.toml` and `gpu.toml` say
+# nothing about which model they configure, and the directory does.
+#
+# Cargo only discovers `examples/*.rs` and `examples/*/main.rs` on its own, and
+# the Ising directory holds three examples rather than one, so each is named
+# here. The example names are unchanged: `cargo run --example ising` still works.
+
+[[example]]
+name = "ising"
+path = "examples/ising/ising.rs"
+
+[[example]]
+name = "checkerboard"
+path = "examples/ising/checkerboard.rs"
+
+[[example]]
+name = "bench"
+path = "examples/ising/bench.rs"
+
+[[example]]
+name = "gauge"
+path = "examples/gauge/gauge.rs"

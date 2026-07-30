@@ -18,7 +18,11 @@
 //! [`binder_cumulant`]) build their moment feature columns and hand them to
 //! `jackknife_features`, which forms each leave-one-block-out estimate as
 //! `total − block_b` in O(1) — moments are additive over blocks, so the whole
-//! jackknife is one O(N) pass rather than a re-scan per block.
+//! jackknife is one O(N) pass rather than a re-scan per block. [`creutz_ratio`]
+//! is derived for the same reason without being a fluctuation: it is a nonlinear
+//! function of four separate ensemble means, so its error has to be propagated
+//! through that function rather than averaged, which is exactly what the
+//! jackknife does.
 
 /// The reduction of one scalar series: a mean and its autocorrelation-corrected
 /// error, with the diagnostics that say whether that error can be trusted.
@@ -336,6 +340,61 @@ pub fn binder_cumulant(magnetizations: &[f64]) -> Derived {
     let block_len = block_len_for(&[&m_squared, &m_fourth]);
     jackknife_features(&[&m_squared, &m_fourth], block_len, |m| {
         1.0 - m[1] / (3.0 * m[0] * m[0])
+    })
+}
+
+/// Creutz ratio `chi(R,T)` — the string tension read off four adjacent Wilson
+/// loops, one series per loop size.
+///
+/// The logarithm of a Wilson loop average splits into an area term, a perimeter
+/// self-energy term, and a constant,
+/// `−log⟨W(R,T)⟩ = sigma·R·T + mu·(R+T) + c`, and only the first of the three is
+/// the string tension. The 2×2 combination
+///
+/// ```text
+/// chi(R,T) = −log[ ⟨W(R,T)⟩·⟨W(R−1,T−1)⟩ / ( ⟨W(R−1,T)⟩·⟨W(R,T−1)⟩ ) ]
+/// ```
+///
+/// cancels the other two exactly — the perimeters sum to `(R+T) + (R+T−2) −
+/// (R+T−1) − (R+T−1) = 0` and the constants cancel in pairs — while the areas
+/// leave `R·T + (R−1)(T−1) − (R−1)T − R(T−1) = 1`, so what is left is `sigma`
+/// plus whatever short-distance corrections the loops are still small enough to
+/// carry. Those corrections die out as the loops grow, which is why `chi` is
+/// reported per `(R,T)`: reading a plateau off the table is the caller's
+/// judgement, not this function's.
+///
+/// The four arguments are the series for `(R,T)`, `(R−1,T−1)`, `(R−1,T)` and
+/// `(R,T−1)` in that order, sample-aligned and equally long — they come from the
+/// same chain, and the jackknife leaves out the same block of *configurations*
+/// from all four at once, which is what keeps their shared fluctuations
+/// correlated in the error rather than adding in quadrature. A trivial side
+/// (`R−1 = 0`) is the constant `1.0` series, so `chi(1,1)` reduces to
+/// `−log⟨W(1,1)⟩`, the mean plaquette.
+///
+/// This is not a mean of anything measured per configuration but a nonlinear
+/// function of four means, so the four raw series are the features directly. No
+/// centering: Wilson averages are positive and of similar magnitude in the
+/// confined phase, so the ratio is well-conditioned, as in [`binder_cumulant`].
+/// When the ratio is not a positive finite number — a near-deconfined or simply
+/// too-noisy run, where a loop average can wander to zero or through it — the
+/// logarithm has no value to give and the estimator returns `NaN` rather than a
+/// clamped stand-in. That is the honest report that `chi` could not be resolved
+/// at this loop size, and it propagates: a single refusing leave-out block makes
+/// `stderr` `NaN` too.
+pub fn creutz_ratio(w_rt: &[f64], w_r1t1: &[f64], w_r1t: &[f64], w_rt1: &[f64]) -> Derived {
+    debug_assert!(
+        [w_r1t1, w_r1t, w_rt1].iter().all(|s| s.len() == w_rt.len()),
+        "the four Wilson series must come from the same chain, sample for sample"
+    );
+
+    let block_len = block_len_for(&[w_rt, w_r1t1, w_r1t, w_rt1]);
+    jackknife_features(&[w_rt, w_r1t1, w_r1t, w_rt1], block_len, |m| {
+        let ratio = m[0] * m[1] / (m[2] * m[3]);
+        if ratio > 0.0 && ratio.is_finite() {
+            -ratio.ln()
+        } else {
+            f64::NAN
+        }
     })
 }
 
@@ -719,6 +778,103 @@ mod tests {
         let mags = vec![2.0; 100];
         let d = binder_cumulant(&mags);
         assert!((d.value - 2.0 / 3.0).abs() < 1e-9, "U_4 = {}", d.value);
+    }
+
+    #[test]
+    fn creutz_reproduces_the_exact_two_dimensional_string_tension() {
+        // In two dimensions <W(R,T)> = tanh(beta)^(R*T) exactly, and the Creutz
+        // combination of areas collapses to 1 for every R,T — so chi must come
+        // back as -log(tanh beta) at *any* loop size, not just asymptotically.
+        // Constant series have no jackknife scatter, so the error must vanish too.
+        // beta = atanh(1/2), written through tanh(beta) directly: a power of two
+        // keeps every loop average exactly constant in floating point, so the
+        // jackknife really does see zero scatter. A constant the sample mean
+        // cannot reproduce to the last bit reads as a perfectly correlated series
+        // instead, which would swallow the whole run into one block.
+        let tanh_beta: f64 = 0.5;
+        let w = |r: u32, t: u32| vec![tanh_beta.powi((r * t) as i32); 400];
+        let expected = -tanh_beta.ln();
+
+        for (r, t) in [(2, 2), (3, 2), (5, 4)] {
+            let d = creutz_ratio(&w(r, t), &w(r - 1, t - 1), &w(r - 1, t), &w(r, t - 1));
+            assert!(
+                (d.value - expected).abs() < 1e-12,
+                "chi({r},{t}) = {}, want {expected}",
+                d.value
+            );
+            assert!(d.stderr < 1e-12, "stderr = {}", d.stderr);
+            assert_eq!(d.n_blocks, 400);
+        }
+    }
+
+    #[test]
+    fn creutz_at_the_smallest_loop_is_minus_log_the_mean_plaquette() {
+        // R = T = 1 puts three of the four loops on the trivial `1.0` anchor that
+        // `wilson_rectangles` keeps in row and column zero, so the whole ratio is
+        // the (1,1) loop alone and chi(1,1) = -log<W(1,1)>.
+        let w11: Vec<f64> = (0..600).map(|i| 0.72 + 0.05 * base_value(i)).collect();
+        let ones = vec![1.0; 600];
+
+        let d = creutz_ratio(&w11, &ones, &ones, &ones);
+        let expected = -sample_mean(&w11).ln();
+        assert!(
+            (d.value - expected).abs() < 1e-12,
+            "chi(1,1) = {}, want {expected}",
+            d.value
+        );
+        // A fluctuating loop must carry a real error bar, unlike the constant
+        // series above.
+        assert!(d.stderr > 0.0, "stderr = {}", d.stderr);
+        assert!(d.is_reliable(), "n_blocks = {}", d.n_blocks);
+    }
+
+    #[test]
+    fn creutz_refuses_a_non_positive_ratio() {
+        // A loop average that has wandered negative — a too-noisy or
+        // near-deconfined run — leaves the logarithm nothing to take. The refusal
+        // is NaN rather than a clamp, and it reaches the error bar as well, since
+        // every leave-out block inherits the same sign.
+        let negative: Vec<f64> = (0..300).map(|i| -0.3 + 0.01 * base_value(i)).collect();
+        let ones = vec![1.0; 300];
+
+        let d = creutz_ratio(&negative, &ones, &ones, &ones);
+        assert!(d.value.is_nan(), "value = {}", d.value);
+        assert!(d.stderr.is_nan(), "stderr = {}", d.stderr);
+
+        // A zero in the denominator is the same refusal: the ratio is not finite.
+        let zeros = vec![0.0; 300];
+        let d = creutz_ratio(&ones, &ones, &zeros, &ones);
+        assert!(d.value.is_nan(), "value = {}", d.value);
+    }
+
+    #[test]
+    fn creutz_refuses_on_too_short_series() {
+        // The inherited too-few-blocks refusal: one sample cannot show a scatter,
+        // so the ratio still comes back but the error is NaN.
+        let one = [0.5];
+        let unit = [1.0];
+        let d = creutz_ratio(&one, &unit, &unit, &unit);
+        assert!(d.n_blocks < 2, "n_blocks = {}", d.n_blocks);
+        assert!(d.stderr.is_nan(), "stderr = {}", d.stderr);
+        assert!(
+            (d.value - -0.5f64.ln()).abs() < 1e-12,
+            "value = {}",
+            d.value
+        );
+    }
+
+    #[test]
+    fn creutz_blocks_on_the_slowest_of_its_four_series() {
+        // The combination decorrelates only as fast as its slowest ingredient, and
+        // the slow one here is a single corner of the 2x2 — blocking on any of the
+        // other three would leave far more blocks than the error can support.
+        let fast: Vec<f64> = (0..2048).map(|i| 0.8 + 0.02 * base_value(i)).collect();
+        let slow: Vec<f64> = (0..2048).map(|i| 0.6 + 0.02 * base_value(i / 16)).collect();
+
+        let expected = ((2.0 * reduce(&slow).tau_int).ceil() as usize).max(1);
+        let d = creutz_ratio(&fast, &fast, &slow, &fast);
+        assert_eq!(d.n_blocks, 2048 / expected);
+        assert!(d.n_blocks < 2048 / 4, "n_blocks = {}", d.n_blocks);
     }
 
     #[test]

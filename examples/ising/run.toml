@@ -1,6 +1,6 @@
 # A single 2D Ising run. Edit and re-run — no recompile needed:
 #
-#     cargo run --example ising -- examples/run.toml
+#     cargo run --example ising -- examples/ising/run.toml
 #
 # Note that this comment does not survive a round-trip: serde carries data, not
 # formatting. Anything that must travel with the run's provenance record goes in

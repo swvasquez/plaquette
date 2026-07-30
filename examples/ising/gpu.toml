@@ -1,6 +1,6 @@
 # GPU checkerboard run:
 #
-#     cargo run --release --example ising -- examples/gpu.toml
+#     cargo run --release --example ising -- examples/ising/gpu.toml
 #
 # Same interface as the CPU runs — only `updater` changes. A larger lattice than
 # the CPU examples, since the GPU pays off at scale (crossover is near L = 64).

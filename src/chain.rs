@@ -19,7 +19,7 @@
 //! not something you assume.
 //!
 //! The cost is that the invariant now lives in a convention rather than the
-//! type. [`Sampler`](crate::sampler::Sampler) is the blessed path; reach for
+//! type. [`IsingSampler`](crate::ising_sampler::IsingSampler) is the blessed path; reach for
 //! `Chain` directly only when doing the phasing yourself.
 //! [`advance`](Chain::advance) is the discarding form and allocates nothing;
 //! pulling warmup configs through the iterator instead is how you keep the
@@ -41,14 +41,14 @@
 //! callers bound a run with `.take(n)`.
 //!
 //! ```
-//! # use plaquette::{Lattice, Configuration, Metropolis, measure};
+//! # use plaquette::{Cell, Lattice, Configuration, Metropolis, measure};
 //! # use plaquette::model::Ising;
 //! # use plaquette::rng::RandRng;
 //! # use plaquette::chain::Chain;
 //! # let lat = Lattice::new([8, 8]);
 //! # let model = Ising::new(1.0, 0.0);
 //! # let mut rng = RandRng::seed_from_u64(0);
-//! # let mut config = Configuration::<2>::hot(&lat, &mut rng);
+//! # let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 //! # let (beta, thermalize, sweeps_between) = (1.0, 10, 2);
 //! let updater = Metropolis;
 //! let mut chain = Chain::new(&mut config, &lat, &model, &updater, beta, &mut rng, sweeps_between);
@@ -189,18 +189,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configuration::Cell;
     use crate::model::Ising;
     use crate::observables::{self, Sample};
     use crate::rng::RandRng;
     use crate::updater::Metropolis;
-    use std::cell::Cell;
 
     /// An [`Updater`] that does nothing but count the sweeps it is asked to run.
     /// Its `sweep` is the whole implementation — the trait requires nothing else.
     /// The `Cell` gives interior mutability under the trait's `&self`, and reading
     /// it coexists with the chain's own `&updater`.
     struct CountingUpdater {
-        sweeps: Cell<usize>,
+        sweeps: std::cell::Cell<usize>,
     }
 
     impl<const D: usize> Updater<2, D> for CountingUpdater {
@@ -223,9 +223,9 @@ mod tests {
     fn constructs_without_sweeping_and_decorrelates_each_next() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.0);
-        let mut config = Configuration::<2>::cold(&lat);
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site);
         let updater = CountingUpdater {
-            sweeps: Cell::new(0),
+            sweeps: std::cell::Cell::new(0),
         };
         let mut rng = RandRng::seed_from_u64(0);
 
@@ -253,9 +253,9 @@ mod tests {
     fn take_n_yields_exactly_n_configs() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.0);
-        let mut config = Configuration::<2>::cold(&lat);
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site);
         let updater = CountingUpdater {
-            sweeps: Cell::new(0),
+            sweeps: std::cell::Cell::new(0),
         };
         let mut rng = RandRng::seed_from_u64(0);
 
@@ -285,7 +285,7 @@ mod tests {
         let model = Ising::new(1.0, 0.0);
         let updater = Metropolis;
         let mut rng = RandRng::seed_from_u64(7);
-        let mut config = Configuration::<2>::hot(&lat, &mut rng);
+        let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
         let n = 12;
         let chain = Chain::new(&mut config, &lat, &model, &updater, 1.0, &mut rng, 2);
@@ -306,7 +306,7 @@ mod tests {
         let model = Ising::new(1.0, 0.0);
         let updater = Metropolis;
         let mut rng = RandRng::seed_from_u64(7);
-        let mut config = Configuration::<2>::hot(&lat, &mut rng);
+        let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
         let n = 12;
         let chain = Chain::new(&mut config, &lat, &model, &updater, 1.0, &mut rng, 2);
@@ -314,7 +314,7 @@ mod tests {
         let configs: Vec<Configuration<2>> = chain.take(n).collect();
 
         assert_eq!(configs.len(), n);
-        assert!(configs.iter().all(|c| c.n_sites() == lat.n_sites()));
+        assert!(configs.iter().all(|c| c.n_vars() == lat.n_sites()));
     }
 
     /// End-to-end physics sanity: a low-temperature (`β = 1`, well below
@@ -328,7 +328,7 @@ mod tests {
         let model = Ising::new(1.0, 0.0);
         let updater = Metropolis;
         let mut rng = RandRng::seed_from_u64(20260718);
-        let mut config = Configuration::<2>::hot(&lat, &mut rng);
+        let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
         let n = 50;
         let n_sites = lat.n_sites() as f64;

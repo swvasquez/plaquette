@@ -1,46 +1,63 @@
 # plaquette
 
-plaquette is a Rust framework for Monte Carlo simulation of lattice models.
+`plaquette` is a Rust framework for Monte Carlo simulation of lattice models.
 
 > [!NOTE]
 > Developed with AI assistance.
 
-It is early-stage: the 2D Ising model, sampled by single-spin Metropolis on the
-CPU, is what runs today.
-
 ## Installation
 
-plaquette builds with a recent Rust toolchain (edition 2024). From a clone of the
-repository:
+`plaquette` is a Rust package and can be built via Cargo
 
 ```bash
 cargo build
 ```
 
+## Models
+
+`plaquette` currently implements two models:
+
+| Model    | Dimension | Implementation | Device   |
+| -------- | --------- | -------------- | -------- |
+| Ising    | 2D        | Metropolis     | CPU      |
+| Ising    | 2D        | Checkerboard   | CPU, GPU |
+| Z2 gauge | 3D        | Metropolis     | CPU      |
+
+Refer to [`docs/`](docs/) for descriptions of used algorithms.
+
 ## Usage
 
-Runnable example code lives in the `examples/` folder. To run the 2D Ising model,
-for example:
+Model runs are configured via TOML. Runnable example code lives in [`examples/`](examples/).
+
+To run the 2D Ising model, call
 
 ```bash
-cargo run --example ising -- examples/run.toml
+cargo run --example ising -- examples/ising/run.toml
 ```
 
-Model runs are set with a TOML config file rather than by editing source, so
-trying a different run is an edit to that file rather than a recompile. The file
-holds the run's parameters — such as the lattice shape, temperature, and number
-of samples — along with a `seed` that makes the run reproducible.
+Similarly, run the 3D Z2 gauge model via
+
+```bash
+cargo run --example gauge -- examples/gauge/gauge.toml
+```
 
 ## Documentation
 
 Documentation describing the models and methods can be found in [`docs/`](docs/).
 
+## Testing
+
+Alongside the unit tests, end-to-end tests in [`tests/`](tests/) validate implementations using well-known results.
+
+Run the whole suite with
+
+```bash
+cargo test
+```
+
 ## AI assistance
 
-plaquette is developed with AI assistance. The conventions that shape the code and
-docs are written down as rules under `.claude/rules/`, each a Markdown file scoped
-by a `paths:` glob to the files it applies to (for example, the README style guide
-in `.claude/rules/readme.md`).
+`plaquette` is developed with AI assistance. The conventions that shape the code and docs are written down as rules under `.claude/rules/`, each a Markdown file scoped by a `paths:` glob to the files it applies to (for example, the README style guide in `.claude/rules/readme.md`).
 
 ## License
 

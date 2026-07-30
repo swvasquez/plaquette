@@ -18,15 +18,16 @@
 //! cargo run --example checkerboard
 //! ```
 
-use plaquette::config::{RunConfig, Start, UpdaterKind};
-use plaquette::{Estimate, Sample, Sampler, measure, reduce};
+use plaquette::config::{Start, UpdaterKind};
+use plaquette::ising_config::IsingRunConfig;
+use plaquette::{Estimate, IsingSampler, Sample, measure, reduce};
 
 /// Thermalize, stream `n_samples`, and reduce the energy density and `|m|`.
 ///
 /// Returns the two estimates the comparison prints. The generic details (which
 /// updater, how long) all come from `run`, so both algorithms share this path.
-fn measure_run(run: &RunConfig) -> (Estimate, Estimate) {
-    let mut sampler = Sampler::new(run);
+fn measure_run(run: &IsingRunConfig) -> (Estimate, Estimate) {
+    let mut sampler = IsingSampler::new(run);
     let lattice = sampler.lattice();
     let model = sampler.model();
     let n_sites = lattice.n_sites() as f64;
@@ -58,7 +59,7 @@ fn main() {
     // One physics point; the two runs differ only in the updater below. Both draw
     // from the same seed — the schedules consume randomness differently, so the
     // sample streams are not identical, but the distributions they sample are.
-    let base = RunConfig {
+    let base = IsingRunConfig {
         shape: [16, 16],
         j: 1.0,
         h: 0.0,
@@ -72,11 +73,11 @@ fn main() {
         description: None,
     };
 
-    let metropolis = RunConfig {
+    let metropolis = IsingRunConfig {
         updater: UpdaterKind::Metropolis,
         ..base.clone()
     };
-    let checkerboard = RunConfig {
+    let checkerboard = IsingRunConfig {
         updater: UpdaterKind::Checkerboard,
         ..base.clone()
     };

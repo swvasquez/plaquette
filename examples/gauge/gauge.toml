@@ -1,0 +1,41 @@
+# A single 3D Z2 gauge run. Edit and re-run — no recompile needed:
+#
+#     cargo run --release --example gauge -- examples/gauge/gauge.toml
+#
+# Note that this comment does not survive a round-trip: serde carries data, not
+# formatting. Anything that must travel with the run's provenance record goes in
+# the `description` field below.
+#
+# Unknown keys are rejected, so a typo here fails at load rather than being
+# silently ignored. That is also what stops an Ising config being run as a gauge
+# theory: `h` is not a field here, and the shape is three long, not two.
+
+# Physics. There is no `h` to go with `j`: a term reading individual links would
+# destroy the local symmetry that makes this a gauge theory.
+shape = [8, 8, 8]  # lattice extents [L_0, L_1, L_2]; fixed length 3
+j = 1.0            # plaquette coupling
+beta = 0.75        # inverse temperature; the transition sits at beta_c ~ 0.7613,
+                   # so this is the confined phase just below it — and on a box
+                   # this small the specific heat peaks a little lower still.
+                   # Expect a long tau_int here for the usual reason: a chain
+                   # near a transition decorrelates slowly.
+
+# Driver controls. Metropolis is the only updater a gauge run accepts — the
+# checkerboard schedule and the GPU backend both color sites, which says nothing
+# about variables living on links.
+updater = "metropolis"  # optional, defaults to "metropolis"
+thermalize = 500        # warmup sweeps, discarded
+sweeps_between = 5      # decorrelation sweeps between samples
+n_samples = 500         # samples to record
+
+# Reproducibility: this seed alone replays the whole run, start config included.
+seed = 20260728
+
+# Start configuration: "cold" (every link aligned) or "hot" (random).
+start = "hot"
+
+# What to measure is NOT specified here: a run produces configurations, and any
+# observable can be computed from them afterwards. Which Wilson rectangles to
+# report, and whether to read a Polyakov loop at all, live in the example source.
+
+description = "8x8x8 just below the deconfinement coupling"

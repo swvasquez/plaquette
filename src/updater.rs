@@ -15,7 +15,7 @@
 //! that never mentions it.
 //!
 //! [`Metropolis`] is the single-spin-flip update, the `Q = 2` case for any `D`.
-//! Its sweep visits `N = n_sites` uniformly-random sites; each `step` proposes
+//! Its sweep visits `N = n_vars` uniformly-random sites; each `step` proposes
 //! the flipped state, prices the move with [`Action::energy_delta`], and accepts
 //! with `min(1, e^{-β ΔE})`. The uniform pick is what makes the proposal
 //! symmetric and so lets acceptance drop the Hastings ratio; pricing by local
@@ -64,7 +64,7 @@ pub trait Updater<const Q: usize, const D: usize> {
     /// A sweep is the conventional unit of Monte Carlo time, sized to the lattice
     /// so autocorrelation is measured in sweeps rather than raw steps. What one
     /// sweep *does* is the algorithm's own choice: [`Metropolis`] attempts
-    /// `n_sites` single-site updates at random sites; [`Checkerboard`] attempts
+    /// `n_vars` single-site updates at random sites; [`Checkerboard`] attempts
     /// one per site in color order; an HMC trajectory would be a single
     /// whole-lattice move.
     ///
@@ -118,7 +118,7 @@ fn step<const D: usize>(
 pub struct Metropolis;
 
 impl<const D: usize> Updater<2, D> for Metropolis {
-    /// `N = n_sites` single-site `step`s at uniformly-random sites. Drawing the
+    /// `N = n_vars` single-site `step`s at uniformly-random sites. Drawing the
     /// site here — rather than inside `step` — is what makes the kernel reusable
     /// by schedules that choose sites differently, like [`Checkerboard`].
     fn sweep(
@@ -130,8 +130,8 @@ impl<const D: usize> Updater<2, D> for Metropolis {
         rng: &mut impl Rng,
     ) -> f64 {
         let mut net = 0.0;
-        for _ in 0..config.n_sites() {
-            let site = rng.next_below(config.n_sites());
+        for _ in 0..config.n_vars() {
+            let site = rng.next_below(config.n_vars());
             net += step(config, lattice, action, site, beta, rng);
         }
         net
@@ -158,7 +158,7 @@ pub struct Checkerboard;
 impl<const D: usize> Updater<2, D> for Checkerboard {
     /// Two color passes: every site of color 0, then every site of color 1, each
     /// a single-site `step`. Together they attempt one update per site, so a
-    /// checkerboard sweep does the same `n_sites` updates a [`Metropolis`] sweep
+    /// checkerboard sweep does the same `n_vars` updates a [`Metropolis`] sweep
     /// does — only the order differs.
     fn sweep(
         &self,
@@ -170,7 +170,7 @@ impl<const D: usize> Updater<2, D> for Checkerboard {
     ) -> f64 {
         let mut net = 0.0;
         for color in [0, 1] {
-            for site in 0..config.n_sites() {
+            for site in 0..config.n_vars() {
                 if parity(lattice, site) == color {
                     net += step(config, lattice, action, site, beta, rng);
                 }
@@ -186,7 +186,7 @@ impl<const D: usize> Updater<2, D> for Checkerboard {
 /// The types are fixed at compile time, but which one a run uses is a value read
 /// from a file — so the two have to meet at a single type. `AnyUpdater` is that
 /// type: it implements [`Updater`] by forwarding `sweep` to whichever updater it
-/// wraps, which is what lets [`Sampler`](crate::sampler::Sampler) hold one field
+/// wraps, which is what lets [`IsingSampler`](crate::ising_sampler::IsingSampler) hold one field
 /// and [`Chain`](crate::chain::Chain) stay generic while the algorithm is chosen
 /// at runtime. Its variants mirror
 /// [`UpdaterKind`](crate::config::UpdaterKind) — a closed set, which is what
@@ -223,7 +223,7 @@ impl<const D: usize> Updater<2, D> for AnyUpdater {
 /// because a single step along any axis changes exactly one coordinate by one and
 /// so flips the parity.
 fn parity<const D: usize>(lattice: &Lattice<D>, site: usize) -> usize {
-    lattice.coords(site).iter().sum::<usize>() % 2
+    lattice.site_coords(site).iter().sum::<usize>() % 2
 }
 
 /// Propose the single-site flip `0 ↔ 1`.
@@ -239,6 +239,7 @@ fn propose(current: State<2>, _rng: &mut impl Rng) -> State<2> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configuration::Cell;
     use crate::model::Ising;
     use crate::rng::RandRng;
 
@@ -288,7 +289,7 @@ mod tests {
 
         // One spin flipped against an otherwise-aligned background: flipping it
         // back to the aligned state lowers the energy.
-        let mut config = Configuration::<2>::cold(&lat);
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site);
         let site = 5;
         config.poke(site, State::new(1).unwrap());
 
@@ -315,7 +316,7 @@ mod tests {
     fn rejects_an_uphill_flip_above_the_boltzmann_factor() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.0);
-        let mut config = Configuration::<2>::cold(&lat); // ground state: every flip uphill
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site); // ground state: every flip uphill
         let untouched = config.clone();
 
         // β = 1, ΔE = +8 ⇒ e^{-βΔE} ≈ 3.4e-4; a draw of 0.5 is far above it.
@@ -332,7 +333,7 @@ mod tests {
     fn accepts_an_uphill_flip_below_the_boltzmann_factor() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.0);
-        let mut config = Configuration::<2>::cold(&lat);
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site);
         let site = 5;
 
         let proposed = propose(config.peek(site), &mut ScriptedRng::new(vec![], vec![]));
@@ -349,16 +350,16 @@ mod tests {
         assert_eq!(realized, action.energy(&lat, &config) - before);
     }
 
-    /// A Metropolis sweep is exactly `N = n_sites` steps: on the ground state
+    /// A Metropolis sweep is exactly `N = n_vars` steps: on the ground state
     /// every flip is uphill, so each step draws one accept uniform, and rejecting
     /// all of them leaves the config untouched with a net ΔE of 0.0.
     #[test]
-    fn metropolis_sweep_runs_n_sites_steps() {
+    fn metropolis_sweep_runs_n_vars_steps() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.0);
-        let mut config = Configuration::<2>::cold(&lat); // ground state: all flips uphill
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site); // ground state: all flips uphill
         let untouched = config.clone();
-        let n = config.n_sites();
+        let n = config.n_vars();
 
         // β = 1 ⇒ e^{-βΔE} ≈ 3.4e-4; a 0.9 draw rejects every step.
         let mut rng = ScriptedRng::new((0..n).collect(), vec![0.9; n]);
@@ -366,7 +367,7 @@ mod tests {
 
         assert_eq!(net, 0.0);
         assert_eq!(config, untouched);
-        assert_eq!(rng.site_i, n, "sweep must attempt exactly n_sites steps");
+        assert_eq!(rng.site_i, n, "sweep must attempt exactly n_vars steps");
         assert_eq!(
             rng.unif_i, n,
             "each uphill step draws exactly one accept uniform"
@@ -380,7 +381,7 @@ mod tests {
     fn metropolis_sweep_net_delta_equals_energy_change() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.5); // exactly representable; sums stay integer
-        let mut config = Configuration::<2>::hot(&lat, &mut RandRng::seed_from_u64(7));
+        let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut RandRng::seed_from_u64(7));
         let before = action.energy(&lat, &config);
 
         let mut rng = RandRng::seed_from_u64(99);
@@ -390,16 +391,16 @@ mod tests {
     }
 
     /// A checkerboard sweep attempts one update per site: on the ground state
-    /// every flip is uphill, so each of the `n_sites` attempts draws exactly one
+    /// every flip is uphill, so each of the `n_vars` attempts draws exactly one
     /// accept uniform. The random-site generator is never touched — the schedule
     /// is deterministic — and rejecting all leaves the config untouched.
     #[test]
     fn checkerboard_sweep_attempts_every_site_once() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.0);
-        let mut config = Configuration::<2>::cold(&lat); // ground state: all flips uphill
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site); // ground state: all flips uphill
         let untouched = config.clone();
-        let n = config.n_sites();
+        let n = config.n_vars();
 
         // β = 1 ⇒ e^{-βΔE} ≈ 3.4e-4; a 0.9 draw rejects every attempt. No site
         // draws are scripted, so a stray next_below would panic.
@@ -422,7 +423,7 @@ mod tests {
     fn checkerboard_sweep_net_delta_equals_energy_change() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.5);
-        let mut config = Configuration::<2>::hot(&lat, &mut RandRng::seed_from_u64(7));
+        let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut RandRng::seed_from_u64(7));
         let before = action.energy(&lat, &config);
 
         let mut rng = RandRng::seed_from_u64(99);
@@ -439,7 +440,7 @@ mod tests {
         let lat = Lattice::new([4, 4]);
         for site in 0..lat.n_sites() {
             let c = parity(&lat, site);
-            for &nbr in lat.neighbors(site) {
+            for &nbr in lat.site_neighbors(site) {
                 assert_ne!(c, parity(&lat, nbr), "neighbors must differ in color");
             }
         }

@@ -1,16 +1,17 @@
-//! Sampler: the orchestrator that owns a warmed-up run and streams from it.
+//! Ising sampler: the orchestrator that owns a warmed-up run and streams from
+//! it.
 //!
-//! Where a chain is pure mechanism, `Sampler` owns the **phasing**. It assembles
-//! the pieces a run needs, thermalizes once in its constructor, and then streams
-//! from its warmed-up state. It is the blessed path: a bare [`Chain`] yields
-//! pre-equilibrium states, a `Sampler` has already thermalized before it gives you
-//! anything.
+//! Where a chain is pure mechanism, [`IsingSampler`] owns the **phasing**. It
+//! assembles the pieces a run needs, thermalizes once in its constructor, and
+//! then streams from its warmed-up state. It is the blessed path: a bare
+//! [`Chain`] yields pre-equilibrium states, an `IsingSampler` has already
+//! thermalized before it gives you anything.
 //!
 //! It also owns the **backend choice**. The run's [`UpdaterKind`] selects between
-//! the CPU chain and the GPU chain, and `Sampler` holds whichever one the config
-//! asked for. [`samples`](Sampler::samples) returns an [`AnyChain`] over it — a
-//! thin front that yields [`Configuration`]s the same way regardless of backend,
-//! so a consumer's loop never names CPU or GPU.
+//! the CPU chain and the GPU chain, and `IsingSampler` holds whichever one the
+//! config asked for. [`samples`](IsingSampler::samples) returns an [`AnyChain`]
+//! over it — a thin front that yields [`Configuration`]s the same way regardless
+//! of backend, so a consumer's loop never names CPU or GPU.
 //!
 //! It streams and keeps no history: the consumer decides what to retain — fold
 //! into running sums, flush batches to a file, or collect when the run is small.
@@ -19,15 +20,16 @@
 //! chain without re-thermalizing.
 //!
 //! Geometry for measurement comes off the *sampler*, not the chain:
-//! [`lattice`](Sampler::lattice) and [`model`](Sampler::model) hand back owned
-//! copies, so a consumer reads them once and then streams. (The CPU `Chain`
-//! exposes its own borrowed accessors, but a `GpuChain` owns its geometry and
+//! [`lattice`](IsingSampler::lattice) and [`model`](IsingSampler::model) hand
+//! back owned copies, so a consumer reads them once and then streams. (The CPU
+//! `Chain` exposes its own borrowed accessors, but a `GpuChain` owns its geometry and
 //! cannot lend it past a by-value consume, so the uniform seam puts them here.)
 
 use crate::chain::Chain;
-use crate::config::{RunConfig, UpdaterKind};
+use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
 use crate::gpu::{Gpu, GpuChain};
+use crate::ising_config::IsingRunConfig;
 use crate::lattice::Lattice;
 use crate::model::Ising;
 use crate::rng::RandRng;
@@ -38,7 +40,7 @@ use crate::updater::{AnyUpdater, Checkerboard, Metropolis};
 /// here rather than a config field.
 const GPU_BATCH: usize = 64;
 
-/// The evolving state a [`Sampler`] streams from, one variant per backend.
+/// The evolving state an [`IsingSampler`] streams from, one variant per backend.
 ///
 /// The CPU variant holds the loose pieces a transient [`Chain`] borrows each call;
 /// the GPU variant owns a persistent [`GpuChain`]. This is where the two
@@ -78,10 +80,10 @@ impl Iterator for AnyChain<'_> {
 /// Owns a run's assembled pieces and its evolving state, thermalized and ready
 /// to stream.
 ///
-/// Fixed at `D = 2`, `Q = 2`, matching [`RunConfig`]. The backend is chosen from
-/// the config's [`UpdaterKind`] and held in a private per-backend `Engine`, so
-/// neither the CPU nor the GPU type leaks into the streaming interface.
-pub struct Sampler {
+/// Fixed at `D = 2`, `Q = 2`, matching [`IsingRunConfig`]. The backend is chosen
+/// from the config's [`UpdaterKind`] and held in a private per-backend
+/// `Engine`, so neither the CPU nor the GPU type leaks into the streaming interface.
+pub struct IsingSampler {
     lattice: Lattice<2>,
     model: Ising,
     beta: f64,
@@ -89,11 +91,12 @@ pub struct Sampler {
     engine: Engine,
 }
 
-impl Sampler {
+impl IsingSampler {
     /// Assemble a run from its config and thermalize it.
     ///
     /// Runs `config.thermalize` warmup sweeps and discards them, so the sampler is
-    /// at equilibrium before it streams. [`RunConfig::build`] seeds the generator
+    /// at equilibrium before it streams. [`IsingRunConfig::build`] seeds the
+    /// generator
     /// *before* drawing a [`Start::Hot`](crate::config::Start::Hot) configuration,
     /// which is what makes the whole run replay from the seed alone; the GPU
     /// backend starts from that same drawn configuration, so a CPU and GPU run of
@@ -106,7 +109,7 @@ impl Sampler {
     ///
     /// Panics if the config is invalid (via `build`), or if it selects the GPU
     /// backend on a machine with no GPU adapter.
-    pub fn new(config: &RunConfig) -> Self {
+    pub fn new(config: &IsingRunConfig) -> Self {
         let (lattice, model, mut rng, mut state, beta) = config.build();
         let sweeps_between = config.sweeps_between;
 
@@ -141,7 +144,7 @@ impl Sampler {
             }
         };
 
-        Sampler {
+        IsingSampler {
             lattice,
             model,
             beta,
@@ -151,7 +154,8 @@ impl Sampler {
     }
 
     /// The lattice this run is on — an owned clone, for measuring the stream
-    /// without holding a borrow of the sampler across [`samples`](Sampler::samples).
+    /// without holding a borrow of the sampler across
+    /// [`samples`](IsingSampler::samples).
     pub fn lattice(&self) -> Lattice<2> {
         self.lattice.clone()
     }
@@ -167,10 +171,10 @@ impl Sampler {
     /// nothing, and calling this again continues the same chain.
     ///
     /// ```
-    /// # use plaquette::config::RunConfig;
-    /// # use plaquette::{measure, Sampler};
-    /// # let run = RunConfig::parse("shape=[8,8]\nj=1.0\nbeta=0.44\nthermalize=10\nsweeps_between=1\nn_samples=5\nseed=1").unwrap();
-    /// let mut sampler = Sampler::new(&run);
+    /// # use plaquette::ising_config::IsingRunConfig;
+    /// # use plaquette::{measure, IsingSampler};
+    /// # let run = IsingRunConfig::parse("shape=[8,8]\nj=1.0\nbeta=0.44\nthermalize=10\nsweeps_between=1\nn_samples=5\nseed=1").unwrap();
+    /// let mut sampler = IsingSampler::new(&run);
     /// let (lattice, model) = (sampler.lattice(), sampler.model());
     /// let energies: Vec<f64> = sampler
     ///     .samples()
@@ -179,7 +183,7 @@ impl Sampler {
     ///     .collect();
     /// ```
     pub fn samples(&mut self) -> AnyChain<'_> {
-        let Sampler {
+        let IsingSampler {
             lattice,
             model,
             beta,
@@ -211,8 +215,8 @@ mod tests {
     use crate::config::Start;
     use crate::observables::measure;
 
-    fn config() -> RunConfig {
-        RunConfig {
+    fn config() -> IsingRunConfig {
+        IsingRunConfig {
             shape: [8, 8],
             j: 1.0,
             h: 0.0,
@@ -230,11 +234,11 @@ mod tests {
     /// The stream yields configs of the run's lattice size, as many as asked for.
     #[test]
     fn streams_configs_of_the_right_size() {
-        let mut sampler = Sampler::new(&config());
+        let mut sampler = IsingSampler::new(&config());
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
-        assert!(configs.iter().all(|c| c.n_sites() == 64));
+        assert!(configs.iter().all(|c| c.n_vars() == 64));
     }
 
     /// A checkerboard-configured run streams too: the `UpdaterKind` from the
@@ -244,11 +248,11 @@ mod tests {
         let mut run = config();
         run.updater = UpdaterKind::Checkerboard;
 
-        let mut sampler = Sampler::new(&run);
+        let mut sampler = IsingSampler::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
-        assert!(configs.iter().all(|c| c.n_sites() == 64));
+        assert!(configs.iter().all(|c| c.n_vars() == 64));
     }
 
     /// A GPU-configured run streams through the same interface. Skips when no GPU
@@ -262,18 +266,18 @@ mod tests {
         let mut run = config();
         run.updater = UpdaterKind::GpuCheckerboard;
 
-        let mut sampler = Sampler::new(&run);
+        let mut sampler = IsingSampler::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
-        assert!(configs.iter().all(|c| c.n_sites() == 64));
+        assert!(configs.iter().all(|c| c.n_vars() == 64));
     }
 
     /// Geometry off the sampler lets a consumer measure the stream without owning
     /// a second lattice.
     #[test]
     fn measures_the_stream_via_sampler_geometry() {
-        let mut sampler = Sampler::new(&config());
+        let mut sampler = IsingSampler::new(&config());
         let lattice = sampler.lattice();
         let model = sampler.model();
         let n_sites = lattice.n_sites() as f64;
@@ -313,7 +317,7 @@ mod tests {
         .take(run.n_samples)
         .collect();
 
-        let mut sampler = Sampler::new(&run);
+        let mut sampler = IsingSampler::new(&run);
         let got: Vec<_> = sampler.samples().take(run.n_samples).collect();
 
         assert_eq!(got, expected);
@@ -323,11 +327,11 @@ mod tests {
     /// `n` then `m` equals one run of `n + m`.
     #[test]
     fn a_second_call_continues_the_same_chain() {
-        let mut split = Sampler::new(&config());
+        let mut split = IsingSampler::new(&config());
         let mut got: Vec<_> = split.samples().take(6).collect();
         got.extend(split.samples().take(4));
 
-        let mut whole = Sampler::new(&config());
+        let mut whole = IsingSampler::new(&config());
         let expected: Vec<_> = whole.samples().take(10).collect();
 
         assert_eq!(got, expected);

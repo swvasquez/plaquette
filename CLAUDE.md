@@ -80,12 +80,28 @@ when confirmation genuinely matters, then assume I'll say when to continue. If I
 drill into a detail or topic you mentioned, just engage with it — don't read it
 as a cue to push toward implementation.
 
+### Asking several questions
+
+When you have more than one question for me, don't dump them all with full detail
+at once. Ask in plain text — never a selection pop-up or any question tool. First
+show the list as one-sentence descriptions — "here are the N things I need to
+settle" — then say let's walk through them, and take them one at a time, waiting
+for my answer before moving to the next.
+
 ### Interactive components
 
 Don't use the following interactive components; instead, convey the same thing in
 plain text (e.g. present choices as a numbered list and ask me to reply):
 
 - Selection pop-ups (interactive multiple-choice / option-picker windows).
+
+### Concurrent changes
+
+Assume other agents may be working in this repo at the same time, so the files and
+state can change under you between steps. Re-read before acting on something you
+read earlier rather than trusting a stale view. When you hit a change you can't
+account for or reconcile, stop and ask me to clarify instead of guessing or
+overwriting it.
 
 ### Working with code
 

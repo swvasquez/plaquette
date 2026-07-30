@@ -1,8 +1,8 @@
 //! Run the driver on the 2D Ising model from a config file and report a couple
 //! of averaged observables.
 //!
-//! The smallest end-to-end use of the library: load a [`RunConfig`], hand it to
-//! a [`Sampler`] (which assembles the pieces and thermalizes), then stream
+//! The smallest end-to-end use of the library: load a [`IsingRunConfig`], hand it to
+//! a [`IsingSampler`] (which assembles the pieces and thermalizes), then stream
 //! samples from it, measuring each one and reducing the collected series.
 //!
 //! It collects the whole `Vec<Sample>` before reducing, because estimating
@@ -18,17 +18,18 @@
 //! Run it with:
 //!
 //! ```text
-//! cargo run --example ising                      # uses examples/run.toml
+//! cargo run --example ising                      # uses examples/ising/run.toml
 //! cargo run --example ising -- path/to/run.toml  # or any other config
 //! ```
 
-use plaquette::config::RunConfig;
+use plaquette::ising_config::IsingRunConfig;
 use plaquette::{
-    Sample, Sampler, binder_cumulant, correlator, measure, reduce, specific_heat, susceptibility,
+    IsingSampler, Sample, binder_cumulant, correlator, measure, reduce, specific_heat,
+    susceptibility,
 };
 
 /// Where the run parameters come from when none is given on the command line.
-const DEFAULT_CONFIG: &str = "examples/run.toml";
+const DEFAULT_CONFIG: &str = "examples/ising/run.toml";
 
 /// Whether to also report the two-point correlator.
 ///
@@ -55,7 +56,7 @@ fn main() {
         .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
 
     // A bad file fails here, before any sweeps are burned.
-    let run = match RunConfig::load(&path) {
+    let run = match IsingRunConfig::load(&path) {
         Ok(run) => run,
         Err(e) => {
             eprintln!("error: {e}");
@@ -66,7 +67,7 @@ fn main() {
 
     // The sampler assembles the pieces and thermalizes, so the stream is at
     // equilibrium from the first config.
-    let mut sampler = Sampler::new(&run);
+    let mut sampler = IsingSampler::new(&run);
 
     // Geometry for measurement comes off the sampler as owned values, read once
     // before streaming so the stream can borrow the sampler by itself.
