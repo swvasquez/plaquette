@@ -4,5 +4,9 @@ version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A framework for Monte Carlo simulation of lattice models."
-repository = "https://github.com/swvasquez/plaquette"
-readme = "README.md"
+
+[dependencies]
+rand = "0.10.2"
+rand_pcg = "0.10.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

@@ -1,0 +1,33 @@
+# A single 2D Ising run. Edit and re-run — no recompile needed:
+#
+#     cargo run --example ising -- examples/run.toml
+#
+# Note that this comment does not survive a round-trip: serde carries data, not
+# formatting. Anything that must travel with the run's provenance record goes in
+# the `description` field below.
+#
+# Unknown keys are rejected, so a typo here fails at load rather than being
+# silently ignored.
+
+# Physics.
+shape = [16, 16]  # lattice extents [L_0, L_1]
+j = 1.0           # nearest-neighbour coupling
+h = 0.0           # external field; optional, defaults to 0.0 (field-free)
+beta = 0.44       # inverse temperature; beta_c = ln(1 + sqrt(2)) / 2 ~ 0.4407
+
+# Driver controls.
+updater = "metropolis"  # update algorithm; optional, defaults to "metropolis"
+thermalize = 500        # warmup sweeps, discarded
+sweeps_between = 5      # decorrelation sweeps between samples
+n_samples = 1000        # samples to record
+
+# Reproducibility: this seed alone replays the whole run, start config included.
+seed = 20260718
+
+# Start configuration: "cold" (aligned) or "hot" (random).
+start = "hot"
+
+# What to measure is NOT specified here: a run produces configurations, and any
+# observable can be computed from them afterwards. See the example source.
+
+description = "16x16 at roughly the critical temperature"
