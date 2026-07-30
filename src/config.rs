@@ -43,6 +43,9 @@ pub enum Start {
 pub enum UpdaterKind {
     /// Single-spin-flip Metropolis ([`Metropolis`](crate::updater::Metropolis)).
     Metropolis,
+    /// Single-spin-flip Metropolis under a checkerboard schedule
+    /// ([`Checkerboard`](crate::updater::Checkerboard)).
+    Checkerboard,
 }
 
 /// A single run's parameters in serializable form: everything needed to produce
@@ -338,6 +341,20 @@ mod tests {
         assert_eq!(config.start, Start::Hot);
         assert_eq!(config.updater, UpdaterKind::Metropolis);
         assert_eq!(config.description.as_deref(), Some("near T_c"));
+    }
+
+    #[test]
+    fn parses_and_round_trips_the_checkerboard_updater() {
+        let mut config = sample_config();
+        config.updater = UpdaterKind::Checkerboard;
+
+        // Serializes with the lowercase variant name, and survives the round-trip.
+        let text = config.to_toml().unwrap();
+        assert!(text.contains(r#"updater = "checkerboard""#));
+        assert_eq!(
+            RunConfig::parse(&text).unwrap().updater,
+            UpdaterKind::Checkerboard
+        );
     }
 
     #[test]

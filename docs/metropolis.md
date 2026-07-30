@@ -88,3 +88,37 @@ are far enough apart to be nearly independent. Taken together, the spaced sample
 from a long enough run look like independent draws from the Boltzmann
 distribution, and averaging an observable over them estimates its Boltzmann
 average.
+
+## Checkerboard schedule
+
+The sampling above runs its moves in sequence, each seeing what the last one left,
+and that is what we want to escape on a GPU, where the point is to update many sites
+at once. A naïve parallel sweep is wrong, though: two neighbouring sites updated
+simultaneously each price their move against the other's old value, double-counting
+the bond between them and breaking detailed balance. The checkerboard schedule fixes
+this by making the sites updated together never interact. It colours each site by
+the parity of its coordinate sum, $\left(\sum_\mu x_\mu\right) \bmod 2$; a step
+along any axis flips the parity, so a site's neighbours are all the opposite colour.
+A whole colour then contains no neighbouring pairs, and can be updated at once
+against a fixed background of the other colour. A sweep is two passes — all of
+colour 0, then all of colour 1 — with a barrier between them so the second reads the
+first's new values.
+
+This still samples $P$ because it only reorders the single-site moves. Each move
+leaves $P$ invariant on its own, and invariance composes,
+
+$$P T_1 = P, \quad P T_2 = P \;\implies\; P\,(T_1 T_2) = P,$$
+
+for any order, so a sweep in colour order preserves the Boltzmann distribution just
+as a random one does. Updating a colour in parallel is the same product, since
+within a colour the simultaneous pass equals doing its sites in sequence. On one
+processor the schedule is thus reordered Metropolis, differing only in
+autocorrelation — which is what makes the sequential version the reference a
+parallel one is checked against.
+
+Two conditions bind the parallel case alone. The independence within a colour needs
+even extents: under periodic boundaries an odd extent wraps a site onto a
+same-colour neighbour, restoring the double-counting. And matching a parallel run
+bit-for-bit needs a random source keyed by each site's coordinates rather than a
+stream advanced in visiting order. Run sequentially neither applies, so the CPU
+checkerboard is correct on any lattice.

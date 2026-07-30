@@ -196,25 +196,14 @@ mod tests {
     use std::cell::Cell;
 
     /// An [`Updater`] that does nothing but count the sweeps it is asked to run.
-    /// Overriding [`sweep`](Updater::sweep) rather than composing `step` makes the
-    /// count one-per-sweep. The `Cell` gives interior mutability under the trait's
-    /// `&self`, and reading it coexists with the chain's own `&updater`.
+    /// Its `sweep` is the whole implementation — the trait requires nothing else.
+    /// The `Cell` gives interior mutability under the trait's `&self`, and reading
+    /// it coexists with the chain's own `&updater`.
     struct CountingUpdater {
         sweeps: Cell<usize>,
     }
 
     impl<const D: usize> Updater<2, D> for CountingUpdater {
-        fn step(
-            &self,
-            _config: &mut Configuration<2>,
-            _lattice: &Lattice<D>,
-            _action: &impl Action<2, D>,
-            _beta: f64,
-            _rng: &mut impl Rng,
-        ) -> f64 {
-            0.0
-        }
-
         fn sweep(
             &self,
             _config: &mut Configuration<2>,

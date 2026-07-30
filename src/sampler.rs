@@ -31,24 +31,24 @@ use crate::configuration::Configuration;
 use crate::lattice::Lattice;
 use crate::model::Ising;
 use crate::rng::RandRng;
-use crate::updater::Metropolis;
+use crate::updater::{AnyUpdater, Checkerboard, Metropolis};
 
 /// The concrete `Chain` a [`Sampler`] lends, named so
 /// [`samples`](Sampler::samples)'s return type stays legible.
-pub type SampleChain<'a> = Chain<'a, 2, 2, Ising, Metropolis, RandRng>;
+pub type SampleChain<'a> = Chain<'a, 2, 2, Ising, AnyUpdater, RandRng>;
 
 /// Owns a run's assembled pieces and its evolving state, thermalized and ready
 /// to stream.
 ///
-/// Fixed at `D = 2`, `Q = 2` and a concrete [`Metropolis`] updater, matching
-/// [`RunConfig`]. The updater is concrete because there is exactly one algorithm
-/// today; a second turns the [`UpdaterKind`] match into real dispatch, which is
-/// where the abstraction would earn itself.
+/// Fixed at `D = 2`, `Q = 2`, matching [`RunConfig`]. The updater is an
+/// [`AnyUpdater`] — the runtime choice among the built-in algorithms — so the
+/// [`UpdaterKind`] read from a config file selects one without that type leaking
+/// into `Sampler`'s or [`Chain`]'s signature.
 pub struct Sampler {
     lattice: Lattice<2>,
     model: Ising,
     rng: RandRng,
-    updater: Metropolis,
+    updater: AnyUpdater,
     /// The evolving chain state, lent to a transient [`Chain`] per call.
     state: Configuration<2>,
     beta: f64,
@@ -75,7 +75,8 @@ impl Sampler {
     pub fn new(config: &RunConfig) -> Self {
         let (lattice, model, mut rng, mut state, beta) = config.build();
         let updater = match config.updater {
-            UpdaterKind::Metropolis => Metropolis,
+            UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
+            UpdaterKind::Checkerboard => AnyUpdater::Checkerboard(Checkerboard),
         };
 
         // `advance` is in sweeps and produces no snapshots, so the stride of 1 is
@@ -151,6 +152,21 @@ mod tests {
     #[test]
     fn streams_configs_of_the_right_size() {
         let mut sampler = Sampler::new(&config());
+        let configs: Vec<_> = sampler.samples().take(5).collect();
+
+        assert_eq!(configs.len(), 5);
+        assert!(configs.iter().all(|c| c.n_sites() == 64));
+    }
+
+    /// A checkerboard-configured run streams too: the `UpdaterKind` from the
+    /// config selects `AnyUpdater::Checkerboard`, which the sampler drives exactly
+    /// like any other updater.
+    #[test]
+    fn streams_with_the_checkerboard_updater() {
+        let mut run = config();
+        run.updater = UpdaterKind::Checkerboard;
+
+        let mut sampler = Sampler::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);

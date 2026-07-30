@@ -23,4 +23,4 @@ pub use statistics::{
     Derived, Estimate, MIN_EFFECTIVE_SAMPLES, binder_cumulant, reduce, specific_heat,
     susceptibility,
 };
-pub use updater::{Metropolis, Updater};
+pub use updater::{AnyUpdater, Checkerboard, Metropolis, Updater};
