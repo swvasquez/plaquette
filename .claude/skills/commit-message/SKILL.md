@@ -38,7 +38,40 @@ over the subject-only default.
 
 When you do include a body, separate it from the subject with exactly one blank
 line — git relies on that blank line to split the two — and wrap it at about 72
-characters, using it to explain the reasoning rather than restate the diff.
+characters.
+
+Pitch the body at the level of motivation, blockers, and why — not a walk
+through the design. The diff already records every class, function, and type
+that changed, so naming them in the message is redundant; what the reader can't
+recover later is the reasoning. As a default, do not name internal types or
+functions at all. When you would reach for one, describe its role in plain words
+instead — "the sampling interface", not `AnyChain`; "the GPU sweep", not
+`GpuChain`. Name a symbol only in the rare case where the motivation is
+meaningless without it, and even then prefer the plain description.
+
+The test is whether someone skimming `git log` would care. They care that a
+capability was added, a constraint respected, a blocker cleared; they do not
+care how the types relate to each other, which is architecture they read from
+the code. If a body describes the design rather than the reason for it, it's at
+the wrong altitude — raise it or drop it.
+
+For calibration, this body is too specific — it narrates the design:
+
+> GpuChain is a sibling of Chain, sharing only the Iterator interface: it
+> owns its device resources and keeps the configuration in a device buffer.
+> A run selects it with the gpu_checkerboard updater, and Sampler reconciles
+> the two backends' opposite ownership models behind AnyChain.
+
+The same change at the right altitude opens with the capability and its why,
+then traces the pipeline evenly and lets the boundaries surface on their own:
+
+> Add GPU checkerboard backend
+>
+> The checkerboard sweep can now run on the GPU via wgpu, updating sites in
+> parallel to sample faster than the serial CPU path. The configuration
+> lives in GPU memory and is updated there; a batch of samples is then
+> copied back to the host in a single transfer. Observables are measured on
+> the host from those configurations.
 
 Present the finished message in a fenced code block so the user can copy it
 cleanly, and keep any surrounding commentary short.

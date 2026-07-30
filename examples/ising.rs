@@ -67,22 +67,22 @@ fn main() {
     // The sampler assembles the pieces and thermalizes, so the stream is at
     // equilibrium from the first config.
     let mut sampler = Sampler::new(&run);
-    let chain = sampler.samples();
 
-    // The geometry comes off the chain rather than a second lattice. These are
-    // `'a` borrows, so they outlive the chain being moved into `.take` below.
-    let (lattice, model) = (chain.lattice(), chain.action());
+    // Geometry for measurement comes off the sampler as owned values, read once
+    // before streaming so the stream can borrow the sampler by itself.
+    let lattice = sampler.lattice();
+    let model = sampler.model();
     let n_sites = lattice.n_sites() as f64;
 
     // One `Sample` per config is `O(n_samples)` memory, not `O(L²·n_samples)`.
     let mut samples: Vec<Sample> = Vec::with_capacity(run.n_samples);
     let mut sum_correlator: Option<Vec<f64>> = None;
 
-    for config in chain.take(run.n_samples) {
-        samples.push(measure(model, lattice, &config));
+    for config in sampler.samples().take(run.n_samples) {
+        samples.push(measure(&model, &lattice, &config));
 
         if SHOW_CORRELATOR {
-            let c = correlator(model, lattice, &config);
+            let c = correlator(&model, &lattice, &config);
             let axis0 = &c.per_axis[0];
             let acc = sum_correlator.get_or_insert_with(|| vec![0.0; axis0.len()]);
             for (slot, &value) in acc.iter_mut().zip(axis0) {

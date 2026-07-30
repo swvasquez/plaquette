@@ -27,13 +27,14 @@ use plaquette::{Estimate, Sample, Sampler, measure, reduce};
 /// updater, how long) all come from `run`, so both algorithms share this path.
 fn measure_run(run: &RunConfig) -> (Estimate, Estimate) {
     let mut sampler = Sampler::new(run);
-    let chain = sampler.samples();
-    let (lattice, model) = (chain.lattice(), chain.action());
+    let lattice = sampler.lattice();
+    let model = sampler.model();
     let n_sites = lattice.n_sites() as f64;
 
-    let samples: Vec<Sample> = chain
+    let samples: Vec<Sample> = sampler
+        .samples()
         .take(run.n_samples)
-        .map(|c| measure(model, lattice, &c))
+        .map(|c| measure(&model, &lattice, &c))
         .collect();
 
     let e_density: Vec<f64> = samples.iter().map(|s| s.energy / n_sites).collect();

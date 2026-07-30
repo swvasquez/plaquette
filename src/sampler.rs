@@ -1,128 +1,207 @@
 //! Sampler: the orchestrator that owns a warmed-up run and streams from it.
 //!
-//! Where [`Chain`] is pure mechanism, `Sampler` owns the **phasing**. It
-//! assembles the pieces a run needs, thermalizes once in its constructor, and
-//! then lends chains from its warmed-up state. It is the blessed path: a bare
-//! `Chain` yields pre-equilibrium states, a `Sampler` has already thermalized
-//! before it gives you anything.
+//! Where a chain is pure mechanism, `Sampler` owns the **phasing**. It assembles
+//! the pieces a run needs, thermalizes once in its constructor, and then streams
+//! from its warmed-up state. It is the blessed path: a bare [`Chain`] yields
+//! pre-equilibrium states, a `Sampler` has already thermalized before it gives you
+//! anything.
 //!
-//! It streams and keeps no history. [`samples`](Sampler::samples) lends a
-//! [`Chain`] over the sampler's evolving state, and the consumer decides what to
-//! retain — fold into running sums, flush batches to a file, or collect when the
-//! run is small. The sampler holds only the chain position (state and RNG), so it
-//! stays `O(L²)` however long the run goes.
+//! It also owns the **backend choice**. The run's [`UpdaterKind`] selects between
+//! the CPU chain and the GPU chain, and `Sampler` holds whichever one the config
+//! asked for. [`samples`](Sampler::samples) returns an [`AnyChain`] over it — a
+//! thin front that yields [`Configuration`]s the same way regardless of backend,
+//! so a consumer's loop never names CPU or GPU.
 //!
-//! That also makes extend-and-recheck free: because the warmed-up state stays
-//! here, `samples` can be called again to draw more after looking at the error
-//! bars, and the second batch continues the same chain without re-thermalizing.
-//! Two calls of `n` and `m` produce exactly what one call of `n + m` would.
+//! It streams and keeps no history: the consumer decides what to retain — fold
+//! into running sums, flush batches to a file, or collect when the run is small.
+//! Because the warmed-up state stays here, `samples` can be called again to draw
+//! more after looking at the error bars, and the second batch continues the same
+//! chain without re-thermalizing.
 //!
-//! `Sampler` owns its pieces because `Chain` borrows all of them and so cannot be
-//! returned from the function that builds them — which is why
-//! [`RunConfig::build`] hands back loose parts. A `Sampler` cannot hold a `Chain`
-//! as a field either (a struct cannot reference its own siblings), so `samples`
-//! builds a transient chain and lends its fields to it. The warmup trajectory is
-//! not exposed here; anyone wanting to watch an observable settle drives a
-//! `Chain` directly.
+//! Geometry for measurement comes off the *sampler*, not the chain:
+//! [`lattice`](Sampler::lattice) and [`model`](Sampler::model) hand back owned
+//! copies, so a consumer reads them once and then streams. (The CPU `Chain`
+//! exposes its own borrowed accessors, but a `GpuChain` owns its geometry and
+//! cannot lend it past a by-value consume, so the uniform seam puts them here.)
 
 use crate::chain::Chain;
 use crate::config::{RunConfig, UpdaterKind};
 use crate::configuration::Configuration;
+use crate::gpu::{Gpu, GpuChain};
 use crate::lattice::Lattice;
 use crate::model::Ising;
 use crate::rng::RandRng;
 use crate::updater::{AnyUpdater, Checkerboard, Metropolis};
 
-/// The concrete `Chain` a [`Sampler`] lends, named so
-/// [`samples`](Sampler::samples)'s return type stays legible.
-pub type SampleChain<'a> = Chain<'a, 2, 2, Ising, AnyUpdater, RandRng>;
+/// How many samples a GPU run produces per device round-trip. A performance knob,
+/// not a physics one — the samples are identical regardless — so it is a default
+/// here rather than a config field.
+const GPU_BATCH: usize = 64;
+
+/// The evolving state a [`Sampler`] streams from, one variant per backend.
+///
+/// The CPU variant holds the loose pieces a transient [`Chain`] borrows each call;
+/// the GPU variant owns a persistent [`GpuChain`]. This is where the two
+/// backends' opposite ownership models are reconciled behind one type.
+enum Engine {
+    Cpu {
+        rng: RandRng,
+        updater: AnyUpdater,
+        /// The evolving configuration, lent to a transient [`Chain`] per call.
+        state: Configuration<2>,
+    },
+    Gpu(GpuChain),
+}
+
+/// A stream of thermalized [`Configuration`]s, over either backend.
+///
+/// Both variants yield the same item, so a consumer bounds it with `.take(n)` and
+/// measures each config without knowing which backend produced it. The CPU
+/// variant is a transient [`Chain`] borrowing the sampler; the GPU variant a
+/// mutable borrow of the sampler's persistent [`GpuChain`].
+pub enum AnyChain<'a> {
+    Cpu(Chain<'a, 2, 2, Ising, AnyUpdater, RandRng>),
+    Gpu(&'a mut GpuChain),
+}
+
+impl Iterator for AnyChain<'_> {
+    type Item = Configuration<2>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            AnyChain::Cpu(chain) => chain.next(),
+            AnyChain::Gpu(chain) => chain.next(),
+        }
+    }
+}
 
 /// Owns a run's assembled pieces and its evolving state, thermalized and ready
 /// to stream.
 ///
-/// Fixed at `D = 2`, `Q = 2`, matching [`RunConfig`]. The updater is an
-/// [`AnyUpdater`] — the runtime choice among the built-in algorithms — so the
-/// [`UpdaterKind`] read from a config file selects one without that type leaking
-/// into `Sampler`'s or [`Chain`]'s signature.
+/// Fixed at `D = 2`, `Q = 2`, matching [`RunConfig`]. The backend is chosen from
+/// the config's [`UpdaterKind`] and held in a private per-backend `Engine`, so
+/// neither the CPU nor the GPU type leaks into the streaming interface.
 pub struct Sampler {
     lattice: Lattice<2>,
     model: Ising,
-    rng: RandRng,
-    updater: AnyUpdater,
-    /// The evolving chain state, lent to a transient [`Chain`] per call.
-    state: Configuration<2>,
     beta: f64,
     sweeps_between: usize,
+    engine: Engine,
 }
 
 impl Sampler {
     /// Assemble a run from its config and thermalize it.
     ///
-    /// Runs `config.thermalize` warmup sweeps and discards them, so the sampler
-    /// is at equilibrium before it lends anything. [`RunConfig::build`] seeds the
-    /// generator *before* drawing a [`Start::Hot`](crate::config::Start::Hot)
-    /// configuration, which is what makes the whole run replay from the seed
-    /// alone.
+    /// Runs `config.thermalize` warmup sweeps and discards them, so the sampler is
+    /// at equilibrium before it streams. [`RunConfig::build`] seeds the generator
+    /// *before* drawing a [`Start::Hot`](crate::config::Start::Hot) configuration,
+    /// which is what makes the whole run replay from the seed alone; the GPU
+    /// backend starts from that same drawn configuration, so a CPU and GPU run of
+    /// one config begin identically.
     ///
     /// `config.n_samples` is deliberately not read here: how many samples to draw
     /// is the consumer's `.take(n)`.
     ///
     /// # Panics
     ///
-    /// Panics if the config is invalid, via `build`. Configs from
-    /// [`load`](RunConfig::load) and [`parse`](RunConfig::parse) are already
-    /// validated.
+    /// Panics if the config is invalid (via `build`), or if it selects the GPU
+    /// backend on a machine with no GPU adapter.
     pub fn new(config: &RunConfig) -> Self {
         let (lattice, model, mut rng, mut state, beta) = config.build();
-        let updater = match config.updater {
-            UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
-            UpdaterKind::Checkerboard => AnyUpdater::Checkerboard(Checkerboard),
-        };
+        let sweeps_between = config.sweeps_between;
 
-        // `advance` is in sweeps and produces no snapshots, so the stride of 1 is
-        // irrelevant and nothing is allocated. The chain drops at the end of the
-        // statement, returning the borrows of `state` and `rng`.
-        Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
-            .advance(config.thermalize);
+        let engine = if let UpdaterKind::GpuCheckerboard = config.updater {
+            let gpu = Gpu::new().expect("GPU backend requested but no GPU adapter is available");
+            let mut chain = GpuChain::new(
+                gpu,
+                &lattice,
+                config.j,
+                config.h,
+                beta,
+                config.seed,
+                &state,
+                sweeps_between,
+                GPU_BATCH,
+            );
+            chain.advance(config.thermalize);
+            Engine::Gpu(chain)
+        } else {
+            let updater = match config.updater {
+                UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
+                UpdaterKind::Checkerboard => AnyUpdater::Checkerboard(Checkerboard),
+                UpdaterKind::GpuCheckerboard => unreachable!("handled by the outer branch"),
+            };
+            // Warm up a transient chain over the loose pieces, then stow them.
+            Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
+                .advance(config.thermalize);
+            Engine::Cpu {
+                rng,
+                updater,
+                state,
+            }
+        };
 
         Sampler {
             lattice,
             model,
-            rng,
-            updater,
-            state,
             beta,
-            sweeps_between: config.sweeps_between,
+            sweeps_between,
+            engine,
         }
     }
 
-    /// Lend a [`Chain`] over the warmed-up state.
-    ///
-    /// Bound it with `.take(n)` and route each yielded config wherever it should
-    /// go; the sampler retains nothing, and calling this again continues the same
-    /// chain. To measure the stream, pull the geometry off the chain first —
-    /// [`Chain::lattice`] and [`Chain::action`] return `'a` borrows that survive
-    /// the chain being consumed:
+    /// The lattice this run is on — an owned clone, for measuring the stream
+    /// without holding a borrow of the sampler across [`samples`](Sampler::samples).
+    pub fn lattice(&self) -> Lattice<2> {
+        self.lattice.clone()
+    }
+
+    /// The model pricing this run's moves — for measuring the stream. `Ising` is
+    /// `Copy`, so this is a cheap value, not a borrow.
+    pub fn model(&self) -> Ising {
+        self.model
+    }
+
+    /// Stream from the warmed-up state, one [`Configuration`] per
+    /// `sweeps_between` sweeps. Bound it with `.take(n)`; the sampler retains
+    /// nothing, and calling this again continues the same chain.
     ///
     /// ```
     /// # use plaquette::config::RunConfig;
     /// # use plaquette::{measure, Sampler};
     /// # let run = RunConfig::parse("shape=[8,8]\nj=1.0\nbeta=0.44\nthermalize=10\nsweeps_between=1\nn_samples=5\nseed=1").unwrap();
     /// let mut sampler = Sampler::new(&run);
-    /// let chain = sampler.samples();
-    /// let (lattice, model) = (chain.lattice(), chain.action());
-    /// let energies: Vec<f64> = chain.take(5).map(|c| measure(model, lattice, &c).energy).collect();
+    /// let (lattice, model) = (sampler.lattice(), sampler.model());
+    /// let energies: Vec<f64> = sampler
+    ///     .samples()
+    ///     .take(5)
+    ///     .map(|c| measure(&model, &lattice, &c).energy)
+    ///     .collect();
     /// ```
-    pub fn samples(&mut self) -> SampleChain<'_> {
-        Chain::new(
-            &mut self.state,
-            &self.lattice,
-            &self.model,
-            &self.updater,
-            self.beta,
-            &mut self.rng,
-            self.sweeps_between,
-        )
+    pub fn samples(&mut self) -> AnyChain<'_> {
+        let Sampler {
+            lattice,
+            model,
+            beta,
+            sweeps_between,
+            engine,
+        } = self;
+        match engine {
+            Engine::Cpu {
+                rng,
+                updater,
+                state,
+            } => AnyChain::Cpu(Chain::new(
+                state,
+                lattice,
+                model,
+                updater,
+                *beta,
+                rng,
+                *sweeps_between,
+            )),
+            Engine::Gpu(chain) => AnyChain::Gpu(chain),
+        }
     }
 }
 
@@ -159,8 +238,7 @@ mod tests {
     }
 
     /// A checkerboard-configured run streams too: the `UpdaterKind` from the
-    /// config selects `AnyUpdater::Checkerboard`, which the sampler drives exactly
-    /// like any other updater.
+    /// config selects the CPU checkerboard, driven like any other updater.
     #[test]
     fn streams_with_the_checkerboard_updater() {
         let mut run = config();
@@ -173,18 +251,37 @@ mod tests {
         assert!(configs.iter().all(|c| c.n_sites() == 64));
     }
 
-    /// The geometry accessors let a consumer measure the stream without owning a
-    /// second lattice.
+    /// A GPU-configured run streams through the same interface. Skips when no GPU
+    /// adapter is available, so the suite stays green on a headless runner.
     #[test]
-    fn measures_the_stream_via_chain_accessors() {
+    fn streams_with_the_gpu_checkerboard() {
+        if crate::gpu::Gpu::new().is_none() {
+            eprintln!("no GPU adapter available; skipping GPU test");
+            return;
+        }
+        let mut run = config();
+        run.updater = UpdaterKind::GpuCheckerboard;
+
+        let mut sampler = Sampler::new(&run);
+        let configs: Vec<_> = sampler.samples().take(5).collect();
+
+        assert_eq!(configs.len(), 5);
+        assert!(configs.iter().all(|c| c.n_sites() == 64));
+    }
+
+    /// Geometry off the sampler lets a consumer measure the stream without owning
+    /// a second lattice.
+    #[test]
+    fn measures_the_stream_via_sampler_geometry() {
         let mut sampler = Sampler::new(&config());
-        let chain = sampler.samples();
-        let (lattice, model) = (chain.lattice(), chain.action());
+        let lattice = sampler.lattice();
+        let model = sampler.model();
         let n_sites = lattice.n_sites() as f64;
 
-        let energies: Vec<f64> = chain
+        let energies: Vec<f64> = sampler
+            .samples()
             .take(3)
-            .map(|c| measure(model, lattice, &c).energy)
+            .map(|c| measure(&model, &lattice, &c).energy)
             .collect();
 
         assert_eq!(energies.len(), 3);

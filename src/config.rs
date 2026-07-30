@@ -39,13 +39,20 @@ pub enum Start {
 /// [`Updater`](crate::updater::Updater) trait. Being a closed set is what makes
 /// it recordable, unlike an arbitrary caller-supplied implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum UpdaterKind {
-    /// Single-spin-flip Metropolis ([`Metropolis`](crate::updater::Metropolis)).
+    /// Single-spin-flip Metropolis on the CPU
+    /// ([`Metropolis`](crate::updater::Metropolis)).
     Metropolis,
-    /// Single-spin-flip Metropolis under a checkerboard schedule
+    /// Single-spin-flip Metropolis under a checkerboard schedule, on the CPU
     /// ([`Checkerboard`](crate::updater::Checkerboard)).
     Checkerboard,
+    /// The checkerboard schedule run on the GPU
+    /// ([`GpuChain`](crate::gpu::GpuChain)); serializes as `gpu_checkerboard`.
+    /// The GPU's only algorithm is the checkerboard, so backend and schedule are
+    /// one choice rather than two — which keeps illegal combinations
+    /// unrepresentable.
+    GpuCheckerboard,
 }
 
 /// A single run's parameters in serializable form: everything needed to produce
@@ -354,6 +361,20 @@ mod tests {
         assert_eq!(
             RunConfig::parse(&text).unwrap().updater,
             UpdaterKind::Checkerboard
+        );
+    }
+
+    #[test]
+    fn parses_and_round_trips_the_gpu_checkerboard_updater() {
+        let mut config = sample_config();
+        config.updater = UpdaterKind::GpuCheckerboard;
+
+        // Two words -> snake_case; survives the round-trip.
+        let text = config.to_toml().unwrap();
+        assert!(text.contains(r#"updater = "gpu_checkerboard""#));
+        assert_eq!(
+            RunConfig::parse(&text).unwrap().updater,
+            UpdaterKind::GpuCheckerboard
         );
     }
 

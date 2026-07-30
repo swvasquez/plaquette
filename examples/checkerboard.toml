@@ -1,0 +1,21 @@
+# CPU checkerboard run. Same physics as run.toml, different schedule:
+#
+#     cargo run --release --example ising -- examples/checkerboard.toml
+#
+# On CPU the checkerboard samples the same distribution as metropolis, just in a
+# fixed color order (see docs/metropolis.md).
+
+shape = [16, 16]
+j = 1.0
+h = 0.0
+beta = 0.44
+
+updater = "checkerboard"
+thermalize = 500
+sweeps_between = 5
+n_samples = 1000
+
+seed = 20260718
+start = "hot"
+
+description = "16x16 at T_c, CPU checkerboard"
