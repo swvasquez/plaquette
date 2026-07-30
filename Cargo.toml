@@ -1,0 +1,8 @@
+[package]
+name = "plaquette"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A framework for Monte Carlo simulation of lattice models."
+repository = "https://github.com/swvasquez/plaquette"
+readme = "README.md"
