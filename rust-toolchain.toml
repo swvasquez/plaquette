@@ -1,0 +1,9 @@
+# The toolchain every checkout uses, so a lint that fails in CI fails locally
+# too. Updating Rust is then a commit here rather than whatever each machine
+# happens to have installed.
+#
+# This is not the crate's minimum supported version — that is `rust-version` in
+# Cargo.toml, and it may lag this one.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

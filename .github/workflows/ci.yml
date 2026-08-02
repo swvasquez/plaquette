@@ -26,11 +26,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+      # Reads rust-toolchain.toml, so the version and components are declared in
+      # one place and CI cannot drift from a local checkout. Caches the
+      # dependency build itself, which matters because wgpu is a long compile.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       # Mesa's lavapipe is a software Vulkan implementation, so the GPU
       # checkerboard backend runs on a runner with no graphics hardware. The
