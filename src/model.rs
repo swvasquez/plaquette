@@ -902,9 +902,9 @@ mod tests {
         // Asking for 10 gets 4 / 2 = 2, so sides 0..=2.
         let table = action.wilson_rectangles(&lat, &config, 10);
         assert_eq!(table.len(), 3);
-        for r in 0..3 {
-            for t in 0..3 {
-                assert_eq!(table[r][t], table[t][r], "{r}x{t}");
+        for (r, row) in table.iter().enumerate() {
+            for (t, &value) in row.iter().enumerate() {
+                assert_eq!(value, table[t][r], "{r}x{t}");
             }
         }
     }

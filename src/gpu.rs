@@ -169,7 +169,7 @@ impl GpuChain {
         // docs/metropolis.md.)
         let shape = lattice.shape();
         assert!(
-            shape[0] % 2 == 0 && shape[1] % 2 == 0,
+            shape[0].is_multiple_of(2) && shape[1].is_multiple_of(2),
             "GPU checkerboard needs even lattice extents, got {shape:?}"
         );
 

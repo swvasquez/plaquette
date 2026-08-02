@@ -52,7 +52,9 @@ enum Engine {
         /// The evolving configuration, lent to a transient [`Chain`] per call.
         state: Configuration<2>,
     },
-    Gpu(GpuChain),
+    /// Boxed because the device chain is far larger than the CPU variant, and an
+    /// enum is sized by its largest one.
+    Gpu(Box<GpuChain>),
 }
 
 /// A stream of thermalized [`Configuration`]s, over either backend.
@@ -127,7 +129,7 @@ impl IsingSampler {
                 GPU_BATCH,
             );
             chain.advance(config.thermalize);
-            Engine::Gpu(chain)
+            Engine::Gpu(Box::new(chain))
         } else {
             let updater = match config.updater {
                 UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
@@ -204,7 +206,7 @@ impl IsingSampler {
                 rng,
                 *sweeps_between,
             )),
-            Engine::Gpu(chain) => AnyChain::Gpu(chain),
+            Engine::Gpu(chain) => AnyChain::Gpu(chain.as_mut()),
         }
     }
 }
