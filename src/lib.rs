@@ -16,11 +16,8 @@
 //!
 //! The algorithms and the physics they rest on are written up under `docs/`.
 
-#![deny(missing_docs)]
-// Denied rather than forbidden, so an eventual need — FFI, or unchecked indexing
-// in a hot loop — is a reviewable exception at one site instead of dropping the
-// rule for the whole crate.
-#![deny(unsafe_code)]
+// Lints are configured in Cargo.toml's `[lints]` table, which covers the tests
+// and examples too rather than the library target alone.
 
 pub mod chain;
 pub mod config;

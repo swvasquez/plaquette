@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["monte-carlo", "lattice", "physics", "ising", "gauge-theory"]
 categories = ["science", "simulation"]
 
+# Applied to every target in the package, so tests and examples are held to the
+# same rules as the library. `unsafe_code` is denied rather than forbidden, so an
+# eventual need — FFI, or unchecked indexing in a hot loop — is a reviewable
+# exception at one site instead of dropping the rule for the whole crate.
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 pollster = "1.0.1"
