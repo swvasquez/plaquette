@@ -58,3 +58,7 @@ jobs:
       - run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+      # Builds the crate from its own packaged tarball, so a file left out of the
+      # package fails here rather than after a version is published and immutable.
+      - run: cargo publish --dry-run --locked
