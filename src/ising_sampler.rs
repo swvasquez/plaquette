@@ -259,8 +259,7 @@ mod tests {
     /// adapter is available, so the suite stays green on a headless runner.
     #[test]
     fn streams_with_the_gpu_checkerboard() {
-        if crate::gpu::Gpu::new().is_none() {
-            eprintln!("no GPU adapter available; skipping GPU test");
+        if crate::gpu::require_gpu().is_none() {
             return;
         }
         let mut run = config();

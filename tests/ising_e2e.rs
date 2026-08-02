@@ -100,13 +100,30 @@ fn cpu_checkerboard_orders_at_low_temperature() {
     );
 }
 
+/// Whether a GPU test can run here, mirroring the crate's internal guard.
+///
+/// An integration test compiles against the published API, so it cannot reach
+/// the crate-internal helper and repeats the rule instead: skip when no adapter
+/// is present, but fail when `PLAQUETTE_REQUIRE_GPU` says one is expected — CI
+/// sets it so a driver that fails to load is a failure, not a silent pass.
+fn gpu_available() -> bool {
+    if plaquette::Gpu::new().is_some() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("PLAQUETTE_REQUIRE_GPU").is_none(),
+        "PLAQUETTE_REQUIRE_GPU is set but no GPU adapter is available"
+    );
+    eprintln!("no GPU adapter available; skipping GPU end-to-end test");
+    false
+}
+
 /// GPU checkerboard: the device backend orders too. Skips rather than fails when
 /// no GPU adapter is present, so the suite stays green on a headless runner —
 /// the same guard the inline GPU tests use.
 #[test]
 fn gpu_checkerboard_orders_at_low_temperature() {
-    if plaquette::Gpu::new().is_none() {
-        eprintln!("no GPU adapter available; skipping GPU end-to-end test");
+    if !gpu_available() {
         return;
     }
     let mean_abs_m = mean_abs_magnetization("gpu_checkerboard");

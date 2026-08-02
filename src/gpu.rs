@@ -51,7 +51,10 @@ impl Gpu {
     }
 
     async fn new_async() -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // Built from the environment so `WGPU_BACKEND` can pin the backend, which
+        // both aids debugging and gives the tests a way to simulate a machine
+        // with no adapter. Unset, it enables every backend, as the default does.
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -423,6 +426,27 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// A device for a GPU test, or `None` when this machine has no adapter.
+///
+/// Skipping keeps the suite green on a machine without a GPU, but it would also
+/// hide a driver that failed to load where a device is expected, since a skipped
+/// test and a passing one look alike. Setting `PLAQUETTE_REQUIRE_GPU` — as CI
+/// does, alongside a software Vulkan driver — turns a missing adapter into a
+/// failure instead.
+#[cfg(test)]
+pub(crate) fn require_gpu() -> Option<Gpu> {
+    match Gpu::new() {
+        Some(gpu) => Some(gpu),
+        None if std::env::var_os("PLAQUETTE_REQUIRE_GPU").is_some() => {
+            panic!("PLAQUETTE_REQUIRE_GPU is set but no GPU adapter is available")
+        }
+        None => {
+            eprintln!("no GPU adapter available; skipping GPU test");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,13 +454,10 @@ mod tests {
     use crate::observables::measure;
     use crate::rng::RandRng;
 
-    /// A device can be acquired on this machine. Skips (rather than fails) when
-    /// no GPU adapter is available, so the suite stays green on a headless or
-    /// sandboxed runner.
+    /// A device can be acquired on this machine.
     #[test]
     fn initializes_a_device() {
-        let Some(_gpu) = Gpu::new() else {
-            eprintln!("no GPU adapter available; skipping GPU test");
+        let Some(_gpu) = require_gpu() else {
             return;
         };
     }
@@ -446,8 +467,7 @@ mod tests {
     /// unchanged. This exercises the buffer plumbing in isolation from the sweep.
     #[test]
     fn uploads_and_reads_back_unchanged() {
-        let Some(gpu) = Gpu::new() else {
-            eprintln!("no GPU adapter available; skipping GPU test");
+        let Some(gpu) = require_gpu() else {
             return;
         };
         let lat = Lattice::new([4, 4]);
@@ -466,8 +486,7 @@ mod tests {
     /// This is a distributional check — the RNGs differ, so it is not bit-for-bit.
     #[test]
     fn matches_the_cpu_checkerboard_distribution() {
-        let Some(gpu) = Gpu::new() else {
-            eprintln!("no GPU adapter available; skipping GPU test");
+        let Some(gpu) = require_gpu() else {
             return;
         };
 
