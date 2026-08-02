@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 description = "A framework for Monte Carlo simulation of lattice models."
 repository = "https://github.com/swvasquez/plaquette"
 readme = "README.md"
+keywords = ["monte-carlo", "lattice", "physics", "ising", "gauge-theory"]
+categories = ["science", "simulation"]
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
