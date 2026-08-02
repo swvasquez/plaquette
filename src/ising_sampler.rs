@@ -64,7 +64,9 @@ enum Engine {
 /// variant is a transient [`Chain`] borrowing the sampler; the GPU variant a
 /// mutable borrow of the sampler's persistent [`GpuChain`].
 pub enum AnyChain<'a> {
+    /// A transient chain borrowing the sampler's state for the length of the run.
     Cpu(Chain<'a, 2, 2, Ising, AnyUpdater, RandRng>),
+    /// A mutable borrow of the sampler's persistent device chain.
     Gpu(&'a mut GpuChain),
 }
 

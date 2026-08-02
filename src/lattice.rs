@@ -54,7 +54,9 @@
 /// name rather than competing for that word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sign {
+    /// A step along `+μ`.
     Plus,
+    /// A step along `−μ`.
     Minus,
 }
 

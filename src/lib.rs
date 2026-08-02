@@ -1,3 +1,23 @@
+//! A framework for Monte Carlo simulation of lattice models.
+//!
+//! A run is assembled from a few interchangeable pieces: a [`Lattice`] fixes the
+//! geometry, an [`Action`] gives the energy of a [`Configuration`] on it, and an
+//! [`Updater`] proposes and accepts changes. A [`Chain`] drives those pieces to
+//! produce a stream of configurations, and [`measure`] turns each one into a
+//! [`Sample`] of observables that [`reduce`] aggregates into estimates with
+//! error bars.
+//!
+//! Two models run today. The two-dimensional Ising model is sampled by
+//! single-spin Metropolis or by a checkerboard sweep, the latter on either the
+//! CPU or the GPU; the three-dimensional Z2 gauge model is sampled by Metropolis
+//! over links. Each has a sampler — [`IsingSampler`] and [`GaugeSampler`] — that
+//! builds a thermalized chain from a run configuration parsed from TOML, which
+//! is how the examples under `examples/` are driven.
+//!
+//! The algorithms and the physics they rest on are written up under `docs/`.
+
+#![deny(missing_docs)]
+
 pub mod chain;
 pub mod config;
 pub mod configuration;
