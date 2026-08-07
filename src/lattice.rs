@@ -76,6 +76,14 @@ pub struct Lattice<const D: usize> {
     /// `2 * (D - 1)` plaquettes containing a link, the three other links of
     /// that plaquette, in consecutive groups of three.
     staples: Vec<usize>,
+    /// Coordinate-sum parity per site, `0` or `1` — the checkerboard color.
+    ///
+    /// A table rather than a computation because the checkerboard schedules ask
+    /// for it twice per variable update, and deriving it needs
+    /// [`site_coords`](Lattice::site_coords), whose divisions by runtime extents
+    /// measured at roughly a third of a whole CPU sweep. One byte per site is
+    /// nothing beside the neighbor table already here.
+    parities: Vec<u8>,
     // TODO: `dir_strides` is recomputed on every `site_index`, `site_coords`,
     // and `site_shift` call; cache it here if any of them lands in a hot loop.
     // TODO: boundary conditions are hardcoded periodic; make swappable
@@ -107,18 +115,24 @@ impl<const D: usize> Lattice<D> {
         }
 
         let mut neighbors = vec![0usize; n_sites * stride];
+        // Filled in the same pass, since decomposing the site index is most of
+        // the cost of either table and this loop already does it.
+        let mut parities = vec![0u8; n_sites];
         for site in 0..n_sites {
+            let mut coord_sum = 0usize;
             for mu in 0..D {
                 let l = shape[mu];
                 let s = dir_stride[mu];
                 let coord = (site / s) % l;
                 let base = site - coord * s;
+                coord_sum += coord;
 
                 // Periodic wrap without a branch: add `l` before the modulo so
                 // the backward step never underflows on usize.
                 neighbors[site * stride + 2 * mu] = base + ((coord + 1) % l) * s;
                 neighbors[site * stride + 2 * mu + 1] = base + ((coord + l - 1) % l) * s;
             }
+            parities[site] = (coord_sum % 2) as u8;
         }
 
         // The staple table is derived from the plaquette enumeration, which
@@ -128,6 +142,7 @@ impl<const D: usize> Lattice<D> {
             shape,
             neighbors,
             staples: Vec::new(),
+            parities,
         };
         lattice.staples = lattice.build_staples();
         lattice
@@ -184,7 +199,7 @@ impl<const D: usize> Lattice<D> {
 ///
 /// Every `*_index` takes coordinates, and the parts come back separately rather
 /// than as a tuple mixing a site with a direction. The packed forms that skip
-/// the coordinate round trip (`link_at`, `link_base`, and their plaquette
+/// the coordinate round trip (`site_link`, `link_base`, and their plaquette
 /// counterparts) stay private until something outside proves it needs them. All
 /// of this is arithmetic on `shape`; none of it reads a table.
 impl<const D: usize> Lattice<D> {
@@ -230,7 +245,19 @@ impl<const D: usize> Lattice<D> {
     /// Linear index of the link based at `coords` and running along `dir`, i.e.
     /// the forward edge from that site to its `+dir` neighbor.
     pub fn link_index(&self, coords: [usize; D], dir: usize) -> usize {
-        self.link_at(self.site_index(coords), dir)
+        self.site_link(self.site_index(coords), dir)
+    }
+
+    /// The site's checkerboard color: the parity of its coordinate sum, `0` or
+    /// `1`.
+    ///
+    /// Two sites of the same color are never nearest neighbors on an even
+    /// lattice, because a step along any axis changes one coordinate by one and
+    /// so flips the parity. Read from a table built at construction, because the
+    /// checkerboard schedules ask for it twice per variable update and computing
+    /// it costs a division per axis.
+    pub fn site_parity(&self, site: usize) -> usize {
+        self.parities[site] as usize
     }
 
     /// The base site of `link`, i.e. the end it points away from.
@@ -268,11 +295,14 @@ impl<const D: usize> Lattice<D> {
     /// The link leaving `site` along `dir`, with the base site already packed.
     ///
     /// Packed `site * D + dir`, direction fastest, so a site's `D` links are
-    /// contiguous just like its neighbor row. The public
-    /// [`link_index`](Lattice::link_index) takes coordinates, so this is the
-    /// form the incidence accessors and the table builder use to avoid a
-    /// pointless round trip through `site_coords`.
-    fn link_at(&self, site: usize, dir: usize) -> usize {
+    /// contiguous just like its neighbor row. [`link_index`](Lattice::link_index)
+    /// takes coordinates, which is the right interface for naming a link in a
+    /// formula but the wrong one for a sweep that already holds a site index —
+    /// going through coordinates and back costs a divide per axis each way to
+    /// recover a number that is one multiply-add. So this is the form the
+    /// incidence accessors, the table builder, and any schedule visiting one
+    /// link per site per direction use.
+    pub fn site_link(&self, site: usize, dir: usize) -> usize {
         debug_assert!(site < self.n_sites(), "site out of range");
         debug_assert!(dir < D, "direction out of range");
         site * D + dir
@@ -425,9 +455,9 @@ impl<const D: usize> Lattice<D> {
         (0..2 * D).map(move |i| {
             let dir = i / 2;
             if i % 2 == 0 {
-                self.link_at(site, dir)
+                self.site_link(site, dir)
             } else {
-                self.link_at(self.site_neighbor(site, dir, Sign::Minus), dir)
+                self.site_link(self.site_neighbor(site, dir, Sign::Minus), dir)
             }
         })
     }
@@ -479,10 +509,10 @@ impl<const D: usize> Lattice<D> {
         let site_mu = self.site_neighbor(site, mu, Sign::Plus);
         let site_nu = self.site_neighbor(site, nu, Sign::Plus);
         [
-            self.link_at(site, mu),
-            self.link_at(site_mu, nu),
-            self.link_at(site_nu, mu),
-            self.link_at(site, nu),
+            self.site_link(site, mu),
+            self.site_link(site_mu, nu),
+            self.site_link(site_nu, mu),
+            self.site_link(site, nu),
         ]
     }
 
@@ -503,7 +533,7 @@ impl<const D: usize> Lattice<D> {
     }
 
     /// Entries per link in the staple table: `2 * (D - 1)` groups of three.
-    const fn staple_stride() -> usize {
+    pub(crate) const fn staple_stride() -> usize {
         6 * D.saturating_sub(1)
     }
 
@@ -530,13 +560,13 @@ impl<const D: usize> Lattice<D> {
         path.steps().iter().scan(base, move |site, &(dir, sign)| {
             Some(match sign {
                 Sign::Plus => {
-                    let link = self.link_at(*site, dir);
+                    let link = self.site_link(*site, dir);
                     *site = self.site_neighbor(*site, dir, Sign::Plus);
                     link
                 }
                 Sign::Minus => {
                     *site = self.site_neighbor(*site, dir, Sign::Minus);
-                    self.link_at(*site, dir)
+                    self.site_link(*site, dir)
                 }
             })
         })
@@ -668,6 +698,21 @@ mod tests {
         assert_eq!(lat.neighbors.len(), 64);
     }
 
+    /// The parity table agrees with the definition it caches. Built alongside
+    /// the neighbor table for speed, it would otherwise be free to drift from
+    /// the coordinate sum it is supposed to be — including on odd extents, where
+    /// the wrap puts same-parity sites next to each other and the table must
+    /// still report the honest value.
+    #[test]
+    fn parity_table_matches_the_coordinate_sum() {
+        for lat in [Lattice::new([4, 6, 2]), Lattice::new([3, 5, 3])] {
+            for site in 0..lat.n_sites() {
+                let expected = lat.site_coords(site).iter().sum::<usize>() % 2;
+                assert_eq!(lat.site_parity(site), expected, "site {site}");
+            }
+        }
+    }
+
     #[test]
     fn known_neighbors_on_3x3() {
         let lat = Lattice::new([3, 3]);
@@ -739,10 +784,10 @@ mod tests {
         for site in 0..lat.n_sites() {
             for dir in 0..3 {
                 assert_eq!(
-                    lat.link_at(site, dir),
+                    lat.site_link(site, dir),
                     lat.link_index(lat.site_coords(site), dir)
                 );
-                assert_eq!(lat.link_base(lat.link_at(site, dir)), (site, dir));
+                assert_eq!(lat.link_base(lat.site_link(site, dir)), (site, dir));
             }
         }
     }
@@ -1144,14 +1189,14 @@ mod tests {
     #[test]
     fn a_backward_step_crosses_the_link_it_arrives_at() {
         // Links are named by their forward end, so stepping `−μ` out of a site
-        // crosses the link based at the neighbour, not at the site left behind.
+        // crosses the link based at the neighbor, not at the site left behind.
         let lat = Lattice::new([4, 4]);
         let there_and_back = [(0, Sign::Minus), (0, Sign::Plus)];
         let path = Loop::new(&lat, &there_and_back).expect("retracing closes");
 
         let back = lat.site_neighbor(5, 0, Sign::Minus);
         let walked: Vec<_> = lat.loop_links(5, &path).collect();
-        assert_eq!(walked, vec![lat.link_at(back, 0), lat.link_at(back, 0)]);
+        assert_eq!(walked, vec![lat.site_link(back, 0), lat.site_link(back, 0)]);
     }
 
     #[test]

@@ -4,7 +4,7 @@ The Z2 gauge theory is a lattice of two-state variables with an interaction buil
 from products around the smallest closed loops. It shares the Ising model's
 alphabet — every variable is a $\pm 1$ — but moves those variables off the sites
 and onto the links between them, and scores a configuration by the elementary
-square faces of the lattice rather than by nearest-neighbour bonds. That shift is
+square faces of the lattice rather than by nearest-neighbor bonds. That shift is
 the whole character of the model: it introduces a local symmetry, a redundancy in
 the description that no site model has, and everything downstream — which
 configurations count as the same, which quantities are meaningful to measure —
@@ -15,7 +15,7 @@ follows from it.
 The lattice is a three-dimensional cubic grid of $N$ sites with periodic
 boundaries, the same toroidal geometry the Ising model uses. What differs is where
 the degrees of freedom sit. Instead of one variable per site, a variable lives on
-each *link* — each edge joining a site to its nearest neighbour. A site has one
+each *link* — each edge joining a site to its nearest neighbor. A site has one
 forward link along each of the three axes, so the lattice carries $3N$ links in
 all, and a link is named by its base site $i$ together with the axis $\mu$ it
 points along, written $\ell = (i, \mu)$.
@@ -37,7 +37,7 @@ $$\sigma_\ell = \pm 1,$$
 so a configuration is a choice of $\sigma_\ell$ on all $3N$ links, and there are
 $2^{3N}$ of them. The variable is an element of the group $\mathbb{Z}_2 = \{+1,
 -1\}$ under multiplication, and reading it as a group element rather than a spin is
-what generalises: replacing $\mathbb{Z}_2$ by a larger group is the path from this
+what generalizes: replacing $\mathbb{Z}_2$ by a larger group is the path from this
 model toward the continuous gauge theories that are the longer-term aim.
 
 ## The plaquette energy

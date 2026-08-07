@@ -15,12 +15,12 @@ concrete language).
 ## Ground claims in the code
 
 Read the source a claim rests on and confirm it before writing. Don't describe
-intended or future behaviour as current; when the code and a claim disagree,
+intended or future behavior as current; when the code and a claim disagree,
 soften to what the code shows and tell the user.
 
-## Labelled requirements
+## Labeled requirements
 
-State load-bearing obligations as labelled requirements so code comments and tests
+State load-bearing obligations as labeled requirements so code comments and tests
 can cite them. Give each doc a short prefix and number sequentially in reading
 order (e.g. `M1, M2, …`). Each requirement is one claim: a short bold lead clause,
 then prose that justifies it and says what breaks if it fails. Let earlier ones be
@@ -38,10 +38,9 @@ $\Delta E$ energy difference).
 ## Structure
 
 Open with a short scope paragraph: what the file covers and how it relates to the
-code. Develop the requirements in grouped sections, and close with a `## Status`
-paragraph recording what the doc reflects as of writing. Keep top-level headings
-to simple, concise phrases that name the theme (`## Algorithm`, `## Correctness`,
-`## Status`) — not full sentences or generic labels.
+code. Develop the requirements in grouped sections. Keep top-level headings to
+simple, concise phrases that name the theme (`## Algorithm`, `## Correctness`) —
+not full sentences or generic labels.
 
 ## Tone
 

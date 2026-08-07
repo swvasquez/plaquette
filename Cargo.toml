@@ -50,3 +50,7 @@ path = "examples/ising/bench.rs"
 [[example]]
 name = "gauge"
 path = "examples/gauge/gauge.rs"
+
+[[example]]
+name = "gauge_bench"
+path = "examples/gauge/bench.rs"

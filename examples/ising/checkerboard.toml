@@ -10,7 +10,7 @@ j = 1.0
 h = 0.0
 beta = 0.44
 
-updater = "checkerboard"
+updater = "site_checkerboard"
 thermalize = 500
 sweeps_between = 5
 n_samples = 1000

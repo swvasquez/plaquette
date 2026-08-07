@@ -73,6 +73,9 @@ those instead of abstract or invented jargon. Don't reach for phrases like
 is genuinely load-bearing, define it once in plain words rather than leaning on
 it.
 
+Spell in American English throughout — code, comments, docs, and prose alike
+(color not colour, neighbor not neighbour, generalize not generalise).
+
 ### Checking in
 
 Don't close every response by asking whether to proceed or implement. Ask once

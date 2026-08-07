@@ -194,7 +194,7 @@ fn main() {
     }
 
     // The same sizes again, now as Creutz ratios. Each one needs the three
-    // smaller neighbours of `(r, t)`, and row and column zero being the trivial
+    // smaller neighbors of `(r, t)`, and row and column zero being the trivial
     // `1.0` anchor is exactly what makes `chi(1,1)` fall back to `-log <W(1,1)>`.
     for r in 1..sides {
         for t in r..sides {

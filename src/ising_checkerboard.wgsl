@@ -32,31 +32,6 @@ struct Push {
 @group(0) @binding(2) var<uniform> params: Params;
 var<push_constant> pc: Push;
 
-// index 0 -> +1, index 1 -> -1 (matches the CPU `spin` map).
-fn spin_pm(s: u32) -> i32 {
-    return 1 - 2 * i32(s);
-}
-
-// A 32-bit integer finalizer (the "lowbias32" hash) — good mixing, cheap, and
-// identical in Rust and WGSL since u32 arithmetic wraps in both.
-fn lowbias32(x: u32) -> u32 {
-    var v = x;
-    v = v ^ (v >> 16u);
-    v = v * 0x7feb352du;
-    v = v ^ (v >> 15u);
-    v = v * 0x846ca68bu;
-    v = v ^ (v >> 16u);
-    return v;
-}
-
-// A uniform in [0, 1) keyed by (seed, site, sweep), with 24 bits of mantissa.
-fn keyed_uniform(seed: u32, site: u32, sweep: u32) -> f32 {
-    var k = seed;
-    k = lowbias32(k ^ site);
-    k = lowbias32(k ^ (sweep * 0x9e3779b9u));
-    return f32(k >> 8u) * (1.0 / 16777216.0);
-}
-
 @compute @workgroup_size(64)
 fn sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
     let site = gid.x;
@@ -71,7 +46,8 @@ fn sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let si = spin_pm(spins[site]);
+    let current = spins[site];
+    let si = spin_pm(current);
     var nsum: i32 = 0;
     for (var d = 0u; d < 4u; d = d + 1u) {
         nsum = nsum + spin_pm(spins[neighbors[site * 4u + d]]);
@@ -82,6 +58,6 @@ fn sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let u = keyed_uniform(params.seed, site, pc.sweep);
     if (dE <= 0.0 || u < exp(-params.beta * dE)) {
-        spins[site] = 1u - spins[site];
+        spins[site] = 1u - current;
     }
 }

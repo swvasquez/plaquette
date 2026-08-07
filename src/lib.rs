@@ -7,10 +7,13 @@
 //! [`Sample`] of observables that [`reduce`] aggregates into estimates with
 //! error bars.
 //!
-//! Two models run today. The two-dimensional Ising model is sampled by
-//! single-spin Metropolis or by a checkerboard sweep, the latter on either the
-//! CPU or the GPU; the three-dimensional Z2 gauge model is sampled by Metropolis
-//! over links. Each has a sampler — [`IsingSampler`] and [`GaugeSampler`] — that
+//! Two models run today, each by Metropolis or by a checkerboard sweep, and each
+//! checkerboard on either the CPU or the GPU. The two colorings differ because
+//! the variables do: the two-dimensional Ising model colors a *site* by the
+//! parity of its coordinate sum, while the three-dimensional Z2 gauge model
+//! colors a *link* by its direction as well as its base site's parity, so that
+//! no two links updated together share a plaquette. Each has a sampler —
+//! [`IsingSampler`] and [`GaugeSampler`] — that
 //! builds a thermalized chain from a run configuration parsed from TOML, which
 //! is how the examples under `examples/` are driven.
 //!
@@ -22,10 +25,12 @@
 pub mod chain;
 pub mod config;
 pub mod configuration;
+pub mod device;
 pub mod gauge_config;
+pub mod gauge_gpu;
 pub mod gauge_sampler;
-pub mod gpu;
 pub mod ising_config;
+pub mod ising_gpu;
 pub mod ising_sampler;
 pub mod lattice;
 pub mod model;
@@ -38,11 +43,13 @@ pub mod updater;
 pub use chain::Chain;
 pub use config::{ConfigError, Start, UpdaterKind};
 pub use configuration::{Cell, Configuration};
+pub use device::Gpu;
 pub use gauge_config::GaugeRunConfig;
-pub use gauge_sampler::GaugeSampler;
-pub use gpu::{Gpu, GpuChain};
+pub use gauge_gpu::GpuGaugeChain;
+pub use gauge_sampler::{AnyGaugeChain, GaugeSampler};
 pub use ising_config::IsingRunConfig;
-pub use ising_sampler::{AnyChain, IsingSampler};
+pub use ising_gpu::GpuIsingChain;
+pub use ising_sampler::{AnyIsingChain, IsingSampler};
 pub use lattice::{Lattice, Loop, Sign};
 pub use model::{Action, AnyAction};
 pub use observables::{
@@ -55,4 +62,4 @@ pub use statistics::{
     Derived, Estimate, MIN_EFFECTIVE_SAMPLES, binder_cumulant, creutz_ratio, reduce, specific_heat,
     susceptibility,
 };
-pub use updater::{AnyUpdater, Checkerboard, Metropolis, Updater};
+pub use updater::{AnyUpdater, LinkCheckerboard, Metropolis, SiteCheckerboard, Updater};

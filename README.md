@@ -17,11 +17,12 @@ cargo build
 
 `plaquette` currently implements two models:
 
-| Model    | Dimension | Implementation | Device   |
-| -------- | --------- | -------------- | -------- |
-| Ising    | 2D        | Metropolis     | CPU      |
-| Ising    | 2D        | Checkerboard   | CPU, GPU |
-| Z2 gauge | 3D        | Metropolis     | CPU      |
+| Model    | Dimension | Implementation     | Device   |
+| -------- | --------- | ------------------ | -------- |
+| Ising    | 2D        | Metropolis         | CPU      |
+| Ising    | 2D        | Site checkerboard  | CPU, GPU |
+| Z2 gauge | 3D        | Metropolis         | CPU      |
+| Z2 gauge | 3D        | Link checkerboard  | CPU, GPU |
 
 Refer to [`docs/`](docs/) for descriptions of used algorithms.
 

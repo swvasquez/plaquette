@@ -93,7 +93,7 @@ fn cpu_metropolis_orders_at_low_temperature() {
 /// same threshold — only the update rule differs.
 #[test]
 fn cpu_checkerboard_orders_at_low_temperature() {
-    let mean_abs_m = mean_abs_magnetization("checkerboard");
+    let mean_abs_m = mean_abs_magnetization("site_checkerboard");
     assert!(
         mean_abs_m > 0.5,
         "low-T checkerboard run should order: mean |m| = {mean_abs_m}"
@@ -126,7 +126,7 @@ fn gpu_checkerboard_orders_at_low_temperature() {
     if !gpu_available() {
         return;
     }
-    let mean_abs_m = mean_abs_magnetization("gpu_checkerboard");
+    let mean_abs_m = mean_abs_magnetization("gpu_site_checkerboard");
     assert!(
         mean_abs_m > 0.5,
         "low-T GPU checkerboard run should order: mean |m| = {mean_abs_m}"

@@ -19,7 +19,7 @@
 //! Dispatching to a general `Lattice<D>` from a variable-length shape is
 //! deferred.
 
-use crate::config::{ConfigError, Start, UpdaterKind, deserialize_shape};
+use crate::config::{ConfigError, Start, UpdaterKind, check_updater, deserialize_shape};
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::model::Ising;
@@ -47,7 +47,7 @@ pub struct IsingRunConfig {
     /// run a smaller lattice than the file names.
     #[serde(deserialize_with = "deserialize_shape")]
     pub shape: [usize; 2],
-    /// Nearest-neighbour coupling `J`.
+    /// Nearest-neighbor coupling `J`.
     pub j: f64,
     /// Uniform external field `h`; defaults to `0.0` when omitted — the
     /// field-free model, which is the standard case. `j` stays required, since
@@ -122,6 +122,11 @@ impl IsingRunConfig {
     /// non-positive or non-finite `beta`, a non-finite coupling or field, and a
     /// run that would record no samples. `thermalize` and `sweeps_between` may
     /// be zero — no warmup and no decorrelation gap are unusual but legitimate.
+    ///
+    /// The updater rules are `check_updater`'s, applied against
+    /// [`Cell::Site`]: this model's variables live on sites, so it takes the
+    /// grade-neutral Metropolis or a site schedule and refuses a link one, and a
+    /// schedule that colors in parallel additionally needs even extents.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if let Some(axis) = self.shape.iter().position(|&l| l == 0) {
             return Err(ConfigError::Invalid(format!(
@@ -148,6 +153,7 @@ impl IsingRunConfig {
                 self.h
             )));
         }
+        check_updater(self.updater, Cell::Site, &self.shape)?;
         if self.n_samples == 0 {
             return Err(ConfigError::Invalid(
                 "n_samples must be positive, or the run records nothing".to_string(),
@@ -274,28 +280,28 @@ mod tests {
     #[test]
     fn parses_and_round_trips_the_checkerboard_updater() {
         let mut config = sample_config();
-        config.updater = UpdaterKind::Checkerboard;
+        config.updater = UpdaterKind::SiteCheckerboard;
 
         // Serializes with the lowercase variant name, and survives the round-trip.
         let text = config.to_toml().unwrap();
-        assert!(text.contains(r#"updater = "checkerboard""#));
+        assert!(text.contains(r#"updater = "site_checkerboard""#));
         assert_eq!(
             IsingRunConfig::parse(&text).unwrap().updater,
-            UpdaterKind::Checkerboard
+            UpdaterKind::SiteCheckerboard
         );
     }
 
     #[test]
     fn parses_and_round_trips_the_gpu_checkerboard_updater() {
         let mut config = sample_config();
-        config.updater = UpdaterKind::GpuCheckerboard;
+        config.updater = UpdaterKind::GpuSiteCheckerboard;
 
         // Two words -> snake_case; survives the round-trip.
         let text = config.to_toml().unwrap();
-        assert!(text.contains(r#"updater = "gpu_checkerboard""#));
+        assert!(text.contains(r#"updater = "gpu_site_checkerboard""#));
         assert_eq!(
             IsingRunConfig::parse(&text).unwrap().updater,
-            UpdaterKind::GpuCheckerboard
+            UpdaterKind::GpuSiteCheckerboard
         );
     }
 
@@ -341,6 +347,43 @@ mod tests {
 
         config.beta = -0.5;
         assert!(invalid_message(&config).contains("beta"));
+    }
+
+    #[test]
+    fn validate_rejects_the_link_updaters() {
+        // The mirror of the gauge schema's rule: both link schedules color
+        // links, so neither says anything about a field living on sites.
+        for kind in [
+            UpdaterKind::LinkCheckerboard,
+            UpdaterKind::GpuLinkCheckerboard,
+        ] {
+            let mut config = sample_config();
+            config.updater = kind;
+            let message = invalid_message(&config);
+            assert!(message.contains("updates Site variables"), "{message}");
+            assert!(message.contains("colors Link variables"), "{message}");
+            assert!(message.contains(&format!("{kind:?}")), "{message}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_odd_extent_on_the_gpu() {
+        // A parallel color pass needs even extents. Caught here so a typo'd
+        // shape is a load-time error rather than a panic when the device chain
+        // is built — the CPU schedules are unaffected, since a sequential sweep
+        // has no such requirement.
+        let mut config = sample_config();
+        config.updater = UpdaterKind::GpuSiteCheckerboard;
+        config.shape = [16, 15];
+        let message = invalid_message(&config);
+        assert!(message.contains("even extents"), "{message}");
+        assert!(message.contains("axis 1"), "{message}");
+
+        config.updater = UpdaterKind::SiteCheckerboard;
+        assert!(
+            config.validate().is_ok(),
+            "an odd extent is fine on the CPU"
+        );
     }
 
     #[test]

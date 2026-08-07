@@ -23,7 +23,7 @@
 //! so it has no transition to find, while three dimensions has one. Dispatching
 //! to a general `Lattice<D>` from a variable-length shape is deferred.
 
-use crate::config::{ConfigError, Start, UpdaterKind, deserialize_shape};
+use crate::config::{ConfigError, Start, UpdaterKind, check_updater, deserialize_shape};
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::model::Z2Gauge;
@@ -131,13 +131,10 @@ impl GaugeRunConfig {
     ///
     /// Rejects what would otherwise panic or produce nothing — a zero extent, a
     /// non-positive or non-finite `beta`, a non-finite coupling, a run recording
-    /// no samples — and one rule the Ising side does not have: the updater must
-    /// be [`UpdaterKind::Metropolis`]. The checkerboard schedule colors *sites*
-    /// by the parity of their coordinates and the GPU backend is built around
-    /// that same site field, so neither has a meaning for variables sitting on
-    /// links; a gauge run under either would not be a slower or faster version
-    /// of the same physics, it would be wrong. The rule lives here rather than
-    /// in a narrower enum so the message can name what was asked for.
+    /// no samples — and applies `check_updater` against [`Cell::Link`]: this
+    /// model's variables live on links, so it takes the grade-neutral Metropolis
+    /// or a link schedule and refuses a site one, and a schedule that colors in
+    /// parallel additionally needs even extents.
     ///
     /// `thermalize` and `sweeps_between` may be zero — no warmup and no
     /// decorrelation gap are unusual but legitimate.
@@ -161,13 +158,7 @@ impl GaugeRunConfig {
                 self.j
             )));
         }
-        if self.updater != UpdaterKind::Metropolis {
-            return Err(ConfigError::Invalid(format!(
-                "a z2 gauge run updates links, which only the metropolis updater does, \
-                 but the config asks for {:?}",
-                self.updater
-            )));
-        }
+        check_updater(self.updater, Cell::Link, &self.shape)?;
         if self.n_samples == 0 {
             return Err(ConfigError::Invalid(
                 "n_samples must be positive, or the run records nothing".to_string(),
@@ -367,16 +358,60 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_every_updater_but_metropolis() {
-        // The rule the Ising schema does not have: both other schedules are
-        // built around a site field, so neither is a valid way to run this.
-        for kind in [UpdaterKind::Checkerboard, UpdaterKind::GpuCheckerboard] {
+    fn validate_rejects_the_site_updaters() {
+        // The rule the Ising schema does not have: both site schedules are built
+        // around a site field, so neither is a valid way to run this.
+        for kind in [
+            UpdaterKind::SiteCheckerboard,
+            UpdaterKind::GpuSiteCheckerboard,
+        ] {
             let mut config = sample_config();
             config.updater = kind;
             let message = invalid_message(&config);
-            assert!(message.contains("metropolis"), "{message}");
+            assert!(message.contains("updates Link variables"), "{message}");
+            assert!(message.contains("colors Site variables"), "{message}");
             assert!(message.contains(&format!("{kind:?}")), "{message}");
         }
+    }
+
+    #[test]
+    fn parses_and_round_trips_the_link_updaters() {
+        // The other half of the same rule: the link schedules are accepted, so
+        // they survive validation on the way through TOML and back.
+        for (kind, rendered) in [
+            (UpdaterKind::LinkCheckerboard, "link_checkerboard"),
+            (UpdaterKind::GpuLinkCheckerboard, "gpu_link_checkerboard"),
+        ] {
+            let mut config = sample_config();
+            config.updater = kind;
+
+            let text = config.to_toml().unwrap();
+            assert!(
+                text.contains(&format!(r#"updater = "{rendered}""#)),
+                "{text}"
+            );
+            assert_eq!(GaugeRunConfig::parse(&text).unwrap().updater, kind);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_odd_extent_on_the_gpu() {
+        // A parallel color pass needs even extents, so an odd shape is a
+        // load-time error naming the axis rather than a panic when the device
+        // chain is built. The CPU link schedule is unaffected — run in sequence,
+        // any link order is a valid Metropolis schedule.
+        let mut config = sample_config();
+        config.updater = UpdaterKind::GpuLinkCheckerboard;
+        config.shape = [8, 8, 7];
+        let message = invalid_message(&config);
+        assert!(message.contains("even extents"), "{message}");
+        assert!(message.contains("axis 2"), "{message}");
+
+        config.updater = UpdaterKind::LinkCheckerboard;
+        assert!(
+            config.validate().is_ok(),
+            "an odd extent is fine on the CPU"
+        );
     }
 
     #[test]
@@ -387,7 +422,7 @@ mod tests {
             shape = [4, 4, 4]
             j = 1.0
             beta = 0.5
-            updater = "gpu_checkerboard"
+            updater = "gpu_site_checkerboard"
             thermalize = 10
             sweeps_between = 1
             n_samples = 10

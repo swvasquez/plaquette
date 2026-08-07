@@ -20,9 +20,12 @@ beta = 0.75        # inverse temperature; the transition sits at beta_c ~ 0.7613
                    # Expect a long tau_int here for the usual reason: a chain
                    # near a transition decorrelates slowly.
 
-# Driver controls. Metropolis is the only updater a gauge run accepts — the
-# checkerboard schedule and the GPU backend both color sites, which says nothing
-# about variables living on links.
+# Driver controls. A gauge run accepts the three updaters that schedule links:
+# "metropolis", "link_checkerboard", and "gpu_link_checkerboard". The
+# checkerboards visit links in a fixed color order rather than at random, which
+# samples the same distribution; the GPU one needs every extent even, since its
+# color pass runs in parallel. The site schedules color sites, which says nothing
+# about variables living on links, so they are rejected.
 updater = "metropolis"  # optional, defaults to "metropolis"
 thermalize = 500        # warmup sweeps, discarded
 sweeps_between = 5      # decorrelation sweeps between samples

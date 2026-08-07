@@ -55,19 +55,19 @@ pub trait Action<const Q: usize, const D: usize> {
     ) -> f64;
 }
 
-/// The Ising model: spins `s_i = ±1` with nearest-neighbour coupling `j` and a
+/// The Ising model: spins `s_i = ±1` with nearest-neighbor coupling `j` and a
 /// uniform external field `h`,
 ///
 /// ```text
 /// H = -j * sum_<ij> s_i s_j  -  h * sum_i s_i
 /// ```
 ///
-/// where the first sum runs over each nearest-neighbour bond once. `j > 0` is
-/// ferromagnetic (aligned neighbours lower the energy). Energies come out in the
+/// where the first sum runs over each nearest-neighbor bond once. `j > 0` is
+/// ferromagnetic (aligned neighbors lower the energy). Energies come out in the
 /// same units as `j` and `h`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ising {
-    /// Nearest-neighbour coupling `J`.
+    /// Nearest-neighbor coupling `J`.
     j: f64,
     /// Uniform external field `h` (set to `0.0` for the field-free model).
     h: f64,
@@ -157,7 +157,7 @@ impl<const D: usize> Action<2, D> for Ising {
             let s_i = decode(config.peek(site));
             spin_sum += s_i as i64;
 
-            // The neighbour row is ordered +0, −0, +1, −1, ...; taking the
+            // The neighbor row is ordered +0, −0, +1, −1, ...; taking the
             // forward columns only (every other entry) visits each bond once.
             for &j_site in lattice.site_neighbors(site).iter().step_by(2) {
                 bond_sum += (s_i * decode(config.peek(j_site))) as i64;
@@ -183,7 +183,7 @@ impl<const D: usize> Action<2, D> for Ising {
             return 0.0; // proposed state equals the current one
         }
 
-        // All 2D neighbours (both directions): every incident bond changes.
+        // All 2D neighbors (both directions): every incident bond changes.
         let neighbor_sum: i64 = lattice
             .site_neighbors(var)
             .iter()
@@ -201,7 +201,7 @@ impl<const D: usize> Action<2, D> for Ising {
 /// H = -j * sum_□ prod_{l in d□} σ_l
 /// ```
 ///
-/// where the sum runs over each plaquette once. `j > 0` favours plaquette
+/// where the sum runs over each plaquette once. `j > 0` favors plaquette
 /// products of `+1`, the analogue of the ferromagnetic alignment that lowers
 /// the Ising energy. Energies come out in the same units as `j`.
 ///
@@ -636,7 +636,7 @@ mod tests {
         let up = State::new(0).unwrap();
         let down = State::new(1).unwrap();
 
-        // A non-uniform configuration so neighbour sums actually vary.
+        // A non-uniform configuration so neighbor sums actually vary.
         let mut config = Configuration::<2>::cold(&lat, Cell::Site);
         for &s in &[5usize, 6, 10] {
             config.poke(s, down);
@@ -913,7 +913,7 @@ mod tests {
     fn a_gauge_transformation_leaves_the_wilson_table_unchanged() {
         // The same invariance as for a single loop, now across every size and
         // placement at once: this is what makes the table a measurement rather
-        // than an artefact of the gauge the chain wandered into.
+        // than an artifact of the gauge the chain wandered into.
         let lat = Lattice::new([4, 4, 4]);
         let action = Z2Gauge::new(1.0);
         let up = State::new(0).unwrap();

@@ -78,7 +78,7 @@ fn main() {
         ..base.clone()
     };
     let checkerboard = IsingRunConfig {
-        updater: UpdaterKind::Checkerboard,
+        updater: UpdaterKind::SiteCheckerboard,
         ..base.clone()
     };
 

@@ -4,7 +4,7 @@ This file covers what `Lattice<D>` in `src/lattice.rs` names and how it names it
 the cells of a periodic hypercubic lattice, the integer index each one carries,
 and the incidence relations between them. It is pure geometry — no configuration,
 no action, no sampler — but the packings it fixes are the contract every model
-built on top reads, so they are stated here as labelled requirements `L1`–`L7`
+built on top reads, so they are stated here as labeled requirements `L1`–`L7`
 that code comments and tests can cite. The physics that motivates the link and
 plaquette machinery is in [`z2-gauge.md`](z2-gauge.md).
 
@@ -47,13 +47,13 @@ $$s = x_0 + L_0\,(x_1 + L_1\,(x_2 + \cdots)),$$
 
 so a step along direction $\mu$ moves the index by the place value
 $L_0 L_1 \cdots L_{\mu-1}$. Unequal extents are allowed and give an anisotropic
-lattice. Everything downstream — the neighbour table, the checkerboard colouring,
+lattice. Everything downstream — the neighbor table, the checkerboard coloring,
 the GPU buffer layout — assumes this order, so changing it silently changes what
 those tables mean.
 
 **L2. Links are packed `site * D + direction`, direction fastest.** The link
-$(s, \mu)$ is the forward edge from $s$ to its $+\mu$ neighbour, and a site's $D$
-links occupy one contiguous run of the index space, mirroring the neighbour
+$(s, \mu)$ is the forward edge from $s$ to its $+\mu$ neighbor, and a site's $D$
+links occupy one contiguous run of the index space, mirroring the neighbor
 table's per-site row. Contiguity is the point: an updater walking the links of a
 site reads a cache line rather than striding.
 
@@ -106,18 +106,18 @@ larger gauge group the ordered product $U_\mu(s) U_\nu(s+\hat\mu)
 U_\mu(s+\hat\nu)^{-1} U_\nu(s)^{-1}$ is the plaquette, and it needs exactly this
 order. Fixing it now costs nothing and keeps the door open.
 
-A plaquette is *anchored* at its base site rather than centred on it: the base is
+A plaquette is *anchored* at its base site rather than centered on it: the base is
 one of the four corners, and the square extends from there along the two positive
 directions, so its corners are $s$, $s + \hat\mu$, $s + \hat\nu$, and
 $s + \hat\mu + \hat\nu$. That one-to-one ownership by a corner is what makes the
-packing in `L3` exact — a centred convention would have no site to assign each
+packing in `L3` exact — a centered convention would have no site to assign each
 plaquette to.
 
 **L5. Each of a plaquette's four corner sites is touched by exactly two of its
 four links.** This is what makes the plaquette product gauge invariant: a gauge
 transformation multiplies each link by the signs at its two ends, so each corner's
 sign enters the product twice and squares away. It is also a cheap and sharp test
-of the enumeration, since a mis-stepped neighbour breaks the closure immediately.
+of the enumeration, since a mis-stepped neighbor breaks the closure immediately.
 With any extent equal to 1 the loop degenerates — a link and its periodic image
 coincide, so the four links are no longer distinct — which is legitimate but worth
 knowing before trusting a small test lattice.
@@ -133,12 +133,12 @@ flat row of $6(D-1)$ entries, one group of three per containing plaquette. In
 three dimensions a link therefore has four staples, fanned around it like the
 vanes of a paddle wheel.
 
-The table is the gauge counterpart of the neighbour table, and the two are
+The table is the gauge counterpart of the neighbor table, and the two are
 instances of one construction: when the variables live on $k$-cells and the
 action sums over $(k+1)$-cells, what an update needs is, for each $k$-cell, the
 other $k$-cells of every $(k+1)$-cell containing it. That gives $2(D-k)$ groups of
 $2k+1$. At $k = 0$ — Ising, variables on sites, energy on bonds — it degenerates
-to $2D$ groups of one, which is exactly the neighbour row. At $k = 1$ it is
+to $2D$ groups of one, which is exactly the neighbor row. At $k = 1$ it is
 $2(D-1)$ groups of three, hence the stride $6(D-1)$. Nothing here builds the
 $k = 2$ case, and the literature has no name for it, but the shape is fixed:
 $2(D-2)$ groups of five.
@@ -152,7 +152,7 @@ guarantee is what lets `link_plaquettes(l)` be zipped against the groups: the tw
 answer the same question, one by index and one by contents.
 
 **L7. A single-link flip reads its energy change from this table alone.** The
-plaquette product factorises as $\sigma_\square = \sigma_\ell \prod_{k \in g}
+plaquette product factorizes as $\sigma_\square = \sigma_\ell \prod_{k \in g}
 \sigma_k$ for the group $g$ belonging to that plaquette, and flipping $\sigma_\ell$
 negates every plaquette containing it and no other, so
 
@@ -160,14 +160,14 @@ $$\Delta E = 2 J\, \sigma_\ell \sum_{g} \prod_{k \in g} \sigma_k,$$
 
 summed over the link's $2(D-1)$ groups. This is the reason the table exists.
 Rederiving the geometry per proposed flip — unpacking the link, looping over
-directions, taking neighbours forward and backward — would cost more than the
+directions, taking neighbors forward and backward — would cost more than the
 arithmetic it feeds, and a sweep proposes a flip on every link. No updater reads
 the table yet; it is built for the one that will.
 
 ## Storage
 
 Two tables are materialised at construction, both flat `Vec<usize>` with a fixed
-stride: the neighbour table, $2D$ entries per site ordered $+0, -0, +1, \dots$,
+stride: the neighbor table, $2D$ entries per site ordered $+0, -0, +1, \dots$,
 and the staple table, $6(D-1)$ entries per link. Nothing else is stored — sites,
 links, and plaquettes have no representation beyond their integer index, and the
 `*_index` functions and the accessors that recover a cell's site and directions
@@ -191,21 +191,3 @@ words per link in three dimensions, or 36 words per site, which at $64^3$ is
 roughly 75 MB of `usize`. Narrowing the indices to `u32` would halve it and is the
 obvious move if the GPU path wants these tables resident, but nothing forces it
 yet.
-
-## Status
-
-As of writing, this doc reflects `src/lattice.rs` with periodic boundaries
-hardcoded in every direction; the type carries a TODO for making them swappable
-(open, antiperiodic, twisted), which would change what the neighbour table means
-without changing any packing above. The plaquette and staple machinery is
-geometry only — no `Configuration`, `State`, or `Action` is involved — and is
-covered by tests for the counts, the index round-trips (through four dimensions),
-hand-computed plaquettes on a $3^3$ lattice, loop closure, and agreement between
-the staple groups and the plaquette enumeration in two and three dimensions.
-
-The vocabulary settled late and the earlier revisions are worth knowing about,
-since the tests and comments were rewritten with it: `Direction` became `Sign`
-once *direction* was reserved for $\mu$, and the `link_coords` and
-`plaquette_coords` accessors were removed in favour of separate `link_site` /
-`link_direction` and `plaquette_site` / `plaquette_directions`, so that no public
-function returns a site fused with a direction.

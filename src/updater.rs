@@ -23,7 +23,7 @@
 //! Uphill moves surviving with probability `e^{-β ΔE} > 0` is mandatory, not an
 //! optimization — it is what lets the chain climb out of local minima.
 //!
-//! [`Checkerboard`] keeps that accept/reject rule and changes only the order the
+//! [`SiteCheckerboard`] keeps that accept/reject rule and changes only the order the
 //! sites are visited in: it colors each site by coordinate-sum parity and updates
 //! one color fully before the other, so no two sites updated together are
 //! neighbors. On CPU that is just Metropolis in a fixed order, sampling the same
@@ -31,6 +31,16 @@
 //! sweep, where a whole color updates at once. See `docs/metropolis.md` for why
 //! the reordering samples the same distribution and when the coloring's
 //! independence holds.
+//!
+//! [`LinkCheckerboard`] is the same idea for a gauge model, where the variables
+//! sit on links and the unit of interaction is the plaquette rather than the
+//! bond. Base-site parity alone cannot separate the four links of a plaquette,
+//! since two of them share a base site, so the coloring splits by direction
+//! first and by parity second — `2D` colors and a `2D`-pass sweep instead of
+//! two. It is a distinct type rather than a mode of [`SiteCheckerboard`] because
+//! only the name is shared: the color rule, what a collision means, and the pass
+//! count all differ, so one `sweep` covering both would be two unrelated bodies
+//! behind a branch. `docs/metropolis.md` carries the argument for the rule.
 //!
 //! The updater holds no chain state: the [`Configuration`] *is* the current
 //! state, mutated in place, and `β` is passed per call so one updater serves a
@@ -40,7 +50,7 @@
 //! [`sweep`](Updater::sweep) still returns the net realized ΔE so a driver can
 //! accumulate it if profiling ever justifies it.
 
-use crate::configuration::Configuration;
+use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::model::Action;
 use crate::rng::Rng;
@@ -64,7 +74,7 @@ pub trait Updater<const Q: usize, const D: usize> {
     /// A sweep is the conventional unit of Monte Carlo time, sized to the lattice
     /// so autocorrelation is measured in sweeps rather than raw steps. What one
     /// sweep *does* is the algorithm's own choice: [`Metropolis`] attempts
-    /// `n_vars` single-site updates at random sites; [`Checkerboard`] attempts
+    /// `n_vars` single-site updates at random sites; [`SiteCheckerboard`] attempts
     /// one per site in color order; an HMC trajectory would be a single
     /// whole-lattice move.
     ///
@@ -81,31 +91,35 @@ pub trait Updater<const Q: usize, const D: usize> {
     ) -> f64;
 }
 
-/// The single-spin-flip Metropolis update at a **given** site: propose the flip,
-/// price it with [`Action::energy_delta`], and accept with `min(1, e^{-β ΔE})`,
-/// returning the realized `ΔE` (`0.0` on rejection, leaving `config` unchanged).
+/// The single-variable-flip Metropolis update at a **given** variable: propose
+/// the flip, price it with [`Action::energy_delta`], and accept with
+/// `min(1, e^{-β ΔE})`, returning the realized `ΔE` (`0.0` on rejection, leaving
+/// `config` unchanged).
 ///
-/// This is the shared single-site kernel, with the *site handed in* rather than
-/// chosen here — site selection is the schedule's job, not the kernel's. Both
-/// [`Metropolis`] (random sites) and [`Checkerboard`] (color order) drive their
-/// sweeps by calling this; the two differ only in which sites they pass and in
-/// what order.
+/// This is the shared single-variable kernel, with the *variable handed in*
+/// rather than chosen here — selecting it is the schedule's job, not the
+/// kernel's. `var` is a bare index into the configuration, so it names a site on
+/// a site field and a link on a link field; [`Action::energy_delta`] is likewise
+/// grade-neutral, which is what lets [`LinkCheckerboard`] reuse this unchanged.
+/// [`Metropolis`] (random order), [`SiteCheckerboard`] (parity order), and
+/// [`LinkCheckerboard`] (direction-and-parity order) all drive their sweeps by
+/// calling it, and differ only in which variables they pass and in what order.
 fn step<const D: usize>(
     config: &mut Configuration<2>,
     lattice: &Lattice<D>,
     action: &impl Action<2, D>,
-    site: usize,
+    var: usize,
     beta: f64,
     rng: &mut impl Rng,
 ) -> f64 {
-    let proposed = propose(config.peek(site), rng);
-    let delta = action.energy_delta(lattice, config, site, proposed);
+    let proposed = propose(config.peek(var), rng);
+    let delta = action.energy_delta(lattice, config, var, proposed);
 
     // Accept with min(1, e^{-β ΔE}). The `ΔE ≤ 0` short-circuit keeps downhill
     // moves without a draw and, by keeping the argument to `exp` non-positive,
     // also prevents overflow.
     if delta <= 0.0 || rng.next_f64() < (-beta * delta).exp() {
-        config.poke(site, proposed);
+        config.poke(var, proposed);
         delta
     } else {
         0.0
@@ -120,7 +134,7 @@ pub struct Metropolis;
 impl<const D: usize> Updater<2, D> for Metropolis {
     /// `N = n_vars` single-site `step`s at uniformly-random sites. Drawing the
     /// site here — rather than inside `step` — is what makes the kernel reusable
-    /// by schedules that choose sites differently, like [`Checkerboard`].
+    /// by schedules that choose sites differently, like [`SiteCheckerboard`].
     fn sweep(
         &self,
         config: &mut Configuration<2>,
@@ -153,9 +167,9 @@ impl<const D: usize> Updater<2, D> for Metropolis {
 /// for a *parallel* sweep — here, updating sequentially, any site order is a
 /// valid Metropolis schedule, so the CPU version is correct on any lattice.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Checkerboard;
+pub struct SiteCheckerboard;
 
-impl<const D: usize> Updater<2, D> for Checkerboard {
+impl<const D: usize> Updater<2, D> for SiteCheckerboard {
     /// Two color passes: every site of color 0, then every site of color 1, each
     /// a single-site `step`. Together they attempt one update per site, so a
     /// checkerboard sweep does the same `n_vars` updates a [`Metropolis`] sweep
@@ -171,8 +185,83 @@ impl<const D: usize> Updater<2, D> for Checkerboard {
         let mut net = 0.0;
         for color in [0, 1] {
             for site in 0..config.n_vars() {
-                if parity(lattice, site) == color {
+                if lattice.site_parity(site) == color {
                     net += step(config, lattice, action, site, beta, rng);
+                }
+            }
+        }
+        net
+    }
+}
+
+/// The single-link-flip Metropolis update with a **checkerboard** schedule for a
+/// gauge model: a stateless unit struct, implementing [`Updater`] for `Q = 2` in
+/// any dimension.
+///
+/// A link is a base site and a direction, and a sweep colors it by the pair
+/// `(direction, parity of the base site's coordinate sum)` — `2D` colors, each
+/// updated fully before the next. Splitting by direction is what base-site parity
+/// alone cannot do: the four links of a plaquette include two that share a base
+/// site, so a rule reading only the site would color them alike. Fixing the
+/// direction freezes every link of another direction, and a plaquette then holds
+/// exactly two links of the pass's direction, whose base sites differ by one step
+/// and so carry opposite parity.
+///
+/// The accept/reject rule is [`Metropolis`]'s, so on CPU this samples the same
+/// distribution and differs only in autocorrelation. Its purpose is to be the
+/// sequential reference for a parallel sweep: within one color no two links share
+/// a plaquette, so a whole color could be updated at once without any link seeing
+/// another change.
+///
+/// That independence holds only when every extent is even; on an odd extent the
+/// periodic wrap puts two links of a shared plaquette back in the same color.
+/// This matters only for a *parallel* sweep — here, updating sequentially, any
+/// link order is a valid Metropolis schedule, so the CPU version is correct on
+/// any lattice. See `docs/metropolis.md` for the full argument.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkCheckerboard;
+
+impl<const D: usize> Updater<2, D> for LinkCheckerboard {
+    /// `2D` color passes: for each direction in turn, every link of that
+    /// direction based on an even site, then every one based on an odd site, each
+    /// a single-variable `step`. Together they attempt one update per link, so a
+    /// sweep does the same `n_vars` updates a [`Metropolis`] sweep does — only
+    /// the order differs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config` is not a link field, since the schedule reads each
+    /// variable's index as a link.
+    fn sweep(
+        &self,
+        config: &mut Configuration<2>,
+        lattice: &Lattice<D>,
+        action: &impl Action<2, D>,
+        beta: f64,
+        rng: &mut impl Rng,
+    ) -> f64 {
+        assert_eq!(
+            config.cell(),
+            Cell::Link,
+            "the link checkerboard schedules links, so the configuration must be a link field"
+        );
+
+        let mut net = 0.0;
+        for dir in 0..D {
+            for color in [0, 1] {
+                // Iterate over *sites*, not links, and address the one link each
+                // site owns in this direction. Scanning every link and skipping
+                // those of another direction would walk `D * n_sites` entries
+                // per pass to perform `n_sites` updates. The visiting order is
+                // the same either way, since the packing is monotonic in the base
+                // site at fixed direction — `link_colors_are_visited_in_link_order`
+                // pins that — and it is the mapping the GPU kernel launches one
+                // thread per.
+                for site in 0..lattice.n_sites() {
+                    if lattice.site_parity(site) == color {
+                        let link = lattice.site_link(site, dir);
+                        net += step(config, lattice, action, link, beta, rng);
+                    }
                 }
             }
         }
@@ -195,8 +284,10 @@ impl<const D: usize> Updater<2, D> for Checkerboard {
 pub enum AnyUpdater {
     /// The random-site schedule, [`Metropolis`].
     Metropolis(Metropolis),
-    /// The checkerboard schedule, [`Checkerboard`].
-    Checkerboard(Checkerboard),
+    /// The site checkerboard schedule, [`SiteCheckerboard`].
+    SiteCheckerboard(SiteCheckerboard),
+    /// The link checkerboard schedule, [`LinkCheckerboard`].
+    LinkCheckerboard(LinkCheckerboard),
 }
 
 impl<const D: usize> Updater<2, D> for AnyUpdater {
@@ -212,18 +303,10 @@ impl<const D: usize> Updater<2, D> for AnyUpdater {
     ) -> f64 {
         match self {
             AnyUpdater::Metropolis(u) => u.sweep(config, lattice, action, beta, rng),
-            AnyUpdater::Checkerboard(u) => u.sweep(config, lattice, action, beta, rng),
+            AnyUpdater::SiteCheckerboard(u) => u.sweep(config, lattice, action, beta, rng),
+            AnyUpdater::LinkCheckerboard(u) => u.sweep(config, lattice, action, beta, rng),
         }
     }
-}
-
-/// A site's checkerboard color: the parity of its coordinate sum, `0` or `1`.
-///
-/// Two sites of the same color are never nearest neighbors on an even lattice,
-/// because a single step along any axis changes exactly one coordinate by one and
-/// so flips the parity.
-fn parity<const D: usize>(lattice: &Lattice<D>, site: usize) -> usize {
-    lattice.site_coords(site).iter().sum::<usize>() % 2
 }
 
 /// Propose the single-site flip `0 ↔ 1`.
@@ -239,8 +322,7 @@ fn propose(current: State<2>, _rng: &mut impl Rng) -> State<2> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configuration::Cell;
-    use crate::model::Ising;
+    use crate::model::{Ising, Z2Gauge};
     use crate::rng::RandRng;
 
     /// A scripted [`Rng`] handing back preset answers, so a test can pin whether
@@ -395,7 +477,7 @@ mod tests {
     /// accept uniform. The random-site generator is never touched — the schedule
     /// is deterministic — and rejecting all leaves the config untouched.
     #[test]
-    fn checkerboard_sweep_attempts_every_site_once() {
+    fn site_checkerboard_sweep_attempts_every_site_once() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.0);
         let mut config = Configuration::<2>::cold(&lat, Cell::Site); // ground state: all flips uphill
@@ -405,7 +487,7 @@ mod tests {
         // β = 1 ⇒ e^{-βΔE} ≈ 3.4e-4; a 0.9 draw rejects every attempt. No site
         // draws are scripted, so a stray next_below would panic.
         let mut rng = ScriptedRng::new(vec![], vec![0.9; n]);
-        let net = Checkerboard.sweep(&mut config, &lat, &action, 1.0, &mut rng);
+        let net = SiteCheckerboard.sweep(&mut config, &lat, &action, 1.0, &mut rng);
 
         assert_eq!(net, 0.0);
         assert_eq!(config, untouched);
@@ -420,14 +502,14 @@ mod tests {
     /// same telescoping identity as the Metropolis sweep — the schedule differs
     /// but the accounting does not.
     #[test]
-    fn checkerboard_sweep_net_delta_equals_energy_change() {
+    fn site_checkerboard_sweep_net_delta_equals_energy_change() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.5);
         let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut RandRng::seed_from_u64(7));
         let before = action.energy(&lat, &config);
 
         let mut rng = RandRng::seed_from_u64(99);
-        let net = Checkerboard.sweep(&mut config, &lat, &action, 0.6, &mut rng);
+        let net = SiteCheckerboard.sweep(&mut config, &lat, &action, 0.6, &mut rng);
 
         assert_eq!(net, action.energy(&lat, &config) - before);
     }
@@ -436,13 +518,156 @@ mod tests {
     /// on an even lattice no site shares a color with any of its neighbors — the
     /// property a parallel sweep relies on.
     #[test]
-    fn colors_partition_and_separate_neighbors() {
+    fn site_colors_separate_neighbors() {
         let lat = Lattice::new([4, 4]);
         for site in 0..lat.n_sites() {
-            let c = parity(&lat, site);
+            let c = lat.site_parity(site);
             for &nbr in lat.site_neighbors(site) {
-                assert_ne!(c, parity(&lat, nbr), "neighbors must differ in color");
+                assert_ne!(c, lat.site_parity(nbr), "neighbors must differ in color");
             }
         }
+    }
+
+    /// A link's color under [`LinkCheckerboard`]: its direction paired with its
+    /// base site's parity, the `2D`-valued rule the sweep's pass order walks.
+    fn link_color<const D: usize>(lattice: &Lattice<D>, link: usize) -> (usize, usize) {
+        (
+            lattice.link_direction(link),
+            lattice.site_parity(lattice.link_site(link)),
+        )
+    }
+
+    /// The link coloring is collision-free: no two links of the same color ever
+    /// share a plaquette. This is the property a parallel gauge sweep would rely
+    /// on, and the reason base-site parity alone is not enough — within a
+    /// plaquette, two links do share a base site, and only the direction half of
+    /// the pair separates them.
+    #[test]
+    fn link_colors_separate_plaquette_partners() {
+        let lat = Lattice::new([4, 4, 4]);
+        for link in 0..lat.n_links() {
+            let color = link_color(&lat, link);
+            for plaquette in lat.link_plaquettes(link) {
+                for partner in lat.plaquette_links(plaquette) {
+                    if partner != link {
+                        assert_ne!(
+                            color,
+                            link_color(&lat, partner),
+                            "links {link} and {partner} share plaquette {plaquette} and a color"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sweep's site-major iteration visits exactly the links a link-major
+    /// scan would, in the same order — the property that lets it address one
+    /// link per site instead of scanning every link and discarding those of
+    /// another direction. Both orders are valid schedules, but pinning them
+    /// equal is what makes that an optimization rather than a change.
+    #[test]
+    fn link_colors_are_visited_in_link_order() {
+        let lat = Lattice::new([4, 6, 4]);
+        for dir in 0..3 {
+            for color in [0, 1] {
+                let site_major: Vec<usize> = (0..lat.n_sites())
+                    .filter(|&site| lat.site_parity(site) == color)
+                    .map(|site| lat.site_link(site, dir))
+                    .collect();
+                let link_major: Vec<usize> = (0..lat.n_links())
+                    .filter(|&link| {
+                        lat.link_direction(link) == dir
+                            && lat.site_parity(lat.link_site(link)) == color
+                    })
+                    .collect();
+
+                assert_eq!(site_major, link_major, "dir {dir}, color {color}");
+                assert!(
+                    site_major.windows(2).all(|w| w[0] < w[1]),
+                    "the shared order should be ascending in link index"
+                );
+            }
+        }
+    }
+
+    /// A link checkerboard sweep attempts one update per link: on the ground
+    /// state every flip is uphill, so each of the `n_vars` attempts draws exactly
+    /// one accept uniform. The random-variable generator is never touched — the
+    /// schedule is deterministic — and rejecting all leaves the config untouched.
+    #[test]
+    fn link_checkerboard_sweep_attempts_every_link_once() {
+        let lat = Lattice::new([4, 4, 4]);
+        let action = Z2Gauge::new(1.0);
+        let mut config = Configuration::<2>::cold(&lat, Cell::Link); // ground state: all flips uphill
+        let untouched = config.clone();
+        let n = config.n_vars();
+
+        // Flipping one link flips its 2(D−1) = 4 plaquettes, so ΔE = +8 at j = 1;
+        // at β = 1 that is e^{-8} ≈ 3.4e-4, and a 0.9 draw rejects every attempt.
+        let mut rng = ScriptedRng::new(vec![], vec![0.9; n]);
+        let net = LinkCheckerboard.sweep(&mut config, &lat, &action, 1.0, &mut rng);
+
+        assert_eq!(net, 0.0);
+        assert_eq!(config, untouched);
+        assert_eq!(
+            rng.unif_i, n,
+            "the link checkerboard must attempt each of the n links once"
+        );
+        assert_eq!(
+            rng.site_i, 0,
+            "the link checkerboard picks nothing at random"
+        );
+    }
+
+    /// The net ΔE a link checkerboard sweep returns equals `H(after) − H(before)`
+    /// — the same telescoping identity the site schedules satisfy, on a link
+    /// field.
+    #[test]
+    fn link_checkerboard_sweep_net_delta_equals_energy_change() {
+        let lat = Lattice::new([4, 4, 4]);
+        let action = Z2Gauge::new(1.0); // integer-valued, so the comparison is bit-exact
+        let mut config = Configuration::<2>::hot(&lat, Cell::Link, &mut RandRng::seed_from_u64(7));
+        let before = action.energy(&lat, &config);
+
+        let mut rng = RandRng::seed_from_u64(99);
+        let net = LinkCheckerboard.sweep(&mut config, &lat, &action, 0.6, &mut rng);
+
+        assert_eq!(net, action.energy(&lat, &config) - before);
+    }
+
+    /// An odd extent is no obstacle to the sequential schedule: the coloring's
+    /// independence fails there — the periodic wrap puts two links of a shared
+    /// plaquette in one color — but updating in sequence makes any order a valid
+    /// Metropolis schedule, so the sweep still runs and still accounts correctly.
+    #[test]
+    fn link_checkerboard_runs_on_odd_extents() {
+        let lat = Lattice::new([3, 5, 3]);
+        let action = Z2Gauge::new(1.0);
+        let mut config = Configuration::<2>::hot(&lat, Cell::Link, &mut RandRng::seed_from_u64(3));
+        let before = action.energy(&lat, &config);
+
+        let mut rng = RandRng::seed_from_u64(11);
+        let net = LinkCheckerboard.sweep(&mut config, &lat, &action, 0.5, &mut rng);
+
+        assert_eq!(net, action.energy(&lat, &config) - before);
+    }
+
+    /// A site field is rejected rather than silently misread: the schedule treats
+    /// every index as a link, so running it on sites would color by a direction
+    /// the variables do not have.
+    #[test]
+    #[should_panic(expected = "must be a link field")]
+    fn link_checkerboard_rejects_a_site_field() {
+        let lat = Lattice::new([4, 4, 4]);
+        let action = Z2Gauge::new(1.0);
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site);
+        LinkCheckerboard.sweep(
+            &mut config,
+            &lat,
+            &action,
+            1.0,
+            &mut RandRng::seed_from_u64(1),
+        );
     }
 }

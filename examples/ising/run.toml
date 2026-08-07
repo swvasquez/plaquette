@@ -11,7 +11,7 @@
 
 # Physics.
 shape = [16, 16]  # lattice extents [L_0, L_1]
-j = 1.0           # nearest-neighbour coupling
+j = 1.0           # nearest-neighbor coupling
 h = 0.0           # external field; optional, defaults to 0.0 (field-free)
 beta = 0.44       # inverse temperature; beta_c = ln(1 + sqrt(2)) / 2 ~ 0.4407
 

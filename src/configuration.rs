@@ -86,6 +86,19 @@ impl<const Q: usize> Configuration<Q> {
         Configuration { cell, variables }
     }
 
+    /// A field built directly from variables already in index order.
+    ///
+    /// The other constructors borrow a [`Lattice`] to *derive* the length, which
+    /// is the right default because a lattice and a cell kind fix exactly one
+    /// correct count. This one is for a caller that already holds the variables
+    /// and so already holds the length — reading a configuration back from a
+    /// device buffer, most of all, where insisting on a lattice would mean
+    /// keeping a whole copy of the geometry alive to recover a number the data
+    /// already carries.
+    pub fn from_variables(cell: Cell, variables: Vec<State<Q>>) -> Self {
+        Configuration { cell, variables }
+    }
+
     /// Which kind of cell this field's variables sit on.
     pub fn cell(&self) -> Cell {
         self.cell

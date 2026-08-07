@@ -8,13 +8,21 @@
 //! warmed-up state. A bare [`Chain`] yields pre-equilibrium configurations; this
 //! has already thermalized before it gives you anything.
 //!
-//! What it does *not* own is a backend choice, and that is the whole difference
-//! between the two samplers. The GPU engine is written around a `D = 2` site
-//! field and the checkerboard coloring it uses is a statement about sites, so
-//! neither has a meaning for link variables; a gauge run is CPU and Metropolis,
-//! which [`GaugeRunConfig::validate`] enforces. So there is no engine enum and no
-//! wrapper over two chain types here — [`samples`](GaugeSampler::samples) returns
-//! the [`Chain`] itself.
+//! It also owns the **backend choice**, the same way
+//! [`IsingSampler`](crate::ising_sampler::IsingSampler) does. The run's
+//! [`UpdaterKind`] picks between the CPU chain and the GPU chain, and the
+//! sampler holds whichever the config asked for.
+//! [`samples`](GaugeSampler::samples) returns an [`AnyGaugeChain`] over it — a
+//! thin front yielding [`Configuration`]s the same way regardless of backend, so
+//! a consumer's loop never names CPU or GPU.
+//!
+//! Which updaters are on offer is the one place this differs from the Ising
+//! side, and the reason is the grade the variables live on rather than anything
+//! about backends. A gauge run accepts the three schedules that update links —
+//! [`Metropolis`], [`LinkCheckerboard`], and the GPU
+//! [`GpuGaugeChain`] — and
+//! [`GaugeRunConfig::validate`] rejects the site schedules, whose parity
+//! coloring is a statement about sites and says nothing about links.
 //!
 //! It streams and keeps no history: the consumer decides what to retain. Because
 //! the warmed-up state stays here, `samples` can be called again to draw more
@@ -44,36 +52,76 @@
 //! ```
 
 use crate::chain::Chain;
+use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
+use crate::device::{GPU_BATCH, Gpu};
 use crate::gauge_config::GaugeRunConfig;
+use crate::gauge_gpu::GpuGaugeChain;
 use crate::lattice::Lattice;
 use crate::model::Z2Gauge;
 use crate::rng::RandRng;
-use crate::updater::Metropolis;
+use crate::updater::{AnyUpdater, LinkCheckerboard, Metropolis};
 
 /// The dimension every gauge run is fixed at, matching [`GaugeRunConfig`].
 const D: usize = 3;
 
+/// The evolving state a [`GaugeSampler`] streams from, one variant per backend.
+///
+/// The CPU variant holds the loose pieces a transient [`Chain`] borrows each
+/// call; the GPU variant owns a persistent [`GpuGaugeChain`]. This is where the
+/// two backends' opposite ownership models are reconciled behind one type.
+enum Engine {
+    Cpu {
+        rng: RandRng,
+        updater: AnyUpdater,
+        /// The evolving configuration, lent to a transient [`Chain`] per call.
+        state: Configuration<2>,
+    },
+    /// Boxed because the device chain is far larger than the CPU variant, and an
+    /// enum is sized by its largest one.
+    Gpu(Box<GpuGaugeChain>),
+}
+
+/// A stream of thermalized link [`Configuration`]s, over either backend.
+///
+/// Both variants yield the same item, so a consumer bounds it with `.take(n)`
+/// and measures each config without knowing which backend produced it. The CPU
+/// variant is a transient [`Chain`] borrowing the sampler; the GPU variant a
+/// mutable borrow of the sampler's persistent [`GpuGaugeChain`].
+///
+/// Named for its grade rather than called `AnyChain`, because the Ising sampler
+/// has a structurally identical type and both are re-exported from the crate
+/// root, where one plain name cannot cover two.
+pub enum AnyGaugeChain<'a> {
+    /// A transient chain borrowing the sampler's state for the length of the run.
+    Cpu(Chain<'a, 2, D, Z2Gauge, AnyUpdater, RandRng>),
+    /// A mutable borrow of the sampler's persistent device chain.
+    Gpu(&'a mut GpuGaugeChain),
+}
+
+impl Iterator for AnyGaugeChain<'_> {
+    type Item = Configuration<2>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            AnyGaugeChain::Cpu(chain) => chain.next(),
+            AnyGaugeChain::Gpu(chain) => chain.next(),
+        }
+    }
+}
+
 /// Owns a gauge run's assembled pieces and its evolving state, thermalized and
 /// ready to stream.
 ///
-/// Fixed at `D = 3`, `Q = 2`, matching [`GaugeRunConfig`]. The pieces are held
-/// loose — the configuration, the generator, and the updater separately — and a
-/// transient [`Chain`] borrows them per call, which is the CPU half of what
-/// [`IsingSampler`](crate::ising_sampler::IsingSampler) does behind its engine
-/// enum. With one backend there is nothing to hide behind, so they sit here as
-/// plain fields.
+/// Fixed at `D = 3`, `Q = 2`, matching [`GaugeRunConfig`]. The backend is chosen
+/// from the config's [`UpdaterKind`] and held in a private per-backend `Engine`,
+/// so neither the CPU nor the GPU type leaks into the streaming interface.
 pub struct GaugeSampler {
     lattice: Lattice<D>,
     model: Z2Gauge,
     beta: f64,
     sweeps_between: usize,
-    /// The only updater a gauge run has. Held as a field rather than built per
-    /// call because [`Chain`] borrows it for the chain's lifetime.
-    updater: Metropolis,
-    /// The evolving configuration, lent to a transient [`Chain`] per call.
-    state: Configuration<2>,
-    rng: RandRng,
+    engine: Engine,
 }
 
 impl GaugeSampler {
@@ -91,23 +139,47 @@ impl GaugeSampler {
     /// # Panics
     ///
     /// Panics if the config is invalid (via `build`), which includes asking for
-    /// an updater other than Metropolis.
+    /// an updater that schedules sites rather than links, or if it selects the
+    /// GPU backend on a machine with no GPU adapter.
     pub fn new(config: &GaugeRunConfig) -> Self {
         let (lattice, model, mut rng, mut state, beta) = config.build();
-        let updater = Metropolis;
 
-        // Warm up a transient chain over the loose pieces, then stow them.
-        Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
-            .advance(config.thermalize);
+        let engine = if let UpdaterKind::GpuLinkCheckerboard = config.updater {
+            let gpu = Gpu::new().expect("GPU backend requested but no GPU adapter is available");
+            let mut chain = GpuGaugeChain::new(
+                gpu,
+                &lattice,
+                config.j,
+                beta,
+                config.seed,
+                &state,
+                config.sweeps_between,
+                GPU_BATCH,
+            );
+            chain.advance(config.thermalize);
+            Engine::Gpu(Box::new(chain))
+        } else {
+            let updater = match config.updater {
+                UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
+                UpdaterKind::LinkCheckerboard => AnyUpdater::LinkCheckerboard(LinkCheckerboard),
+                other => unreachable!("rejected by GaugeRunConfig::validate: {other:?}"),
+            };
+            // Warm up a transient chain over the loose pieces, then stow them.
+            Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
+                .advance(config.thermalize);
+            Engine::Cpu {
+                rng,
+                updater,
+                state,
+            }
+        };
 
         GaugeSampler {
             lattice,
             model,
             beta,
             sweeps_between: config.sweeps_between,
-            updater,
-            state,
-            rng,
+            engine,
         }
     }
 
@@ -127,16 +199,30 @@ impl GaugeSampler {
     /// Stream from the warmed-up state, one [`Configuration`] per
     /// `sweeps_between` sweeps. Bound it with `.take(n)`; the sampler retains
     /// nothing, and calling this again continues the same chain.
-    pub fn samples(&mut self) -> Chain<'_, 2, D, Z2Gauge, Metropolis, RandRng> {
-        Chain::new(
-            &mut self.state,
-            &self.lattice,
-            &self.model,
-            &self.updater,
-            self.beta,
-            &mut self.rng,
-            self.sweeps_between,
-        )
+    pub fn samples(&mut self) -> AnyGaugeChain<'_> {
+        let GaugeSampler {
+            lattice,
+            model,
+            beta,
+            sweeps_between,
+            engine,
+        } = self;
+        match engine {
+            Engine::Cpu {
+                rng,
+                updater,
+                state,
+            } => AnyGaugeChain::Cpu(Chain::new(
+                state,
+                lattice,
+                model,
+                updater,
+                *beta,
+                rng,
+                *sweeps_between,
+            )),
+            Engine::Gpu(chain) => AnyGaugeChain::Gpu(chain.as_mut()),
+        }
     }
 }
 
@@ -162,6 +248,39 @@ mod tests {
         }
     }
 
+    /// A link-checkerboard-configured run streams too: the `UpdaterKind` from
+    /// the config selects the CPU link schedule, driven like any other updater.
+    #[test]
+    fn streams_with_the_link_checkerboard_updater() {
+        let mut run = config();
+        run.updater = UpdaterKind::LinkCheckerboard;
+
+        let mut sampler = GaugeSampler::new(&run);
+        let configs: Vec<_> = sampler.samples().take(5).collect();
+
+        assert_eq!(configs.len(), 5);
+        assert!(configs.iter().all(|c| c.n_vars() == 192));
+        assert!(configs.iter().all(|c| c.cell() == Cell::Link));
+    }
+
+    /// A GPU-configured run streams through the same interface. Skips when no
+    /// GPU adapter is available, so the suite stays green on a headless runner.
+    #[test]
+    fn streams_with_the_gpu_link_checkerboard() {
+        if crate::device::require_gpu().is_none() {
+            return;
+        }
+        let mut run = config();
+        run.updater = UpdaterKind::GpuLinkCheckerboard;
+
+        let mut sampler = GaugeSampler::new(&run);
+        let configs: Vec<_> = sampler.samples().take(5).collect();
+
+        assert_eq!(configs.len(), 5);
+        assert!(configs.iter().all(|c| c.n_vars() == 192));
+        assert!(configs.iter().all(|c| c.cell() == Cell::Link));
+    }
+
     /// The stream yields link configs of the run's lattice size, as many as
     /// asked for: 3 links per site on 64 sites.
     #[test]
@@ -181,7 +300,7 @@ mod tests {
     fn matches_a_hand_driven_chain() {
         let run = config();
         let (lattice, model, mut rng, mut state, beta) = run.build();
-        let updater = Metropolis;
+        let updater = AnyUpdater::Metropolis(Metropolis);
         Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
             .advance(run.thermalize);
         let expected: Vec<_> = Chain::new(
@@ -309,5 +428,44 @@ mod tests {
             / n as f64;
 
         assert!(mean > 0.9, "mean unit loop at beta = 3 was {mean}");
+    }
+
+    /// The link checkerboard samples the same distribution the random-order
+    /// Metropolis does: at the same coupling the two agree on the mean plaquette.
+    /// The comparison is distributional rather than bit-for-bit, because the two
+    /// schedules consume the generator differently — Metropolis draws a link
+    /// index per step and the checkerboard draws none — so identical seeds put
+    /// them on different streams. The tolerance is set to swamp the residual
+    /// Monte Carlo error at this sample count rather than to any physics.
+    #[test]
+    fn link_checkerboard_matches_the_metropolis_distribution() {
+        fn mean_plaquette(kind: UpdaterKind) -> f64 {
+            let mut run = config();
+            run.updater = kind;
+            run.beta = 0.5;
+            run.thermalize = 500;
+            run.sweeps_between = 4;
+
+            let mut sampler = GaugeSampler::new(&run);
+            let (lattice, model) = (sampler.lattice(), sampler.model());
+            let n = 400;
+            sampler
+                .samples()
+                .take(n)
+                .map(|c| {
+                    gauge_measure(&model, &lattice, &c).plaquette_sum
+                        / lattice.n_plaquettes() as f64
+                })
+                .sum::<f64>()
+                / n as f64
+        }
+
+        let metropolis = mean_plaquette(UpdaterKind::Metropolis);
+        let checkerboard = mean_plaquette(UpdaterKind::LinkCheckerboard);
+
+        assert!(
+            (metropolis - checkerboard).abs() < 0.02,
+            "mean plaquette: metropolis {metropolis}, link checkerboard {checkerboard}"
+        );
     }
 }
