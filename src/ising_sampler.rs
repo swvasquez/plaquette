@@ -59,14 +59,19 @@ enum Engine {
 /// measures each config without knowing which backend produced it. The CPU
 /// variant is a transient [`Chain`] borrowing the sampler; the GPU variant a
 /// mutable borrow of the sampler's persistent [`GpuIsingChain`].
-pub enum AnyIsingChain<'a> {
+///
+/// Only the CPU variant carries the dimension. The device chain reads the
+/// lattice once when it is built and keeps buffers afterwards, so `D` never
+/// reaches [`GpuIsingChain`]'s type — the parameter here is the borrowed
+/// [`Chain`]'s alone.
+pub enum AnyIsingChain<'a, const D: usize> {
     /// A transient chain borrowing the sampler's state for the length of the run.
-    Cpu(Chain<'a, 2, 2, Ising, AnyUpdater, RandRng>),
+    Cpu(Chain<'a, 2, D, Ising, AnyUpdater, RandRng>),
     /// A mutable borrow of the sampler's persistent device chain.
     Gpu(&'a mut GpuIsingChain),
 }
 
-impl Iterator for AnyIsingChain<'_> {
+impl<const D: usize> Iterator for AnyIsingChain<'_, D> {
     type Item = Configuration<2>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -80,18 +85,19 @@ impl Iterator for AnyIsingChain<'_> {
 /// Owns a run's assembled pieces and its evolving state, thermalized and ready
 /// to stream.
 ///
-/// Fixed at `D = 2`, `Q = 2`, matching [`IsingRunConfig`]. The backend is chosen
-/// from the config's [`UpdaterKind`] and held in a private per-backend
-/// `Engine`, so neither the CPU nor the GPU type leaks into the streaming interface.
-pub struct IsingSampler {
-    lattice: Lattice<2>,
+/// Fixed at `Q = 2` and generic over the dimension, which a driver names in its
+/// own source and the config's shape must agree with. The backend is chosen from the config's
+/// [`UpdaterKind`] and held in a private per-backend `Engine`, so neither the
+/// CPU nor the GPU type leaks into the streaming interface.
+pub struct IsingSampler<const D: usize> {
+    lattice: Lattice<D>,
     model: Ising,
     beta: f64,
     sweeps_between: usize,
     engine: Engine,
 }
 
-impl IsingSampler {
+impl<const D: usize> IsingSampler<D> {
     /// Assemble a run from its config and thermalize it.
     ///
     /// Runs `config.thermalize` warmup sweeps and discards them, so the sampler is
@@ -110,7 +116,7 @@ impl IsingSampler {
     /// Panics if the config is invalid (via `build`), or if it selects the GPU
     /// backend on a machine with no GPU adapter.
     pub fn new(config: &IsingRunConfig) -> Self {
-        let (lattice, model, mut rng, mut state, beta) = config.build();
+        let (lattice, model, mut rng, mut state, beta) = config.build::<D>();
         let sweeps_between = config.sweeps_between;
 
         let engine = if let UpdaterKind::GpuSiteCheckerboard = config.updater {
@@ -162,7 +168,7 @@ impl IsingSampler {
     /// The lattice this run is on — an owned clone, for measuring the stream
     /// without holding a borrow of the sampler across
     /// [`samples`](IsingSampler::samples).
-    pub fn lattice(&self) -> Lattice<2> {
+    pub fn lattice(&self) -> Lattice<D> {
         self.lattice.clone()
     }
 
@@ -180,7 +186,7 @@ impl IsingSampler {
     /// # use plaquette::ising_config::IsingRunConfig;
     /// # use plaquette::{measure, IsingSampler};
     /// # let run = IsingRunConfig::parse("shape=[8,8]\nj=1.0\nbeta=0.44\nthermalize=10\nsweeps_between=1\nn_samples=5\nseed=1").unwrap();
-    /// let mut sampler = IsingSampler::new(&run);
+    /// let mut sampler = IsingSampler::<2>::new(&run);
     /// let (lattice, model) = (sampler.lattice(), sampler.model());
     /// let energies: Vec<f64> = sampler
     ///     .samples()
@@ -188,7 +194,7 @@ impl IsingSampler {
     ///     .map(|c| measure(&model, &lattice, &c).energy)
     ///     .collect();
     /// ```
-    pub fn samples(&mut self) -> AnyIsingChain<'_> {
+    pub fn samples(&mut self) -> AnyIsingChain<'_, D> {
         let IsingSampler {
             lattice,
             model,
@@ -223,7 +229,7 @@ mod tests {
 
     fn config() -> IsingRunConfig {
         IsingRunConfig {
-            shape: [8, 8],
+            shape: vec![8, 8],
             j: 1.0,
             h: 0.0,
             beta: 0.44,
@@ -240,7 +246,7 @@ mod tests {
     /// The stream yields configs of the run's lattice size, as many as asked for.
     #[test]
     fn streams_configs_of_the_right_size() {
-        let mut sampler = IsingSampler::new(&config());
+        let mut sampler = IsingSampler::<2>::new(&config());
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
@@ -254,7 +260,7 @@ mod tests {
         let mut run = config();
         run.updater = UpdaterKind::SiteCheckerboard;
 
-        let mut sampler = IsingSampler::new(&run);
+        let mut sampler = IsingSampler::<2>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
@@ -271,7 +277,7 @@ mod tests {
         let mut run = config();
         run.updater = UpdaterKind::GpuSiteCheckerboard;
 
-        let mut sampler = IsingSampler::new(&run);
+        let mut sampler = IsingSampler::<2>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
@@ -282,7 +288,7 @@ mod tests {
     /// a second lattice.
     #[test]
     fn measures_the_stream_via_sampler_geometry() {
-        let mut sampler = IsingSampler::new(&config());
+        let mut sampler = IsingSampler::<2>::new(&config());
         let lattice = sampler.lattice();
         let model = sampler.model();
         let n_sites = lattice.n_sites() as f64;
@@ -306,7 +312,7 @@ mod tests {
     #[test]
     fn matches_a_hand_driven_chain() {
         let run = config();
-        let (lattice, model, mut rng, mut state, beta) = run.build();
+        let (lattice, model, mut rng, mut state, beta) = run.build::<2>();
         let updater = Metropolis;
         Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
             .advance(run.thermalize);
@@ -322,7 +328,7 @@ mod tests {
         .take(run.n_samples)
         .collect();
 
-        let mut sampler = IsingSampler::new(&run);
+        let mut sampler = IsingSampler::<2>::new(&run);
         let got: Vec<_> = sampler.samples().take(run.n_samples).collect();
 
         assert_eq!(got, expected);
@@ -332,11 +338,11 @@ mod tests {
     /// `n` then `m` equals one run of `n + m`.
     #[test]
     fn a_second_call_continues_the_same_chain() {
-        let mut split = IsingSampler::new(&config());
+        let mut split = IsingSampler::<2>::new(&config());
         let mut got: Vec<_> = split.samples().take(6).collect();
         got.extend(split.samples().take(4));
 
-        let mut whole = IsingSampler::new(&config());
+        let mut whole = IsingSampler::<2>::new(&config());
         let expected: Vec<_> = whole.samples().take(10).collect();
 
         assert_eq!(got, expected);

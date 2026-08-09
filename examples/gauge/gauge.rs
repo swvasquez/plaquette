@@ -1,5 +1,5 @@
-//! Run the driver on the 3D Z2 gauge theory from a config file and report a
-//! couple of averaged observables.
+//! Run the driver on the Z2 gauge theory from a config file and report a couple
+//! of averaged observables.
 //!
 //! The gauge counterpart of the `ising` example, and the same shape end to end:
 //! load a [`GaugeRunConfig`], hand it to a [`GaugeSampler`] (which assembles the
@@ -12,8 +12,13 @@
 //! which means the theory confines, or merely with the perimeter, which means it
 //! does not.
 //!
-//! In three dimensions that changes over at `beta_c ~ 0.7613`, so the shipped
-//! config sits just below it, in the confined phase near the transition. The
+//! The dimension is the one run parameter this file names rather than the config
+//! does — `D` below is a compile-time constant, and the config's `shape` has to
+//! agree. Two is the floor, since a plaquette needs a pair of directions. In
+//! three dimensions the changeover sits at `beta_c ~ 0.7613`, so the shipped
+//! config sits just below it, in the confined phase near the transition; two
+//! dimensions confines at every coupling and four has a first-order transition at
+//! the self-dual `beta_c ~ 0.4407`. The
 //! loop table on its own does not say how strong that area falloff is, so the run
 //! also reports the Creutz ratio `chi(r, t)` beside it — the 2x2 combination of
 //! adjacent loops in which the perimeter and constant parts of `-log W` cancel,
@@ -48,6 +53,14 @@ use plaquette::{
     Estimate, GaugeSample, GaugeSampler, creutz_ratio, gauge_measure, polyakov_loop, reduce,
     specific_heat, wilson_rectangles,
 };
+
+/// The lattice dimension this program is built for.
+///
+/// Edit and rebuild to run a different one — `3` for the box the shipped config
+/// uses, `2` for the exactly solvable case, `4` for the self-dual one. Two is the
+/// floor: below it there is no plaquette for the action to score. The config's
+/// `shape` must name this many axes.
+const D: usize = 3;
 
 /// Where the run parameters come from when none is given on the command line.
 const DEFAULT_CONFIG: &str = "examples/gauge/gauge.toml";
@@ -94,9 +107,17 @@ fn main() {
         }
     };
 
+    // The file has to be for the dimension this program was built for. Checked
+    // here so a mismatch is a message rather than a panic inside the sampler.
+    if let Err(e) = run.check_dimension::<D>() {
+        eprintln!("error: {e}");
+        eprintln!("edit `const D` in examples/gauge/gauge.rs and rebuild to run it");
+        std::process::exit(1);
+    }
+
     // The sampler assembles the pieces and thermalizes, so the stream is at
     // equilibrium from the first config.
-    let mut sampler = GaugeSampler::new(&run);
+    let mut sampler = GaugeSampler::<D>::new(&run);
 
     // Geometry for measurement comes off the sampler as owned values, read once
     // before streaming so the stream can borrow the sampler by itself.
@@ -135,9 +156,10 @@ fn main() {
     // The mean plaquette is the energy per plaquette with the coupling divided
     // out, which is the form the literature reports and the one that survives
     // `j = 0`. The specific heat takes the raw total energies its formula is
-    // written in, normalized by the plaquette count — in three dimensions there
-    // are as many plaquettes as links, so that is also the per-degree-of-freedom
-    // reading.
+    // written in, normalized by the plaquette count, which is what the energy
+    // is a sum over. Only in three dimensions does that also happen to be the
+    // link count, and so the per-degree-of-freedom reading; elsewhere the two
+    // differ by the `C(D, 2) / D` ratio.
     let energies: Vec<f64> = samples.iter().map(|s| s.energy).collect();
     let mean_plaquette: Vec<f64> = samples
         .iter()
@@ -151,7 +173,7 @@ fn main() {
         println!("{description}");
     }
     println!(
-        "3D Z2 gauge, shape = {:?}, beta = {}, J = {}",
+        "Z2 gauge in {D}D, shape = {:?}, beta = {}, J = {}",
         run.shape, run.beta, run.j
     );
     println!(

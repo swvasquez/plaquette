@@ -9,13 +9,21 @@
 //!
 //! Two models run today, each by Metropolis or by a checkerboard sweep, and each
 //! checkerboard on either the CPU or the GPU. The two colorings differ because
-//! the variables do: the two-dimensional Ising model colors a *site* by the
-//! parity of its coordinate sum, while the three-dimensional Z2 gauge model
-//! colors a *link* by its direction as well as its base site's parity, so that
-//! no two links updated together share a plaquette. Each has a sampler —
-//! [`IsingSampler`] and [`GaugeSampler`] — that
+//! the variables do: the Ising model colors a *site* by the parity of its
+//! coordinate sum, while the Z2 gauge model colors a *link* by its direction as
+//! well as its base site's parity, so that no two links updated together share a
+//! plaquette. Each has a sampler — [`IsingSampler`] and [`GaugeSampler`] — that
 //! builds a thermalized chain from a run configuration parsed from TOML, which
 //! is how the examples under `examples/` are driven.
+//!
+//! Every layer is generic over the lattice dimension `D`, which each model needs
+//! enough of to have the cell its energy scores: Ising sums over links and needs
+//! one, the gauge action sums over plaquettes and needs two. `D` is a
+//! compile-time parameter throughout, so a driver names the dimension it is
+//! built for and a config file's `shape` has to agree; `check_dimension` reports
+//! a file that does not. Nothing dispatches over the dimension at runtime,
+//! which keeps the set of instantiations a program pays for down to the one it
+//! actually runs.
 //!
 //! The algorithms and the physics they rest on are written up under `docs/`.
 

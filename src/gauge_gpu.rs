@@ -6,13 +6,12 @@
 //! The gauge sibling of [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain), and
 //! a separate type for the same reason
 //! [`LinkCheckerboard`](crate::updater::LinkCheckerboard) is separate from
-//! [`SiteCheckerboard`](crate::updater::SiteCheckerboard): that one is fixed at
-//! `D = 2` over a site field and this is fixed at `D = 3` over a link field, so
-//! they share no line of the schedule. What they *do* share — encoding color
-//! passes, batching samples, and reading them back — is
-//! `DeviceSweeper`, so this module holds only
-//! the part that is about the gauge model: the `Params` layout, the staple
-//! table, and the six-color link checkerboard the shader implements.
+//! [`SiteCheckerboard`](crate::updater::SiteCheckerboard): that one runs over a
+//! site field and this over a link field, so they share no line of the schedule.
+//! What they *do* share — encoding color passes, batching samples, and reading
+//! them back — is `DeviceSweeper`, so this module holds only the part that is
+//! about the gauge model: the `Params` layout, the staple table, and the
+//! `2D`-color link checkerboard the shader implements.
 //!
 //! The coloring is compiled into the shader (`gauge_checkerboard.wgsl`), so this
 //! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
@@ -22,34 +21,27 @@
 //! is the one a plaquette interaction needs.
 
 use crate::configuration::{Cell, Configuration};
-use crate::device::{DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed};
+use crate::device::{DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors};
 use crate::lattice::Lattice;
-
-/// The dimension the gauge shader is written for, matching
-/// [`GaugeRunConfig`](crate::gauge_config::GaugeRunConfig).
-const D: usize = 3;
-
-/// Color passes per sweep, `2 * D`: a direction and a base-site parity.
-const N_COLORS: u32 = 2 * D as u32;
+use crate::model::Z2Gauge;
+use crate::updater::LinkCheckerboard;
 
 /// The compiled kernel: the shared preamble followed by the link checkerboard.
 const SHADER: &str = crate::device::shader_source!("gauge_checkerboard.wgsl");
 
 /// The static run parameters uploaded to the shader's uniform buffer.
 ///
-/// `#[repr(C)]` with explicit padding to a 16-byte multiple, matching the WGSL
-/// `Params` struct's uniform layout.
+/// `#[repr(C)]`, already a 16-byte multiple, matching the WGSL `Params` struct's
+/// uniform layout. It carries no geometry: the kernel reads a base site's parity
+/// from a table and takes the dimension as an override, so nothing about the
+/// shape has to be described here.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     n_sites: u32,
-    width: u32,
-    height: u32,
     seed: u32,
     beta: f32,
     j: f32,
-    _pad0: f32,
-    _pad1: f32,
 }
 
 /// The Z2 gauge Markov chain run on the GPU, yielding sampled
@@ -57,7 +49,12 @@ struct Params {
 ///
 /// A sibling of [`Chain`](crate::chain::Chain): same iterator interface, device
 /// machinery underneath. Owns everything it needs, so it borrows nothing and can
-/// be moved and driven freely. Fixed at `Q = 2`, `D = 3`.
+/// be moved and driven freely. Fixed at `Q = 2`.
+///
+/// The type carries no dimension, for the reason
+/// [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain) does not: the lattice is
+/// read once in [`new`](GpuGaugeChain::new) to build the tables, and what
+/// survives is device buffers and counts.
 pub struct GpuGaugeChain {
     sweeper: DeviceSweeper,
 }
@@ -77,9 +74,10 @@ impl GpuGaugeChain {
     /// # Panics
     ///
     /// Panics if `batch` is zero, if `start` is not a link field of this
-    /// lattice, or if any extent is odd.
+    /// lattice, if any extent is odd, or if `D < 2`, where there is no plaquette
+    /// for the action to score.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new<const D: usize>(
         gpu: Gpu,
         lattice: &Lattice<D>,
         j: f64,
@@ -90,6 +88,15 @@ impl GpuGaugeChain {
         batch: usize,
     ) -> Self {
         assert!(batch > 0, "batch size must be positive");
+        // Below two dimensions there is no direction pair, so the lattice has no
+        // plaquettes and the action is identically zero. That is a sweep with
+        // nothing to price rather than an error the arithmetic would raise, so
+        // it has to be said here.
+        assert!(
+            D >= Z2Gauge::MIN_DIMENSION,
+            "{}",
+            Z2Gauge::TOO_FEW_DIMENSIONS
+        );
         // The shader indexes the staple table by link, so a site field would be
         // silently misread rather than rejected; the cell kind is what makes
         // that checkable at all.
@@ -118,15 +125,12 @@ impl GpuGaugeChain {
         for link in 0..n_links {
             staples.extend(lattice.link_staples(link).iter().map(|&l| l as u32));
         }
+        let site_color = site_colors(lattice);
         let params = Params {
             n_sites: n_sites as u32,
-            width: shape[0] as u32,
-            height: shape[1] as u32,
             seed: fold_seed(seed),
             beta: beta as f32,
             j: j as f32,
-            _pad0: 0.0,
-            _pad1: 0.0,
         };
 
         GpuGaugeChain {
@@ -137,15 +141,21 @@ impl GpuGaugeChain {
                     shader: SHADER,
                     vars_init: &links,
                     table: &staples,
+                    site_color: &site_color,
                     params: bytemuck::bytes_of(&params),
+                    dimension: D as u32,
                     cell: Cell::Link,
                     n_vars: n_links,
                     // One thread per site, each owning that site's link in the
-                    // pass's direction. A thread-per-link launch would idle five
-                    // threads in six, since a dispatch owns one direction of
-                    // three and one parity of two.
+                    // pass's direction. A thread-per-link launch would idle all
+                    // but one thread in `2 * D`, since a dispatch owns one
+                    // direction of `D` and one parity of two; per-site idles one
+                    // in two whatever the dimension.
                     threads: n_sites,
-                    colors: N_COLORS,
+                    // Read from the CPU schedule rather than restated: the two
+                    // must agree, since that schedule is the sequential
+                    // reference this kernel is checked against.
+                    colors: LinkCheckerboard::colors::<D>() as u32,
                     sweeps_between,
                     batch,
                 },
@@ -188,14 +198,30 @@ mod tests {
         let Some(gpu) = require_gpu() else {
             return;
         };
-        let lat = Lattice::new([4, 4, 4]);
-        let mut rng = RandRng::seed_from_u64(0);
-        let start = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
+        fn round_trip<const D: usize>(gpu: Gpu, shape: [usize; D]) {
+            let lat = Lattice::new(shape);
+            let mut rng = RandRng::seed_from_u64(0);
+            let start = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
 
-        let mut chain = GpuGaugeChain::new(gpu, &lat, 1.0, 0.5, 7, &start, 0, 1);
-        let got = chain.next().expect("open-ended stream yields");
+            let mut chain = GpuGaugeChain::new(gpu, &lat, 1.0, 0.5, 7, &start, 0, 1);
+            let got = chain.next().expect("open-ended stream yields");
 
-        assert_eq!(got, start, "zero-sweep round-trip must be the identity");
+            assert_eq!(
+                got, start,
+                "{shape:?}: zero-sweep round-trip must be the identity"
+            );
+        }
+
+        // Two, three, and four dimensions: the staple stride is `6(D - 1)`
+        // entries per link, so the buffer this uploads and the stride the kernel
+        // indexes it with are a different width in each. A `D = 3` case alone
+        // would not notice the two disagreeing, since three is what the shader
+        // used to be written for.
+        round_trip(gpu, [4, 4, 4]);
+        let Some(gpu) = require_gpu() else { return };
+        round_trip(gpu, [4, 4]);
+        let Some(gpu) = require_gpu() else { return };
+        round_trip(gpu, [4, 4, 4, 4]);
     }
 
     /// A cold start at strong coupling stays cold: every plaquette is already

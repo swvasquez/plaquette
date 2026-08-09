@@ -42,7 +42,7 @@
 //! # use plaquette::gauge_config::GaugeRunConfig;
 //! # use plaquette::{GaugeSampler, gauge_measure};
 //! # let run = GaugeRunConfig::parse("shape=[4,4,4]\nj=1.0\nbeta=0.75\nthermalize=10\nsweeps_between=1\nn_samples=5\nseed=1").unwrap();
-//! let mut sampler = GaugeSampler::new(&run);
+//! let mut sampler = GaugeSampler::<3>::new(&run);
 //! let (lattice, model) = (sampler.lattice(), sampler.model());
 //! let plaquettes: Vec<f64> = sampler
 //!     .samples()
@@ -61,9 +61,6 @@ use crate::lattice::Lattice;
 use crate::model::Z2Gauge;
 use crate::rng::RandRng;
 use crate::updater::{AnyUpdater, LinkCheckerboard, Metropolis};
-
-/// The dimension every gauge run is fixed at, matching [`GaugeRunConfig`].
-const D: usize = 3;
 
 /// The evolving state a [`GaugeSampler`] streams from, one variant per backend.
 ///
@@ -92,14 +89,19 @@ enum Engine {
 /// Named for its grade rather than called `AnyChain`, because the Ising sampler
 /// has a structurally identical type and both are re-exported from the crate
 /// root, where one plain name cannot cover two.
-pub enum AnyGaugeChain<'a> {
+///
+/// Only the CPU variant carries the dimension. The device chain reads the
+/// lattice once when it is built and keeps buffers afterwards, so `D` never
+/// reaches [`GpuGaugeChain`]'s type — the parameter here is the borrowed
+/// [`Chain`]'s alone.
+pub enum AnyGaugeChain<'a, const D: usize> {
     /// A transient chain borrowing the sampler's state for the length of the run.
     Cpu(Chain<'a, 2, D, Z2Gauge, AnyUpdater, RandRng>),
     /// A mutable borrow of the sampler's persistent device chain.
     Gpu(&'a mut GpuGaugeChain),
 }
 
-impl Iterator for AnyGaugeChain<'_> {
+impl<const D: usize> Iterator for AnyGaugeChain<'_, D> {
     type Item = Configuration<2>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -113,10 +115,11 @@ impl Iterator for AnyGaugeChain<'_> {
 /// Owns a gauge run's assembled pieces and its evolving state, thermalized and
 /// ready to stream.
 ///
-/// Fixed at `D = 3`, `Q = 2`, matching [`GaugeRunConfig`]. The backend is chosen
-/// from the config's [`UpdaterKind`] and held in a private per-backend `Engine`,
-/// so neither the CPU nor the GPU type leaks into the streaming interface.
-pub struct GaugeSampler {
+/// Fixed at `Q = 2` and generic over the dimension, which a driver names in its
+/// own source and the config's shape must agree with. The backend is chosen from the config's
+/// [`UpdaterKind`] and held in a private per-backend `Engine`, so neither the
+/// CPU nor the GPU type leaks into the streaming interface.
+pub struct GaugeSampler<const D: usize> {
     lattice: Lattice<D>,
     model: Z2Gauge,
     beta: f64,
@@ -124,7 +127,7 @@ pub struct GaugeSampler {
     engine: Engine,
 }
 
-impl GaugeSampler {
+impl<const D: usize> GaugeSampler<D> {
     /// Assemble a gauge run from its config and thermalize it.
     ///
     /// Runs `config.thermalize` warmup sweeps at stride 1 and discards them, so
@@ -139,10 +142,11 @@ impl GaugeSampler {
     /// # Panics
     ///
     /// Panics if the config is invalid (via `build`), which includes asking for
-    /// an updater that schedules sites rather than links, or if it selects the
-    /// GPU backend on a machine with no GPU adapter.
+    /// an updater that schedules sites rather than links or naming a dimension
+    /// other than `D`, or if it selects the GPU backend on a machine with no GPU
+    /// adapter.
     pub fn new(config: &GaugeRunConfig) -> Self {
-        let (lattice, model, mut rng, mut state, beta) = config.build();
+        let (lattice, model, mut rng, mut state, beta) = config.build::<D>();
 
         let engine = if let UpdaterKind::GpuLinkCheckerboard = config.updater {
             let gpu = Gpu::new().expect("GPU backend requested but no GPU adapter is available");
@@ -199,7 +203,7 @@ impl GaugeSampler {
     /// Stream from the warmed-up state, one [`Configuration`] per
     /// `sweeps_between` sweeps. Bound it with `.take(n)`; the sampler retains
     /// nothing, and calling this again continues the same chain.
-    pub fn samples(&mut self) -> AnyGaugeChain<'_> {
+    pub fn samples(&mut self) -> AnyGaugeChain<'_, D> {
         let GaugeSampler {
             lattice,
             model,
@@ -235,7 +239,7 @@ mod tests {
 
     fn config() -> GaugeRunConfig {
         GaugeRunConfig {
-            shape: [4, 4, 4],
+            shape: vec![4, 4, 4],
             j: 1.0,
             beta: 0.75,
             updater: UpdaterKind::Metropolis,
@@ -255,7 +259,7 @@ mod tests {
         let mut run = config();
         run.updater = UpdaterKind::LinkCheckerboard;
 
-        let mut sampler = GaugeSampler::new(&run);
+        let mut sampler = GaugeSampler::<3>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
@@ -273,7 +277,7 @@ mod tests {
         let mut run = config();
         run.updater = UpdaterKind::GpuLinkCheckerboard;
 
-        let mut sampler = GaugeSampler::new(&run);
+        let mut sampler = GaugeSampler::<3>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
@@ -285,7 +289,7 @@ mod tests {
     /// asked for: 3 links per site on 64 sites.
     #[test]
     fn streams_link_configs_of_the_right_size() {
-        let mut sampler = GaugeSampler::new(&config());
+        let mut sampler = GaugeSampler::<3>::new(&config());
         let configs: Vec<_> = sampler.samples().take(5).collect();
 
         assert_eq!(configs.len(), 5);
@@ -299,7 +303,7 @@ mod tests {
     #[test]
     fn matches_a_hand_driven_chain() {
         let run = config();
-        let (lattice, model, mut rng, mut state, beta) = run.build();
+        let (lattice, model, mut rng, mut state, beta) = run.build::<3>();
         let updater = AnyUpdater::Metropolis(Metropolis);
         Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
             .advance(run.thermalize);
@@ -315,7 +319,7 @@ mod tests {
         .take(run.n_samples)
         .collect();
 
-        let mut sampler = GaugeSampler::new(&run);
+        let mut sampler = GaugeSampler::<3>::new(&run);
         let got: Vec<_> = sampler.samples().take(run.n_samples).collect();
 
         assert_eq!(got, expected);
@@ -325,8 +329,8 @@ mod tests {
     /// is the reproducibility guarantee end to end rather than at `build` alone.
     #[test]
     fn is_reproducible_from_the_config() {
-        let mut a = GaugeSampler::new(&config());
-        let mut b = GaugeSampler::new(&config());
+        let mut a = GaugeSampler::<3>::new(&config());
+        let mut b = GaugeSampler::<3>::new(&config());
         assert_eq!(
             a.samples().take(4).collect::<Vec<_>>(),
             b.samples().take(4).collect::<Vec<_>>()
@@ -337,11 +341,11 @@ mod tests {
     /// re-thermalizing: `n` then `m` equals one run of `n + m`.
     #[test]
     fn a_second_call_continues_the_same_chain() {
-        let mut split = GaugeSampler::new(&config());
+        let mut split = GaugeSampler::<3>::new(&config());
         let mut got: Vec<_> = split.samples().take(6).collect();
         got.extend(split.samples().take(4));
 
-        let mut whole = GaugeSampler::new(&config());
+        let mut whole = GaugeSampler::<3>::new(&config());
         let expected: Vec<_> = whole.samples().take(10).collect();
 
         assert_eq!(got, expected);
@@ -353,7 +357,7 @@ mod tests {
     /// lattice, and the model handed over actually belong to each other.
     #[test]
     fn measures_the_stream_via_sampler_geometry() {
-        let mut sampler = GaugeSampler::new(&config());
+        let mut sampler = GaugeSampler::<3>::new(&config());
         let lattice = sampler.lattice();
         let model = sampler.model();
         let n_plaquettes = lattice.n_plaquettes() as f64;
@@ -389,7 +393,7 @@ mod tests {
         run.thermalize = 0;
         run.sweeps_between = 0;
 
-        let mut sampler = GaugeSampler::new(&run);
+        let mut sampler = GaugeSampler::<3>::new(&run);
         let (lattice, model) = (sampler.lattice(), sampler.model());
         let table = wilson_rectangles(&model, &lattice, &sampler.samples().next().unwrap(), 2);
 
@@ -416,7 +420,7 @@ mod tests {
         run.thermalize = 200;
         run.sweeps_between = 2;
 
-        let mut sampler = GaugeSampler::new(&run);
+        let mut sampler = GaugeSampler::<3>::new(&run);
         let (lattice, model) = (sampler.lattice(), sampler.model());
 
         let n = 40;
@@ -446,7 +450,7 @@ mod tests {
             run.thermalize = 500;
             run.sweeps_between = 4;
 
-            let mut sampler = GaugeSampler::new(&run);
+            let mut sampler = GaugeSampler::<3>::new(&run);
             let (lattice, model) = (sampler.lattice(), sampler.model());
             let n = 400;
             sampler

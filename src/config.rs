@@ -15,28 +15,49 @@
 //! separate entry points, and a caller names the one it means.
 
 use crate::configuration::Cell;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-/// Deserialize a lattice shape, rejecting an array whose length is not `N`.
+/// Check that a config's shape names `expected` axes, the dimension the driver
+/// was built for.
 ///
-/// Needed because serde's fixed-size array visitor stops reading after `N`
-/// entries and the TOML deserializer does not object to the ones left over, so a
-/// *too long* `shape` would otherwise load silently truncated: `[8, 8, 8]` in a
-/// two-dimensional schema drops an axis and runs a different theory than the
-/// file describes, without a word. A shape that is too *short* already fails on
-/// its own — the visitor runs out and says so. Going through a `Vec` first is
-/// what makes the extra entries visible, and it is the same guarantee
-/// `deny_unknown_fields` gives for keys, applied to the one field whose length
-/// carries the dimension.
-pub(crate) fn deserialize_shape<'de, De, const N: usize>(de: De) -> Result<[usize; N], De::Error>
-where
-    De: Deserializer<'de>,
-{
-    let extents = Vec::<usize>::deserialize(de)?;
-    let found = extents.len();
-    extents.try_into().map_err(|_| {
-        let expected = format!("a lattice shape of length {N}");
-        serde::de::Error::invalid_length(found, &expected.as_str())
+/// The dimension is the one run parameter a file cannot decide on its own. Every
+/// layer of the library is generic over `D`, but `D` is a compile-time parameter
+/// and a file is read at runtime, so a driver names the dimension it is built for
+/// and this reports a file that disagrees. Naming it in the driver rather than
+/// dispatching on it at load is deliberate: a dispatch would have to instantiate
+/// the whole sampler stack once per dimension, and once a second parameter is
+/// generic — the state count `Q`, for a Potts or `U(1)` model — the set of
+/// instantiations to enumerate is a grid rather than a list. Fixing the point at
+/// compile time is also what the lattice-gauge codes do.
+///
+/// This is the graceful path, for a driver that wants to report a mismatch and
+/// exit. `build` panics on the same condition, as the backstop for a caller that
+/// skipped the check.
+pub fn check_dimension(shape: &[usize], expected: usize) -> Result<(), ConfigError> {
+    if shape.len() != expected {
+        return Err(ConfigError::Invalid(format!(
+            "this program is built for {expected} dimensions, \
+             but shape{shape:?} names {}",
+            shape.len()
+        )));
+    }
+    Ok(())
+}
+
+/// A config's shape as the fixed-width array a [`Lattice`](crate::lattice::Lattice)
+/// needs, or a panic if it does not name `D` axes.
+///
+/// The panicking counterpart of [`check_dimension`], for the point where a
+/// driver has already committed to a `D` and is building the run. Both schemas
+/// convert here rather than each spelling out the conversion, so the message a
+/// caller who skipped the check sees is written once.
+pub(crate) fn shape_array<const D: usize>(shape: &[usize]) -> [usize; D] {
+    <[usize; D]>::try_from(shape).unwrap_or_else(|_| {
+        panic!(
+            "this program is built for {D} dimensions, but shape{shape:?} names {}; \
+             call check_dimension::<{D}> after loading to report this cleanly",
+            shape.len()
+        )
     })
 }
 
@@ -133,6 +154,36 @@ impl UpdaterKind {
             UpdaterKind::GpuSiteCheckerboard | UpdaterKind::GpuLinkCheckerboard
         )
     }
+}
+
+/// Check that `shape` describes a lattice this model can live on: at least
+/// `min_dimension` axes, each of positive extent.
+///
+/// The dimension floor is the one thing the two schemas genuinely disagree
+/// about, and it follows from which cell the model's energy scores. Ising scores
+/// links, which exist in one dimension; the gauge action scores plaquettes,
+/// which need a pair of directions and so two. Below its bound a model does not
+/// fail loudly — the cell count goes to zero and the energy comes out
+/// identically zero — so the bound has to be stated rather than left to the
+/// arithmetic. `scores` names the cell for the message.
+pub(crate) fn check_shape(
+    shape: &[usize],
+    min_dimension: usize,
+    scores: &str,
+) -> Result<(), ConfigError> {
+    if shape.len() < min_dimension {
+        return Err(ConfigError::Invalid(format!(
+            "this run scores {scores}, which need at least {min_dimension} dimensions, \
+             but shape{shape:?} names {}",
+            shape.len()
+        )));
+    }
+    if let Some(axis) = shape.iter().position(|&l| l == 0) {
+        return Err(ConfigError::Invalid(format!(
+            "every lattice extent must be positive, but shape{shape:?} is 0 on axis {axis}"
+        )));
+    }
+    Ok(())
 }
 
 /// Check that `updater` can advance a field on `cell` over a lattice of

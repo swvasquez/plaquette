@@ -19,14 +19,12 @@
 //! reference.
 
 use crate::configuration::{Cell, Configuration};
-use crate::device::{DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed};
+use crate::device::{DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors};
 use crate::lattice::Lattice;
 
-/// The dimension the Ising shader is written for, matching
-/// [`IsingRunConfig`](crate::ising_config::IsingRunConfig).
-const D: usize = 2;
-
-/// Color passes per sweep: the two coordinate-sum parities.
+/// Color passes per sweep: the two coordinate-sum parities. A site's color does
+/// not depend on the dimension — a step along any axis flips the parity, in one
+/// dimension as in six — so unlike the link coloring this count is a constant.
 const N_COLORS: u32 = 2;
 
 /// The compiled kernel: the shared preamble followed by the site checkerboard.
@@ -35,18 +33,20 @@ const SHADER: &str = crate::device::shader_source!("ising_checkerboard.wgsl");
 /// The static run parameters uploaded to the shader's uniform buffer.
 ///
 /// `#[repr(C)]` with explicit padding to a 16-byte multiple, matching the WGSL
-/// `Params` struct's uniform layout.
+/// `Params` struct's uniform layout. It carries no geometry: the kernel reads a
+/// site's color from a table and takes the dimension as an override, so nothing
+/// about the shape has to be described here.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     n_sites: u32,
-    width: u32,
     seed: u32,
-    _pad0: u32,
     beta: f32,
     j: f32,
     h: f32,
+    _pad0: f32,
     _pad1: f32,
+    _pad2: f32,
 }
 
 /// The Ising Markov chain run on the GPU, yielding sampled [`Configuration`]s on
@@ -54,7 +54,12 @@ struct Params {
 ///
 /// A sibling of [`Chain`](crate::chain::Chain): same iterator interface, device
 /// machinery underneath. Owns everything it needs, so it borrows nothing and can
-/// be moved and driven freely. Fixed at `Q = 2`, `D = 2`.
+/// be moved and driven freely. Fixed at `Q = 2`.
+///
+/// The type carries no dimension. It reads the lattice once, in
+/// [`new`](GpuIsingChain::new), to build the tables it uploads, and afterwards
+/// holds only device buffers and counts — so `D` is a parameter of the
+/// constructor rather than of the chain.
 pub struct GpuIsingChain {
     sweeper: DeviceSweeper,
 }
@@ -74,9 +79,9 @@ impl GpuIsingChain {
     /// # Panics
     ///
     /// Panics if `batch` is zero, if `start` is not a site field of this
-    /// lattice, or if either extent is odd.
+    /// lattice, or if any extent is odd.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new<const D: usize>(
         gpu: Gpu,
         lattice: &Lattice<D>,
         j: f64,
@@ -107,19 +112,20 @@ impl GpuIsingChain {
         let n_sites = lattice.n_sites();
 
         let spins: Vec<u32> = start.variables().iter().map(|s| s.index() as u32).collect();
-        let mut neighbors: Vec<u32> = Vec::with_capacity(n_sites * 2 * D);
+        let mut neighbors: Vec<u32> = Vec::with_capacity(n_sites * Lattice::<D>::neighbor_stride());
         for site in 0..n_sites {
             neighbors.extend(lattice.site_neighbors(site).iter().map(|&nb| nb as u32));
         }
+        let site_color = site_colors(lattice);
         let params = Params {
             n_sites: n_sites as u32,
-            width: shape[0] as u32,
             seed: fold_seed(seed),
-            _pad0: 0,
             beta: beta as f32,
             j: j as f32,
             h: h as f32,
+            _pad0: 0.0,
             _pad1: 0.0,
+            _pad2: 0.0,
         };
 
         GpuIsingChain {
@@ -130,7 +136,9 @@ impl GpuIsingChain {
                     shader: SHADER,
                     vars_init: &spins,
                     table: &neighbors,
+                    site_color: &site_color,
                     params: bytemuck::bytes_of(&params),
+                    dimension: D as u32,
                     cell: Cell::Site,
                     n_vars: n_sites,
                     // One thread per site, which on a site field is also one per
@@ -195,6 +203,47 @@ mod tests {
         let got = chain.next().expect("open-ended stream yields");
 
         assert_eq!(got, start, "zero-sweep round-trip must be the identity");
+    }
+
+    /// Every site is reached when the launch has to span more than one row of
+    /// workgroups.
+    ///
+    /// One row is `max_compute_workgroups_per_dimension * 64` threads, about 4.2
+    /// million on any adapter, and it is an API-level cap rather than a
+    /// conservative default — no limits request raises it. Past it the host
+    /// launches a rectangle and the kernel folds the two axes back into a site
+    /// index. Nothing smaller exercises that folding, so this lattice is sized
+    /// deliberately just over the edge: `2048^2 = 4_194_304` sites against a
+    /// `65535 * 64 = 4_194_240` row.
+    ///
+    /// The physics is chosen to make a missed site unmistakable rather than
+    /// merely unlikely. At `j = 0` a flip costs `2 * s_i * h`, so with `h < 0`
+    /// every spin of a cold field flips on its first visit, whatever its
+    /// neighbors are doing. After one sweep the magnetization must be exactly
+    /// `-N`: a site the grid failed to reach would still be `+1` and shift it by
+    /// a countable amount, and a site reached twice would flip back.
+    #[test]
+    fn a_launch_spanning_two_rows_reaches_every_site() {
+        let Some(gpu) = require_gpu() else {
+            return;
+        };
+        let lat = Lattice::new([2048, 2048]);
+        let n_sites = lat.n_sites();
+        assert!(
+            n_sites > 65535 * 64,
+            "this lattice must not fit in one row of workgroups"
+        );
+
+        let start = Configuration::<2>::cold(&lat, Cell::Site);
+        let mut chain = GpuIsingChain::new(gpu, &lat, 0.0, -1.0, 1.0, 7, &start, 1, 1);
+        let after = chain.next().expect("open-ended stream yields");
+
+        let model = Ising::new(0.0, -1.0);
+        assert_eq!(
+            measure(&model, &lat, &after).magnetization,
+            -(n_sites as f64),
+            "every site should have flipped exactly once"
+        );
     }
 
     /// The GPU checkerboard samples the same distribution as the CPU one: at a

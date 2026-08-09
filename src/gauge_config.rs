@@ -16,22 +16,30 @@
 //! reproducibility fields, and the load/parse/validate/round-trip contract are
 //! written the same way on both sides and read the same way from a file.
 //!
-//! The dimension is fixed at `D = 3`, the same way the Ising schema is nailed to
-//! `D = 2` and for the same reason: a file is read at runtime, so the loader has
-//! to commit to a concrete dimension. Three is the interesting one for `Z2` —
-//! the two-dimensional theory is exactly solvable and confines at every coupling,
-//! so it has no transition to find, while three dimensions has one. Dispatching
-//! to a general `Lattice<D>` from a variable-length shape is deferred.
+//! The dimension is whatever the file's `shape` is long, down to a floor of two:
+//! the action scores plaquettes, and a plaquette needs a pair of directions.
+//! Three is the interesting case — the two-dimensional theory is exactly
+//! solvable and has no transition, while three dimensions does — but two is
+//! worth running precisely because it is solvable, since `tanh(beta)` raised to
+//! a loop's area is a closed form to check a sampled chain against. The `D` that
+//! [`build`](GaugeRunConfig::build) needs is a compile-time parameter a driver
+//! names in its own source, and
+//! [`check_dimension`](GaugeRunConfig::check_dimension) reports a file that
+//! disagrees.
 
-use crate::config::{ConfigError, Start, UpdaterKind, check_updater, deserialize_shape};
+use crate::config::{
+    ConfigError, Start, UpdaterKind, check_dimension, check_shape, check_updater, shape_array,
+};
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::model::Z2Gauge;
 use crate::rng::RandRng;
 use serde::{Deserialize, Serialize};
 
-/// The dimension every gauge run is fixed at (see the module docs).
-const D: usize = 3;
+/// The fewest dimensions a Z2 gauge run can be built on, re-exported from the
+/// model that owns it — the floor follows from what [`Z2Gauge`] scores, not from
+/// anything about config files.
+pub const MIN_DIMENSION: usize = Z2Gauge::MIN_DIMENSION;
 
 /// A single gauge run's parameters in serializable form: everything needed to
 /// produce a run's configurations, and nothing about what is later measured from
@@ -45,19 +53,18 @@ const D: usize = 3;
 /// after the fact.
 ///
 /// Unknown keys are rejected rather than ignored, which also gives the schema a
-/// second job: an Ising file handed to this parser fails on `h` and on its
-/// two-element `shape`, rather than running a gauge theory at whatever the file
-/// happened to say.
+/// second job: an Ising file handed to this parser fails on `h`, rather than
+/// running a gauge theory at whatever the file happened to say. The shape no
+/// longer helps with that — a two-element shape is a legitimate gauge run now —
+/// so `h` is the whole of the discrimination.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GaugeRunConfig {
     // --- physics ---
-    /// Per-axis lattice extents `[L_0, L_1, L_2]`. Fixed length 3 (see module
-    /// docs), and a file giving any other length is refused rather than truncated:
-    /// a too-long `shape` would otherwise drop its trailing extents in silence and
-    /// run a smaller lattice than the file names.
-    #[serde(deserialize_with = "deserialize_shape")]
-    pub shape: [usize; D],
+    /// Per-axis lattice extents `[L_0, ..., L_{D-1}]`. Its length *is* the
+    /// dimension of the run, which is why it is a list rather than a fixed-width
+    /// tuple: nothing else in the file says how many directions there are.
+    pub shape: Vec<usize>,
     /// Plaquette coupling `J`. There is no `h` to go with it — see the module
     /// docs.
     pub j: f64,
@@ -127,24 +134,42 @@ impl GaugeRunConfig {
         Ok(config)
     }
 
+    /// The dimension this run is on: the number of extents its shape names.
+    pub fn dimension(&self) -> usize {
+        self.shape.len()
+    }
+
+    /// Check that this run's dimension is `D`, the one the calling program was
+    /// built for.
+    ///
+    /// A driver names `D` in its own source and calls this right after loading,
+    /// so a file written for another dimension is a clean message rather than a
+    /// panic partway through a run. See
+    /// [`check_dimension`](crate::config::check_dimension) for why the dimension
+    /// is a compile-time choice.
+    pub fn check_dimension<const D: usize>(&self) -> Result<(), ConfigError> {
+        check_dimension(&self.shape, D)
+    }
+
     /// Check that the values describe a runnable gauge run.
     ///
-    /// Rejects what would otherwise panic or produce nothing — a zero extent, a
-    /// non-positive or non-finite `beta`, a non-finite coupling, a run recording
-    /// no samples — and applies `check_updater` against [`Cell::Link`]: this
-    /// model's variables live on links, so it takes the grade-neutral Metropolis
-    /// or a link schedule and refuses a site one, and a schedule that colors in
-    /// parallel additionally needs even extents.
+    /// Rejects what would otherwise panic or produce nothing — a shape below two
+    /// dimensions or with a zero extent, a non-positive or non-finite `beta`, a
+    /// non-finite coupling, a run recording no samples — and applies
+    /// `check_updater` against [`Cell::Link`]: this model's variables live on
+    /// links, so it takes the grade-neutral Metropolis or a link schedule and
+    /// refuses a site one, and a schedule that colors in parallel additionally
+    /// needs even extents.
+    ///
+    /// It checks the dimension floor but not which dimension the *program* was
+    /// built for. Two is a statement about the physics and belongs to the
+    /// schema; matching a particular binary is a separate question, and
+    /// [`check_dimension`](GaugeRunConfig::check_dimension) answers it.
     ///
     /// `thermalize` and `sweeps_between` may be zero — no warmup and no
     /// decorrelation gap are unusual but legitimate.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(axis) = self.shape.iter().position(|&l| l == 0) {
-            return Err(ConfigError::Invalid(format!(
-                "every lattice extent must be positive, but shape{:?} is 0 on axis {axis}",
-                self.shape
-            )));
-        }
+        check_shape(&self.shape, MIN_DIMENSION, "plaquettes")?;
         // `is_finite` first, so the comparison below is NaN-free.
         if !self.beta.is_finite() || self.beta <= 0.0 {
             return Err(ConfigError::Invalid(format!(
@@ -186,17 +211,23 @@ impl GaugeRunConfig {
     /// uses. That is not a parameter: it is where the gauge variables live, and
     /// the model's energy asserts it.
     ///
+    /// `D` must match [`dimension`](GaugeRunConfig::dimension). It is a
+    /// parameter rather than something read off the config because a lattice's
+    /// dimension is part of its type, so a driver names it in its own source and
+    /// calls [`check_dimension`](GaugeRunConfig::check_dimension) first to turn
+    /// a mismatch into a message.
+    ///
     /// # Panics
     ///
     /// Panics if the config is invalid. [`load`](GaugeRunConfig::load) and
     /// [`parse`](GaugeRunConfig::parse) validate, so this can only fire on a
     /// `GaugeRunConfig` built by hand that skipped
-    /// [`validate`](GaugeRunConfig::validate).
-    pub fn build(&self) -> (Lattice<D>, Z2Gauge, RandRng, Configuration<2>, f64) {
+    /// [`validate`](GaugeRunConfig::validate). Panics too if `D` disagrees with
+    /// the shape's length.
+    pub fn build<const D: usize>(&self) -> (Lattice<D>, Z2Gauge, RandRng, Configuration<2>, f64) {
         self.validate()
             .expect("build called on an unvalidated config");
-
-        let lattice = Lattice::new(self.shape);
+        let lattice = Lattice::new(shape_array::<D>(&self.shape));
         let model = Z2Gauge::new(self.j);
         let mut rng = RandRng::seed_from_u64(self.seed);
         // Drawn from `rng` *after* seeding and *before* the chain uses it, so the
@@ -225,7 +256,7 @@ mod tests {
     /// A fully-specified config used as a fixture across the tests.
     fn sample_config() -> GaugeRunConfig {
         GaugeRunConfig {
-            shape: [8, 8, 8],
+            shape: vec![8, 8, 8],
             j: 1.0,
             beta: 0.75,
             updater: UpdaterKind::Metropolis,
@@ -328,7 +359,7 @@ mod tests {
     #[test]
     fn validate_rejects_a_zero_extent() {
         let mut config = sample_config();
-        config.shape = [8, 0, 8];
+        config.shape = vec![8, 0, 8];
         assert!(invalid_message(&config).contains("extent"));
     }
 
@@ -402,7 +433,7 @@ mod tests {
         // any link order is a valid Metropolis schedule.
         let mut config = sample_config();
         config.updater = UpdaterKind::GpuLinkCheckerboard;
-        config.shape = [8, 8, 7];
+        config.shape = vec![8, 8, 7];
         let message = invalid_message(&config);
         assert!(message.contains("even extents"), "{message}");
         assert!(message.contains("axis 2"), "{message}");
@@ -455,12 +486,10 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_of_the_wrong_length_is_refused_rather_than_truncated() {
-        // Too *long* is the dangerous direction, and it does not fail on its own:
-        // serde's array visitor stops after three entries and the TOML
-        // deserializer says nothing about the fourth, so without
-        // `deserialize_shape` a four-dimensional file would quietly run as a
-        // three-dimensional one. Too short fails either way.
+    fn the_shape_length_is_the_dimension_down_to_two() {
+        // The schema puts no length on `shape`: whatever it names is the run's
+        // dimension, down to the two the action needs. This is the field that
+        // used to be fixed at three.
         let text = r#"
             shape = [4, 4, 4, 4]
             j = 1.0
@@ -470,25 +499,30 @@ mod tests {
             n_samples = 10
             seed = 1
         "#;
-        assert!(matches!(
-            GaugeRunConfig::parse(text),
-            Err(ConfigError::Parse(_))
-        ));
+        for (shape, dimension) in [("[4, 4, 4, 4]", 4), ("[4, 4, 4]", 3), ("[4, 4]", 2)] {
+            let config = GaugeRunConfig::parse(&text.replace("[4, 4, 4, 4]", shape)).unwrap();
+            assert_eq!(config.dimension(), dimension);
+        }
 
-        let short = text.replace("[4, 4, 4, 4]", "[4, 4]");
-        assert!(matches!(
-            GaugeRunConfig::parse(&short),
-            Err(ConfigError::Parse(_))
-        ));
+        // One dimension has no direction pair, so no plaquettes and an
+        // identically zero energy — a run producing nothing rather than failing,
+        // which is why the schema has to turn it away.
+        let line = text.replace("[4, 4, 4, 4]", "[4]");
+        let message = match GaugeRunConfig::parse(&line) {
+            Err(ConfigError::Invalid(msg)) => msg,
+            other => panic!("expected an Invalid error, got {other:?}"),
+        };
+        assert!(message.contains("plaquettes"), "{message}");
     }
 
     #[test]
     fn an_ising_file_is_refused_rather_than_run_as_a_gauge_theory() {
-        // The two schemas have no discriminant key, so this is what stops a file
-        // meant for the other model. Both of its marks are checked separately,
-        // since either alone has to be enough: an Ising file without an `h` is
-        // still an Ising file, and one that happened to name three extents would
-        // still have a field this model cannot price.
+        // The two schemas have no discriminant key, so `h` is what stops a file
+        // meant for the other model: `deny_unknown_fields` refuses a field this
+        // model cannot price. It is the *whole* of the discrimination now that
+        // the shape carries the dimension — `[8, 8]` names a legitimate
+        // two-dimensional gauge run, so a field-free Ising file at that shape is
+        // simply a gauge file, and nothing can tell them apart.
         let ising = r#"
             shape = [8, 8]
             j = 1.0
@@ -504,14 +538,7 @@ mod tests {
             Err(ConfigError::Parse(_))
         ));
 
-        // The two-element shape alone, with the field dropped.
-        let no_field = ising.replace("h = 0.25\n", "");
-        assert!(matches!(
-            GaugeRunConfig::parse(&no_field),
-            Err(ConfigError::Parse(_))
-        ));
-
-        // And `h` alone, with the shape corrected.
+        // `h` alone, with the shape one this model would run happily.
         let three_axes = ising.replace("[8, 8]", "[8, 8, 8]");
         assert!(matches!(
             GaugeRunConfig::parse(&three_axes),
@@ -532,7 +559,7 @@ mod tests {
             start = "cold"
         "#;
         let config = GaugeRunConfig::parse(text).unwrap();
-        let (lattice, model, _rng, start, beta) = config.build();
+        let (lattice, model, _rng, start, beta) = config.build::<3>();
 
         assert_eq!(lattice.shape(), [4, 6, 8]);
         assert_eq!(lattice.n_sites(), 192);
@@ -546,10 +573,32 @@ mod tests {
     }
 
     #[test]
+    fn check_dimension_accepts_only_the_shape_the_file_names() {
+        // The graceful half of the pair below: a driver calls this after loading
+        // and prints the message rather than letting `build` panic.
+        let config = sample_config();
+        assert!(config.check_dimension::<3>().is_ok());
+        let message = match config.check_dimension::<2>() {
+            Err(ConfigError::Invalid(msg)) => msg,
+            other => panic!("expected an Invalid error, got {other:?}"),
+        };
+        assert!(message.contains("built for 2 dimensions"), "{message}");
+        assert!(message.contains("names 3"), "{message}");
+    }
+
+    #[test]
+    #[should_panic(expected = "this program is built for 2 dimensions")]
+    fn build_refuses_a_dimension_the_shape_does_not_name() {
+        // The backstop for a driver that skipped `check_dimension`. Without it
+        // the shape would be silently truncated or padded to `D`.
+        sample_config().build::<2>();
+    }
+
+    #[test]
     fn build_honors_a_hot_start() {
         let mut config = sample_config();
         config.start = Start::Hot;
-        let (lattice, _, _, start, _) = config.build();
+        let (lattice, _, _, start, _) = config.build::<3>();
 
         // A hot start on 1536 links is aligned with vanishing probability, so
         // this distinguishes it from cold without being flaky.
@@ -563,8 +612,8 @@ mod tests {
         let mut config = sample_config();
         config.start = Start::Hot;
 
-        let (_, _, mut rng_a, start_a, _) = config.build();
-        let (_, _, mut rng_b, start_b, _) = config.build();
+        let (_, _, mut rng_a, start_a, _) = config.build::<3>();
+        let (_, _, mut rng_b, start_b, _) = config.build::<3>();
 
         assert_eq!(start_a, start_b);
         for _ in 0..16 {
@@ -579,7 +628,7 @@ mod tests {
         // and the chain would silently share randomness.
         let mut config = sample_config();
         config.start = Start::Hot;
-        let (_, _, mut rng, _, _) = config.build();
+        let (_, _, mut rng, _, _) = config.build::<3>();
 
         let mut fresh = RandRng::seed_from_u64(config.seed);
         assert_ne!(rng.next_f64(), fresh.next_f64());

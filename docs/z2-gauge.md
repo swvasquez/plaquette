@@ -1,4 +1,4 @@
-# Z2 gauge theory in three dimensions
+# Z2 gauge theory
 
 The Z2 gauge theory is a lattice of two-state variables with an interaction built
 from products around the smallest closed loops. It shares the Ising model's
@@ -12,21 +12,23 @@ follows from it.
 
 ## Lattice and links
 
-The lattice is a three-dimensional cubic grid of $N$ sites with periodic
+The lattice is a $D$-dimensional hypercubic grid of $N$ sites with periodic
 boundaries, the same toroidal geometry the Ising model uses. What differs is where
 the degrees of freedom sit. Instead of one variable per site, a variable lives on
 each *link* — each edge joining a site to its nearest neighbor. A site has one
-forward link along each of the three axes, so the lattice carries $3N$ links in
-all, and a link is named by its base site $i$ together with the axis $\mu$ it
-points along, written $\ell = (i, \mu)$.
+forward link along each of the $D$ axes, so the lattice carries $DN$ links in all,
+and a link is named by its base site $i$ together with the axis $\mu$ it points
+along, written $\ell = (i, \mu)$.
 
 The links in turn bound the elementary square faces, called *plaquettes*. A
 plaquette is fixed by a base site and a pair of distinct axes $(\mu, \nu)$: it is
 the unit square in the $\mu\nu$-plane whose four sides are the links $(i, \mu)$,
-$(i + \hat\mu, \nu)$, $(i + \hat\nu, \mu)$, and $(i, \nu)$. In three dimensions
-there are three such planes, so each site anchors three plaquettes and the lattice
-has $3N$ of them — the same count as the links, a coincidence special to three
-dimensions.
+$(i + \hat\mu, \nu)$, $(i + \hat\nu, \mu)$, and $(i, \nu)$. There are
+$\binom{D}{2}$ such planes, so each site anchors that many plaquettes and the
+lattice has $\binom{D}{2} N$ of them. Two dimensions is the floor: below it no
+pair of distinct axes exists, so there are no plaquettes and no theory. Three
+dimensions is the one where the plaquette count $3N$ happens to equal the link
+count, a coincidence of $\binom{3}{2} = 3$ rather than anything structural.
 
 ## The link variable
 
@@ -34,8 +36,8 @@ On each link sits a single two-state variable,
 
 $$\sigma_\ell = \pm 1,$$
 
-so a configuration is a choice of $\sigma_\ell$ on all $3N$ links, and there are
-$2^{3N}$ of them. The variable is an element of the group $\mathbb{Z}_2 = \{+1,
+so a configuration is a choice of $\sigma_\ell$ on all $DN$ links, and there are
+$2^{DN}$ of them. The variable is an element of the group $\mathbb{Z}_2 = \{+1,
 -1\}$ under multiplication, and reading it as a group element rather than a spin is
 what generalizes: replacing $\mathbb{Z}_2$ by a larger group is the path from this
 model toward the continuous gauge theories that are the longer-term aim.
@@ -73,7 +75,7 @@ cancels this way, $\sigma_\square$ is left unchanged, and therefore so is the wh
 energy. The transformation is *local* — an independent choice at each of the $N$
 sites, $2^N$ transformations in all — and it maps a configuration to a physically
 identical one. Configurations related by a gauge transformation are not distinct
-states but the same state described differently, and the $2^{3N}$ configurations
+states but the same state described differently, and the $2^{DN}$ configurations
 collapse into far fewer gauge-inequivalent classes.
 
 This redundancy is the defining feature of a gauge theory and the sharpest break
@@ -98,16 +100,23 @@ case. How its average $\langle W(C) \rangle$ falls off with the size of the loop
 separates the two phases of the theory. At small $\beta$ (strong coupling) it
 decays with the *area* the loop encloses, the confined phase; at large $\beta$
 (weak coupling) it decays only with the loop's *perimeter*, the deconfined phase.
-The crossover between the two laws is a genuine phase transition at a finite
-critical coupling.
+Whether the crossover between the two laws is a genuine transition depends on the
+dimension. In two it is not: the theory confines at every coupling, and the area
+law holds exactly, which is what makes two dimensions the check the measurement is
+pinned against below. From three up there is a transition at a finite critical
+coupling.
 
-That transition is tied to the Ising model by a duality: three-dimensional
-$\mathbb{Z}_2$ gauge theory is dual to the three-dimensional Ising model, with the
-gauge coupling and the Ising temperature related by the duality map, so the gauge
-transition sits at the image of the Ising critical point (near $\beta_c \approx
-0.76$). The two models are the same physics read on dual lattices — which is why a
-framework that already samples the Ising model is the natural place to build this
-one.
+In three dimensions that transition is tied to the Ising model by a duality:
+three-dimensional $\mathbb{Z}_2$ gauge theory is dual to the three-dimensional
+Ising model, with the gauge coupling and the Ising temperature related by the
+duality map, so the gauge transition sits at the image of the Ising critical point
+(near $\beta_c \approx 0.76$). The two models are the same physics read on dual
+lattices — which is why a framework that already samples the Ising model is the
+natural place to build this one. Four dimensions is dual to *itself*, and the
+self-duality fixes its transition exactly at $\beta_c = \tfrac12 \ln(1 +
+\sqrt2) \approx 0.4407$; unlike the three-dimensional one it is first order, so
+the two phases coexist there and a short run near it stays in whichever it
+started in.
 
 ## Measuring the loops
 
@@ -149,7 +158,7 @@ jackknife it shares with the fluctuation quantities does. When the ratio inside 
 logarithm is not positive — a run too noisy to resolve $\chi$ at that size — it
 returns `NaN` rather than a clamped stand-in.
 
-Two dimensions are the exact check on both halves of this. Fixing the gauge there
+Two dimensions is the exact check on both halves of this. Fixing the gauge there
 leaves one free variable per plaquette, so the plaquettes are independent, each
 averages to $\tanh(\beta J)$, and a rectangle — the product of the plaquettes it
 encloses — averages to

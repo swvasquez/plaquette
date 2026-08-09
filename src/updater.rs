@@ -221,6 +221,19 @@ impl<const D: usize> Updater<2, D> for SiteCheckerboard {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkCheckerboard;
 
+impl LinkCheckerboard {
+    /// Colors in one sweep: a direction paired with a base-site parity.
+    ///
+    /// Unlike the site coloring's two, this grows with the dimension, and the
+    /// number is shared rather than derived twice — `GpuGaugeChain` turns it
+    /// into dispatches per sweep and has to agree with the order
+    /// [`sweep`](LinkCheckerboard::sweep) walks, since the CPU schedule is the
+    /// reference the device kernel is checked against.
+    pub(crate) const fn colors<const D: usize>() -> usize {
+        2 * D
+    }
+}
+
 impl<const D: usize> Updater<2, D> for LinkCheckerboard {
     /// `2D` color passes: for each direction in turn, every link of that
     /// direction based on an even site, then every one based on an odd site, each
@@ -559,6 +572,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The link coloring stays collision-free at every dimension.
+    ///
+    /// This is the property a parallel pass rests on, and it grows with `D` in a
+    /// way the fixed-dimension test above cannot show: a link gains plaquette
+    /// partners linearly while the coloring's own `2D` colors grow alongside. A
+    /// coloring that stopped separating partners in higher dimensions would
+    /// break detailed balance on the GPU silently — every measured quantity
+    /// would still look reasonable.
+    ///
+    /// Only the link half is here. The site coloring is `Lattice::site_parity`
+    /// rather than anything this module owns, and
+    /// `lattice::parity_alternates_between_neighbors_in_every_dimension` already
+    /// sweeps it over a superset of these shapes.
+    ///
+    /// Every extent is even, which the wrap requires: an odd one puts a variable
+    /// next to a same-colored copy of itself across the boundary.
+    #[test]
+    fn the_link_coloring_stays_collision_free_in_every_dimension() {
+        fn links<const D: usize>(shape: [usize; D]) {
+            let lat = Lattice::new(shape);
+            for link in 0..lat.n_links() {
+                let color = link_color(&lat, link);
+                for plaquette in lat.link_plaquettes(link) {
+                    for partner in lat.plaquette_links(plaquette) {
+                        if partner != link {
+                            assert_ne!(
+                                color,
+                                link_color(&lat, partner),
+                                "{shape:?}: links {link} and {partner} share \
+                                 plaquette {plaquette} and a color"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        links([4, 6]);
+        links([2, 4, 6]);
+        links([2, 4, 2, 4]);
+        links([2, 2, 4, 2, 2]);
+        links([2, 4, 2, 2, 4, 2]);
+    }
+
+    /// A link pass covers every link exactly once, at every dimension.
+    ///
+    /// The counterpart of the collision-free property: a coloring that separated
+    /// partners but skipped or double-counted variables would also break the
+    /// chain, and the two failures are independent. Only the link pass is worth
+    /// asserting — the site pass partitions the sites by a two-valued function,
+    /// so reproducing the whole range is arithmetic rather than a property of
+    /// the schedule.
+    #[test]
+    fn a_link_pass_covers_every_link_once() {
+        fn links<const D: usize>(shape: [usize; D]) {
+            let lat = Lattice::new(shape);
+            let mut seen: Vec<usize> = Vec::with_capacity(lat.n_links());
+            // The pass order the sweep walks: direction outermost, parity inner.
+            for dir in 0..D {
+                for color in [0, 1] {
+                    seen.extend(
+                        (0..lat.n_sites())
+                            .filter(|&site| lat.site_parity(site) == color)
+                            .map(|site| lat.site_link(site, dir)),
+                    );
+                }
+            }
+            assert_eq!(seen.len(), lat.n_links(), "{shape:?}: wrong pass total");
+            seen.sort_unstable();
+            assert_eq!(seen, (0..lat.n_links()).collect::<Vec<_>>(), "{shape:?}");
+        }
+
+        links([4, 6]);
+        links([2, 4, 6]);
+        links([2, 4, 2, 4]);
+        links([2, 4, 2, 2, 4, 2]);
     }
 
     /// The sweep's site-major iteration visits exactly the links a link-major

@@ -16,6 +16,13 @@
 //! batching. Keeping that in one place is what stops a fix to the read-back path
 //! landing in one backend and silently not the other.
 //!
+//! Neither the batching nor either kernel knows the lattice dimension. What the
+//! kernels would otherwise have to derive from it — a site's coordinate-sum
+//! parity — arrives instead as an uploaded table, since the host already holds
+//! one and the CPU schedules read it; the one number a kernel still needs, `D`
+//! itself, is passed as a WGSL `override` and resolved when the pipeline is
+//! built, so the compiled code sees a literal.
+//!
 //! The batching is the reason a device round-trip is cheap: the configuration
 //! stays in a device buffer and crosses the host boundary once per *batch*, not
 //! once per sample. `batch` trades the per-sample launch and transfer overhead
@@ -29,6 +36,7 @@ use std::collections::VecDeque;
 use wgpu::util::DeviceExt;
 
 use crate::configuration::{Cell, Configuration};
+use crate::lattice::Lattice;
 use crate::state::State;
 
 /// An initialized GPU device and its command queue.
@@ -65,13 +73,26 @@ impl Gpu {
             })
             .await
             .ok()?;
+        // Everything the adapter offers, not `Limits::default()`. The defaults
+        // are the WebGPU baseline a browser guarantees — a 128 MiB storage
+        // binding among them — and asking for them on a desktop adapter caps the
+        // crate an order of magnitude below the hardware. A lattice run walks
+        // into that quickly, because the tables grow with the volume *and* with
+        // the dimension: a link's staple row is `6(D - 1)` entries wide, so a
+        // six-dimensional box of side eight already needs 188 MB for a table any
+        // real card holds without noticing. Requesting the adapter's own limits
+        // always succeeds, since they are by definition what it supports.
+        //
+        // The cost is the portability the defaults buy: a pipeline that fits
+        // here need not fit in a browser. That is a trade worth revisiting if a
+        // `wasm` target ever matters, and free until then.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("plaquette compute device"),
                 required_features: wgpu::Features::PUSH_CONSTANTS,
                 required_limits: wgpu::Limits {
                     max_push_constant_size: PUSH_CONSTANT_BYTES,
-                    ..Default::default()
+                    ..adapter.limits()
                 },
                 ..Default::default()
             })
@@ -82,8 +103,64 @@ impl Gpu {
 }
 
 /// Threads per workgroup, matching the `@workgroup_size(64)` both shaders
-/// declare.
+/// declare and the `WORKGROUP_SIZE` in the shared preamble.
 const WORKGROUP_SIZE: u32 = 64;
+
+/// How wide and how tall to launch, to cover `threads` threads under a cap of
+/// `per_axis` workgroups per dispatch axis.
+///
+/// A dispatch is capped at `max_compute_workgroups_per_dimension` *per axis* —
+/// 65535 on essentially every adapter, and unlike the memory limits it is an
+/// API-level ceiling rather than a conservative default, so requesting the
+/// adapter's limits does not move it. One row of workgroups therefore covers
+/// about 4.2 million threads, which a lattice reaches at side 161 in three
+/// dimensions but side 12 in six, since the volume grows as `L^D`.
+///
+/// Past that the launch becomes a rectangle and the shader folds the two axes
+/// back into one index (`linear_index` in the preamble). Rows are filled
+/// completely, so the mapping stays contiguous and the last row's leftover
+/// threads fall out on the kernel's own bounds check. Two axes raise the ceiling
+/// to roughly `65535^2` workgroups, which no lattice will reach before its
+/// buffers do.
+/// The cap is a parameter rather than read from the device here, so the
+/// arithmetic can be checked without one — and against a small cap, since the
+/// interesting behavior starts past `per_axis * WORKGROUP_SIZE` threads and no
+/// lattice small enough for a test reaches that at the real limit.
+fn grid_for(per_axis: u32, threads: usize) -> (u32, u32) {
+    let total = (threads as u64).div_ceil(u64::from(WORKGROUP_SIZE)).max(1);
+    let width = total.min(u64::from(per_axis));
+    let height = total.div_ceil(width);
+    assert!(
+        height <= u64::from(per_axis),
+        "a dispatch of {threads} threads needs {height} rows of workgroups, \
+         above this device's limit of {per_axis} per axis"
+    );
+    (width as u32, height as u32)
+}
+
+/// Panic unless a buffer of `bytes` can be created and bound on `device`.
+///
+/// The two limits differ — a buffer may be larger than any one binding of it —
+/// and both are checked, since every buffer here is bound whole. `what` names
+/// the table, because a wgpu validation failure names only a byte count and a
+/// binding index, and a caller reading that has no way back to a lattice. What
+/// each table's width is made of belongs to the backend that built it, not
+/// here, so the message says what to change and leaves the layout to the
+/// backend's own documentation.
+fn check_fits(device: &wgpu::Device, bytes: u64, what: &str) {
+    let limits = device.limits();
+    let binding = u64::from(limits.max_storage_buffer_binding_size);
+    let buffer = limits.max_buffer_size;
+    assert!(
+        bytes <= binding && bytes <= buffer,
+        "the {what} needs {:.1} MB, above this device's limit of {:.1} MB \
+         per storage binding and {:.1} MB per buffer; \
+         reduce the lattice extents or the dimension",
+        bytes as f64 / 1e6,
+        binding as f64 / 1e6,
+        buffer as f64 / 1e6,
+    );
+}
 
 /// Roughly how many compute passes one command buffer may encode.
 ///
@@ -128,8 +205,16 @@ pub(crate) struct SweepSetup<'a> {
     /// The read-only lookup table the shader prices a flip against — neighbors
     /// for a site kernel, staples for a link one.
     pub table: &'a [u32],
+    /// Each site's coordinate-sum parity, one `u32` per site, from
+    /// [`Lattice::site_parity`](crate::lattice::Lattice::site_parity). Both
+    /// kernels test a thread's color against this rather than recomputing it,
+    /// which is what keeps them free of any per-axis arithmetic.
+    pub site_color: &'a [u32],
     /// The model's uniform block, already laid out for WGSL.
     pub params: &'a [u8],
+    /// The lattice dimension, supplied to the shader as the `D` override. Every
+    /// other dimension-dependent constant a kernel uses derives from it in WGSL.
+    pub dimension: u32,
     /// Which lattice cell the variables sit on, so a read-back configuration
     /// knows what its indices mean.
     pub cell: Cell,
@@ -174,7 +259,8 @@ pub(crate) struct DeviceSweeper {
     colors: u32,
     sweeps_between: usize,
     batch: usize,
-    workgroups: u32,
+    /// Workgroups to launch, as a `(width, height)` grid — see `dispatch_grid`.
+    dispatch: (u32, u32),
     /// Global sweep counter — the RNG key, so every sweep draws differently.
     sweeps_done: u32,
     /// Host-side buffer of the current batch; `next` drains it, refilling on empty.
@@ -185,18 +271,20 @@ impl DeviceSweeper {
     /// Upload the buffers, compile the shader, build the pipeline, and assemble
     /// a sweeper over the lot.
     ///
-    /// The bind group is the same three slots for every backend — the variables
-    /// read-write, the lookup table read-only, the uniform block — which is what
-    /// lets one builder serve both. A backend that needed a fourth slot would
-    /// have outgrown this, and should say so by not using it rather than by
-    /// widening the layout for everyone.
+    /// The bind group is the same four slots for every backend — the variables
+    /// read-write, the lookup table read-only, the uniform block, the color
+    /// table read-only — which is what lets one builder serve both. A backend
+    /// that needed a fifth would have outgrown this, and should say so by not
+    /// using it rather than by widening the layout for everyone.
     pub(crate) fn build(gpu: Gpu, setup: SweepSetup<'_>) -> Self {
         let SweepSetup {
             label,
             shader,
             vars_init,
             table,
+            site_color,
             params,
+            dimension,
             cell,
             n_vars,
             threads,
@@ -205,6 +293,36 @@ impl DeviceSweeper {
             batch,
         } = setup;
         let device = &gpu.device;
+
+        // Everything the device has to hold, checked before anything is created.
+        // A limit tripped inside `wgpu` surfaces as a validation failure naming a
+        // byte count and a binding index, which a caller cannot turn back into a
+        // lattice; these say which table it was and what to shrink.
+        debug_assert_eq!(
+            vars_init.len(),
+            n_vars,
+            "the initial variables and the declared count must agree"
+        );
+        let word = std::mem::size_of::<u32>() as u64;
+        let sample_bytes = n_vars as u64 * word;
+        check_fits(
+            device,
+            sample_bytes,
+            &format!("{label} variable buffer ({n_vars} variables)"),
+        );
+        check_fits(
+            device,
+            table.len() as u64 * word,
+            &format!("{label} table ({} entries)", table.len()),
+        );
+
+        // The batch is a performance knob rather than a physics one — the samples
+        // are identical however it is set — so a staging buffer that will not fit
+        // is answered by holding fewer samples per round trip rather than by
+        // refusing the run. One slot is the variable buffer's size, already
+        // checked above, so the clamp is all the staging buffer needs.
+        let batch =
+            batch.min((device.limits().max_buffer_size / sample_bytes.max(1)).max(1) as usize);
 
         let vars = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("{label} variables")),
@@ -216,6 +334,11 @@ impl DeviceSweeper {
             contents: bytemuck::cast_slice(table),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let site_color = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("{label} color table")),
+            contents: bytemuck::cast_slice(site_color),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("{label} params")),
             contents: params,
@@ -223,7 +346,7 @@ impl DeviceSweeper {
         });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("{label} staging")),
-            size: (n_vars * batch * std::mem::size_of::<u32>()) as u64,
+            size: sample_bytes * batch as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -238,6 +361,7 @@ impl DeviceSweeper {
                 storage_entry(0, false),
                 storage_entry(1, true),
                 uniform_entry(2),
+                storage_entry(3, true),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -253,9 +377,19 @@ impl DeviceSweeper {
             layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some("sweep"),
-            compilation_options: Default::default(),
+            // The one place the lattice dimension reaches the device. Resolved
+            // here rather than compiled into the source, so a kernel's loop
+            // bounds are still constants by the time the shader is translated.
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("D", f64::from(dimension))],
+                ..Default::default()
+            },
             cache: None,
         });
+        let dispatch = grid_for(
+            device.limits().max_compute_workgroups_per_dimension,
+            threads,
+        );
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(&format!("{label} bind group")),
             layout: &bind_group_layout,
@@ -272,6 +406,10 @@ impl DeviceSweeper {
                     binding: 2,
                     resource: params.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: site_color.as_entire_binding(),
+                },
             ],
         });
 
@@ -281,13 +419,13 @@ impl DeviceSweeper {
             bind_group,
             vars,
             staging,
-            _resources: vec![table, params],
+            _resources: vec![table, site_color, params],
             cell,
             n_vars,
             colors,
             sweeps_between,
             batch,
-            workgroups: (threads as u32).div_ceil(WORKGROUP_SIZE),
+            dispatch,
             sweeps_done: 0,
             buffer: VecDeque::new(),
         }
@@ -339,7 +477,8 @@ impl DeviceSweeper {
             pass.set_bind_group(0, &self.bind_group, &[]);
             let push: [u32; 2] = [sweep_index, color];
             pass.set_push_constants(0, bytemuck::bytes_of(&push));
-            pass.dispatch_workgroups(self.workgroups, 1, 1);
+            let (width, height) = self.dispatch;
+            pass.dispatch_workgroups(width, height, 1);
         }
     }
 
@@ -439,6 +578,17 @@ pub(crate) fn assert_even_extents(shape: &[usize], what: &str) {
     );
 }
 
+/// Each site's checkerboard color, in the form the kernels read.
+///
+/// Both backends upload this and neither derives it: the lattice already holds
+/// the parities, the CPU schedules read the same table, and a kernel recomputing
+/// coordinate arithmetic is what tied the shaders to a fixed dimension before.
+pub(crate) fn site_colors<const D: usize>(lattice: &Lattice<D>) -> Vec<u32> {
+    (0..lattice.n_sites())
+        .map(|site| lattice.site_parity(site) as u32)
+        .collect()
+}
+
 /// Fold a 64-bit seed into the 32-bit key the shaders' RNG takes, so two seeds
 /// differing only in their high bits do not collide on the device.
 pub(crate) fn fold_seed(seed: u64) -> u32 {
@@ -490,6 +640,48 @@ pub(crate) fn require_gpu() -> Option<Gpu> {
         None => {
             eprintln!("no GPU adapter available; skipping GPU test");
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The launch grid covers every thread, never overruns an axis, and only
+    /// becomes two-dimensional once one row cannot hold the work.
+    ///
+    /// Checked against a small cap as well as the usual one, since the
+    /// interesting behavior starts past `per_axis * WORKGROUP_SIZE` threads and
+    /// no lattice small enough for a test reaches that at the real limit.
+    #[test]
+    fn the_dispatch_grid_covers_every_thread() {
+        for per_axis in [4u32, 65535] {
+            let row = u64::from(per_axis) * u64::from(WORKGROUP_SIZE);
+            for threads in [
+                0,
+                1,
+                63,
+                64,
+                65,
+                row as usize - 1,
+                row as usize,
+                row as usize + 1,
+                row as usize * 3 + 7,
+            ] {
+                let (width, height) = grid_for(per_axis, threads);
+                assert!(width <= per_axis && height <= per_axis, "{threads} threads");
+                let covered = u64::from(width) * u64::from(height) * u64::from(WORKGROUP_SIZE);
+                assert!(
+                    covered >= threads as u64,
+                    "{threads} threads: grid {width}x{height} covers only {covered}"
+                );
+                // One row while one row is enough: a rectangle costs nothing but
+                // it should not appear before it has to.
+                if threads as u64 <= row {
+                    assert_eq!(height, 1, "{threads} threads should fit in one row");
+                }
+            }
         }
     }
 }

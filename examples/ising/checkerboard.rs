@@ -27,7 +27,10 @@ use plaquette::{Estimate, IsingSampler, Sample, measure, reduce};
 /// Returns the two estimates the comparison prints. The generic details (which
 /// updater, how long) all come from `run`, so both algorithms share this path.
 fn measure_run(run: &IsingRunConfig) -> (Estimate, Estimate) {
-    let mut sampler = IsingSampler::new(run);
+    // The shape is written into this file rather than read from one, so the
+    // dimension is named right here rather than as a `const D` the way the
+    // `ising` example does it.
+    let mut sampler = IsingSampler::<2>::new(run);
     let lattice = sampler.lattice();
     let model = sampler.model();
     let n_sites = lattice.n_sites() as f64;
@@ -60,7 +63,7 @@ fn main() {
     // from the same seed — the schedules consume randomness differently, so the
     // sample streams are not identical, but the distributions they sample are.
     let base = IsingRunConfig {
-        shape: [16, 16],
+        shape: vec![16, 16],
         j: 1.0,
         h: 0.0,
         beta: 0.44, // beta_c = ln(1 + sqrt(2)) / 2 ~ 0.4407

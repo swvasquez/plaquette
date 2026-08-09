@@ -14,17 +14,26 @@
 //! derives `Serialize` too, so a run can dump the exact config it ran.
 //!
 //! Its scope is a single `(L, beta, h)` point; a later `Scan` component would
-//! wrap this rather than the reverse. The dimension is fixed at `D = 2` because
-//! a file is read at runtime and the loader must commit to a concrete dimension.
-//! Dispatching to a general `Lattice<D>` from a variable-length shape is
-//! deferred.
+//! wrap this rather than the reverse. The dimension is whatever the file's
+//! `shape` is long: the energy scores nearest-neighbor bonds, which exist along
+//! a line as much as on a square, so one dimension is the floor. The `D` that
+//! [`build`](IsingRunConfig::build) needs is a compile-time parameter a driver
+//! names in its own source, and
+//! [`check_dimension`](IsingRunConfig::check_dimension) reports a file that
+//! disagrees.
 
-use crate::config::{ConfigError, Start, UpdaterKind, check_updater, deserialize_shape};
+use crate::config::{
+    ConfigError, Start, UpdaterKind, check_dimension, check_shape, check_updater, shape_array,
+};
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::model::Ising;
 use crate::rng::RandRng;
 use serde::{Deserialize, Serialize};
+
+/// The fewest dimensions an Ising run can be built on, re-exported from the
+/// model that owns it.
+pub const MIN_DIMENSION: usize = Ising::MIN_DIMENSION;
 
 /// A single run's parameters in serializable form: everything needed to produce
 /// a run's configurations, and nothing about what is later measured from them.
@@ -41,12 +50,10 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct IsingRunConfig {
     // --- physics ---
-    /// Per-axis lattice extents `[L_0, L_1]`. Fixed length 2 (see module docs),
-    /// and a file giving any other length is refused rather than truncated: a
-    /// too-long `shape` would otherwise drop its trailing extents in silence and
-    /// run a smaller lattice than the file names.
-    #[serde(deserialize_with = "deserialize_shape")]
-    pub shape: [usize; 2],
+    /// Per-axis lattice extents `[L_0, ..., L_{D-1}]`. Its length *is* the
+    /// dimension of the run, which is why it is a list rather than a fixed-width
+    /// tuple: nothing else in the file says how many directions there are.
+    pub shape: Vec<usize>,
     /// Nearest-neighbor coupling `J`.
     pub j: f64,
     /// Uniform external field `h`; defaults to `0.0` when omitted — the
@@ -116,24 +123,37 @@ impl IsingRunConfig {
         Ok(config)
     }
 
+    /// The dimension this run is on: the number of extents its shape names.
+    pub fn dimension(&self) -> usize {
+        self.shape.len()
+    }
+
+    /// Check that this run's dimension is `D`, the one the calling program was
+    /// built for.
+    ///
+    /// A driver names `D` in its own source and calls this right after loading,
+    /// so a file written for another dimension is a clean message rather than a
+    /// panic partway through a run. See
+    /// [`check_dimension`](crate::config::check_dimension) for why the dimension
+    /// is a compile-time choice.
+    pub fn check_dimension<const D: usize>(&self) -> Result<(), ConfigError> {
+        check_dimension(&self.shape, D)
+    }
+
     /// Check that the values describe a runnable run.
     ///
-    /// Rejects what would otherwise panic or produce nothing: a zero extent, a
-    /// non-positive or non-finite `beta`, a non-finite coupling or field, and a
-    /// run that would record no samples. `thermalize` and `sweeps_between` may
-    /// be zero — no warmup and no decorrelation gap are unusual but legitimate.
+    /// Rejects what would otherwise panic or produce nothing: an empty shape or
+    /// a zero extent, a non-positive or non-finite `beta`, a non-finite coupling
+    /// or field, and a run that would record no samples. `thermalize` and
+    /// `sweeps_between` may be zero — no warmup and no decorrelation gap are
+    /// unusual but legitimate.
     ///
     /// The updater rules are `check_updater`'s, applied against
     /// [`Cell::Site`]: this model's variables live on sites, so it takes the
     /// grade-neutral Metropolis or a site schedule and refuses a link one, and a
     /// schedule that colors in parallel additionally needs even extents.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(axis) = self.shape.iter().position(|&l| l == 0) {
-            return Err(ConfigError::Invalid(format!(
-                "every lattice extent must be positive, but shape{:?} is 0 on axis {axis}",
-                self.shape
-            )));
-        }
+        check_shape(&self.shape, MIN_DIMENSION, "nearest-neighbor bonds")?;
         // `is_finite` first, so the comparison below is NaN-free.
         if !self.beta.is_finite() || self.beta <= 0.0 {
             return Err(ConfigError::Invalid(format!(
@@ -177,17 +197,23 @@ impl IsingRunConfig {
     /// this by hand could seed one generator and initialize the config from
     /// another, leaving a run that looks reproducible and quietly is not.
     ///
+    /// `D` must match [`dimension`](IsingRunConfig::dimension). It is a
+    /// parameter rather than something read off the config because a lattice's
+    /// dimension is part of its type, so a driver names it in its own source and
+    /// calls [`check_dimension`](IsingRunConfig::check_dimension) first to turn
+    /// a mismatch into a message.
+    ///
     /// # Panics
     ///
     /// Panics if the config is invalid. [`load`](IsingRunConfig::load) and
     /// [`parse`](IsingRunConfig::parse) validate, so this can only fire on a
     /// `IsingRunConfig` built by hand (as a future `Scan` would) that skipped
-    /// [`validate`](IsingRunConfig::validate).
-    pub fn build(&self) -> (Lattice<2>, Ising, RandRng, Configuration<2>, f64) {
+    /// [`validate`](IsingRunConfig::validate). Panics too if `D` disagrees with
+    /// the shape's length.
+    pub fn build<const D: usize>(&self) -> (Lattice<D>, Ising, RandRng, Configuration<2>, f64) {
         self.validate()
             .expect("build called on an unvalidated config");
-
-        let lattice = Lattice::new(self.shape);
+        let lattice = Lattice::new(shape_array::<D>(&self.shape));
         let model = Ising::new(self.j, self.h);
         let mut rng = RandRng::seed_from_u64(self.seed);
         // Drawn from `rng` *after* seeding and *before* the chain uses it, so the
@@ -216,7 +242,7 @@ mod tests {
     /// A fully-specified config used as a fixture across the tests.
     fn sample_config() -> IsingRunConfig {
         IsingRunConfig {
-            shape: [8, 8],
+            shape: vec![8, 8],
             j: 1.0,
             h: 0.0,
             beta: 0.44,
@@ -335,7 +361,7 @@ mod tests {
     #[test]
     fn validate_rejects_a_zero_extent() {
         let mut config = sample_config();
-        config.shape = [8, 0];
+        config.shape = vec![8, 0];
         assert!(invalid_message(&config).contains("extent"));
     }
 
@@ -374,7 +400,7 @@ mod tests {
         // has no such requirement.
         let mut config = sample_config();
         config.updater = UpdaterKind::GpuSiteCheckerboard;
-        config.shape = [16, 15];
+        config.shape = vec![16, 15];
         let message = invalid_message(&config);
         assert!(message.contains("even extents"), "{message}");
         assert!(message.contains("axis 1"), "{message}");
@@ -423,12 +449,10 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_of_the_wrong_length_is_refused_rather_than_truncated() {
-        // Too *long* is the dangerous direction, and it does not fail on its own:
-        // serde's array visitor stops after two entries and the TOML deserializer
-        // says nothing about the third, so without `deserialize_shape` a
-        // three-dimensional file would quietly run as a two-dimensional one. Too
-        // short fails either way.
+    fn the_shape_length_is_the_dimension() {
+        // The schema puts no length on `shape`: whatever it names is the run's
+        // dimension. This is the field that used to be fixed at two, so what is
+        // asserted is that three, two, and one all load and report themselves.
         let text = r#"
             shape = [8, 8, 8]
             j = 1.0
@@ -438,15 +462,17 @@ mod tests {
             n_samples = 200
             seed = 7
         "#;
-        assert!(matches!(
-            IsingRunConfig::parse(text),
-            Err(ConfigError::Parse(_))
-        ));
+        for (shape, dimension) in [("[8, 8, 8]", 3), ("[8, 8]", 2), ("[8]", 1)] {
+            let config = IsingRunConfig::parse(&text.replace("[8, 8, 8]", shape)).unwrap();
+            assert_eq!(config.dimension(), dimension);
+        }
 
-        let short = text.replace("[8, 8, 8]", "[8]");
+        // An empty shape has no axes at all, which is a lattice with nothing on
+        // it rather than a zero-dimensional model.
+        let none = text.replace("[8, 8, 8]", "[]");
         assert!(matches!(
-            IsingRunConfig::parse(&short),
-            Err(ConfigError::Parse(_))
+            IsingRunConfig::parse(&none),
+            Err(ConfigError::Invalid(_))
         ));
     }
 
@@ -485,7 +511,7 @@ mod tests {
             start = "cold"
         "#;
         let config = IsingRunConfig::parse(text).unwrap();
-        let (lattice, model, _rng, start, beta) = config.build();
+        let (lattice, model, _rng, start, beta) = config.build::<2>();
 
         assert_eq!(lattice.shape(), [8, 4]);
         assert_eq!(lattice.n_sites(), 32);
@@ -500,7 +526,7 @@ mod tests {
     fn build_honors_a_hot_start() {
         let mut config = sample_config();
         config.start = Start::Hot;
-        let (lattice, _, _, start, _) = config.build();
+        let (lattice, _, _, start, _) = config.build::<2>();
 
         // A hot start on 64 sites is aligned with probability 2^-64, so this
         // distinguishes it from cold without being flaky.
@@ -514,8 +540,8 @@ mod tests {
         let mut config = sample_config();
         config.start = Start::Hot;
 
-        let (_, _, mut rng_a, start_a, _) = config.build();
-        let (_, _, mut rng_b, start_b, _) = config.build();
+        let (_, _, mut rng_a, start_a, _) = config.build::<2>();
+        let (_, _, mut rng_b, start_b, _) = config.build::<2>();
 
         assert_eq!(start_a, start_b);
         for _ in 0..16 {
@@ -530,7 +556,7 @@ mod tests {
         // and the chain would silently share randomness.
         let mut config = sample_config();
         config.start = Start::Hot;
-        let (_, _, mut rng, _, _) = config.build();
+        let (_, _, mut rng, _, _) = config.build::<2>();
 
         let mut fresh = RandRng::seed_from_u64(config.seed);
         assert_ne!(rng.next_f64(), fresh.next_f64());

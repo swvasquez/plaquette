@@ -1,9 +1,17 @@
-//! Run the driver on the 2D Ising model from a config file and report a couple
-//! of averaged observables.
+//! Run the driver on the Ising model from a config file and report a couple of
+//! averaged observables.
 //!
 //! The smallest end-to-end use of the library: load a [`IsingRunConfig`], hand it to
 //! a [`IsingSampler`] (which assembles the pieces and thermalizes), then stream
 //! samples from it, measuring each one and reducing the collected series.
+//!
+//! The dimension is the one run parameter this file names rather than the config
+//! does. `D` below is a compile-time constant, so running a ring or a hypercubic
+//! lattice instead of a square one means editing that one line and rebuilding;
+//! everything else — extents, coupling, temperature, schedule — still comes from
+//! the TOML. The library is generic over `D`, so nothing but the constant
+//! changes. A config whose `shape` names a different number of axes is reported
+//! at load by `check_dimension`.
 //!
 //! It collects the whole `Vec<Sample>` before reducing, because estimating
 //! autocorrelation is a function of the *series* — folding each config into a
@@ -27,6 +35,13 @@ use plaquette::{
     IsingSampler, Sample, binder_cumulant, correlator, measure, reduce, specific_heat,
     susceptibility,
 };
+
+/// The lattice dimension this program is built for.
+///
+/// Edit and rebuild to run a different one — `2` for the square lattice the
+/// shipped config uses, `1` for a ring, `3` or more for a hypercubic box. The
+/// config's `shape` must name this many axes.
+const D: usize = 2;
 
 /// Where the run parameters come from when none is given on the command line.
 const DEFAULT_CONFIG: &str = "examples/ising/run.toml";
@@ -65,9 +80,17 @@ fn main() {
         }
     };
 
+    // The file has to be for the dimension this program was built for. Checked
+    // here so a mismatch is a message rather than a panic inside the sampler.
+    if let Err(e) = run.check_dimension::<D>() {
+        eprintln!("error: {e}");
+        eprintln!("edit `const D` in examples/ising/ising.rs and rebuild to run it");
+        std::process::exit(1);
+    }
+
     // The sampler assembles the pieces and thermalizes, so the stream is at
     // equilibrium from the first config.
-    let mut sampler = IsingSampler::new(&run);
+    let mut sampler = IsingSampler::<D>::new(&run);
 
     // Geometry for measurement comes off the sampler as owned values, read once
     // before streaming so the stream can borrow the sampler by itself.
@@ -113,7 +136,7 @@ fn main() {
         println!("{description}");
     }
     println!(
-        "2D Ising, shape = {:?}, beta = {}, J = {}, h = {}",
+        "Ising in {D}D, shape = {:?}, beta = {}, J = {}, h = {}",
         run.shape, run.beta, run.j, run.h
     );
     println!(

@@ -20,6 +20,10 @@
 //! `debug_assert!` — a field on the wrong cell otherwise panics deep in a loop
 //! or, when the two counts happen to coincide, silently computes a different
 //! theory.
+//!
+//! Both hold in any dimension their cell exists in, and neither carries a
+//! dimension-shaped special case: `Ising` needs one direction, `Z2Gauge` needs
+//! two.
 
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::{Lattice, Loop, Sign};
@@ -74,6 +78,15 @@ pub struct Ising {
 }
 
 impl Ising {
+    /// The fewest dimensions this model is defined in.
+    ///
+    /// The energy scores nearest-neighbor bonds, and a line has them — a ring of
+    /// spins is a perfectly good, and exactly solvable, Ising model. The peer of
+    /// [`Z2Gauge::MIN_DIMENSION`], which is two for a reason that bites much
+    /// harder; this one exists so both models answer the same question in the
+    /// same place.
+    pub const MIN_DIMENSION: usize = 1;
+
     /// An Ising action with coupling `j` and external field `h`.
     pub fn new(j: f64, h: f64) -> Self {
         Ising { j, h }
@@ -225,6 +238,27 @@ pub struct Z2Gauge {
 }
 
 impl Z2Gauge {
+    /// The fewest dimensions this model is defined in.
+    ///
+    /// The energy scores plaquettes, and a plaquette is spanned by a *pair* of
+    /// distinct directions, so one dimension has none. That is not a small
+    /// lattice but no theory at all: `C(D, 2)` is zero, every configuration
+    /// scores zero, every proposed flip is accepted, and a chain returns noise
+    /// wearing the shape of a gauge field. Nothing downstream notices, which is
+    /// why the floor is stated rather than left to the arithmetic.
+    ///
+    /// It lives here because it follows from what this action scores. The config
+    /// schema re-exports it as
+    /// [`MIN_DIMENSION`](crate::gauge_config::MIN_DIMENSION) and
+    /// `GpuGaugeChain::new` reads it too, so the rule has one home and one
+    /// wording rather than a literal `2` in each.
+    pub const MIN_DIMENSION: usize = 2;
+
+    /// What every guard on [`MIN_DIMENSION`](Z2Gauge::MIN_DIMENSION) says, so
+    /// the five places that check it cannot drift into five wordings.
+    pub(crate) const TOO_FEW_DIMENSIONS: &'static str =
+        "the Z2 gauge action scores plaquettes, which need at least two dimensions";
+
     /// A Z2 gauge action with plaquette coupling `j`.
     pub fn new(j: f64) -> Self {
         Z2Gauge { j }
@@ -242,7 +276,7 @@ impl Z2Gauge {
         lattice: &Lattice<D>,
         config: &Configuration<2>,
     ) -> f64 {
-        debug_assert!(D >= 2, "a plaquette needs two directions to span");
+        assert!(D >= Self::MIN_DIMENSION, "{}", Self::TOO_FEW_DIMENSIONS);
         debug_assert!(
             config.cell() == Cell::Link,
             "gauge variables live on links, not {:?}",
@@ -369,7 +403,7 @@ impl Z2Gauge {
         config: &Configuration<2>,
         max_side: usize,
     ) -> Vec<Vec<f64>> {
-        debug_assert!(D >= 2, "a rectangle needs two directions to span");
+        assert!(D >= Self::MIN_DIMENSION, "{}", Self::TOO_FEW_DIMENSIONS);
         debug_assert!(
             config.cell() == Cell::Link,
             "gauge variables live on links, not {:?}",
@@ -414,7 +448,7 @@ impl Z2Gauge {
 
 impl<const D: usize> Action<2, D> for Z2Gauge {
     fn energy(&self, lattice: &Lattice<D>, config: &Configuration<2>) -> f64 {
-        debug_assert!(D >= 2, "a plaquette needs two directions to span");
+        assert!(D >= Self::MIN_DIMENSION, "{}", Self::TOO_FEW_DIMENSIONS);
         debug_assert!(
             config.cell() == Cell::Link,
             "gauge variables live on links, not {:?}",
@@ -431,7 +465,7 @@ impl<const D: usize> Action<2, D> for Z2Gauge {
         var: usize,
         proposed: State<2>,
     ) -> f64 {
-        debug_assert!(D >= 2, "a plaquette needs two directions to span");
+        assert!(D >= Self::MIN_DIMENSION, "{}", Self::TOO_FEW_DIMENSIONS);
         debug_assert!(
             config.cell() == Cell::Link,
             "gauge variables live on links, not {:?}",
@@ -651,6 +685,224 @@ mod tests {
             after.poke(site, proposed);
             assert_eq!(delta, action.energy(&lat, &after) - before);
         }
+    }
+
+    /// How many variables `deltas_match_from_scratch` probes on a large lattice.
+    ///
+    /// Every variable is checked when a lattice is small enough, because that is
+    /// the strongest form of the test. Each probe costs a whole-lattice energy
+    /// scan, so checking all of them is quadratic in the variable count and a
+    /// ten-dimensional box runs into billions of operations under a debug build.
+    /// Past the cap the probes are spread evenly across the index range instead,
+    /// which still reaches every direction and both parities.
+    const MAX_PROBES: usize = 64;
+
+    /// Flip variables of `config` in turn and check the incremental energy
+    /// against the difference of two from-scratch energies.
+    ///
+    /// This is the sharpest check that a model carries no assumption about the
+    /// dimension: `energy` walks cells by index while `energy_delta` walks the
+    /// incidence tables, so the two agree only if the packing, the strides, and
+    /// the neighbor and staple rows all say the same thing about the geometry.
+    /// A `D`-specific mistake anywhere in that chain shows up as a mismatch on
+    /// some variable rather than as a plausible wrong number.
+    fn deltas_match_from_scratch<const D: usize, A: Action<2, D>>(
+        shape: [usize; D],
+        action: &A,
+        cell: Cell,
+    ) {
+        let lat = Lattice::new(shape);
+        let mut config = Configuration::<2>::cold(&lat, cell);
+        // A non-uniform configuration, so the neighbor and staple sums vary
+        // rather than all collapsing onto the ground state's.
+        for var in (0..config.n_vars()).step_by(3) {
+            config.poke(var, State::new(1).unwrap());
+        }
+
+        // `config` is never mutated below — each probe clones it — so the
+        // reference energy is computed once rather than per probe.
+        let before = action.energy(&lat, &config);
+        let n_vars = config.n_vars();
+        let step = n_vars.div_ceil(MAX_PROBES).max(1);
+        for var in (0..n_vars).step_by(step) {
+            let proposed = State::new(1 - config.peek(var).index()).unwrap();
+            let delta = action.energy_delta(&lat, &config, var, proposed);
+
+            let mut after = config.clone();
+            after.poke(var, proposed);
+            // The couplings below are exactly representable and the sums are
+            // integer, so the two sides agree bit-for-bit.
+            assert_eq!(
+                delta,
+                action.energy(&lat, &after) - before,
+                "{shape:?}: variable {var}"
+            );
+        }
+    }
+
+    /// The dimensions both models are checked at, up to ten.
+    ///
+    /// Ten is a ceiling on what anyone would plausibly run rather than anything
+    /// the code knows about — nothing in the library states an upper bound, and
+    /// `Lattice<12>` would compile. The point of going this far is that every
+    /// count the incidence tables are built from grows with `D`, some of them
+    /// quadratically: at ten dimensions a site has twenty neighbors, a link sits
+    /// in eighteen plaquettes, and each site anchors forty-five of them.
+    ///
+    /// The unequal extents matter as much as the dimensions. A cubic shape hides
+    /// a transposed stride, since every axis then has the same place value.
+    #[test]
+    fn ising_deltas_match_from_scratch_in_every_dimension() {
+        let action = Ising::new(1.0, 0.5);
+        deltas_match_from_scratch([6], &action, Cell::Site);
+        deltas_match_from_scratch([4, 4], &action, Cell::Site);
+        deltas_match_from_scratch([3, 4, 5], &action, Cell::Site);
+        deltas_match_from_scratch([2, 3, 2, 3], &action, Cell::Site);
+        deltas_match_from_scratch([2, 2, 3, 2, 2], &action, Cell::Site);
+        deltas_match_from_scratch([2, 3, 2, 2, 3, 2], &action, Cell::Site);
+        deltas_match_from_scratch([2, 2, 2, 3, 2, 2, 2, 2], &action, Cell::Site);
+        deltas_match_from_scratch([2, 2, 2, 2, 3, 2, 2, 2, 2, 2], &action, Cell::Site);
+    }
+
+    /// The gauge counterpart, from two dimensions up, where a plaquette exists at
+    /// all. See [`ising_deltas_match_from_scratch_in_every_dimension`] for why
+    /// the shapes are shaped this way.
+    #[test]
+    fn gauge_deltas_match_from_scratch_in_every_dimension() {
+        let action = Z2Gauge::new(1.0);
+        deltas_match_from_scratch([4, 4], &action, Cell::Link);
+        deltas_match_from_scratch([3, 4, 5], &action, Cell::Link);
+        deltas_match_from_scratch([2, 3, 2, 3], &action, Cell::Link);
+        deltas_match_from_scratch([2, 2, 3, 2, 2], &action, Cell::Link);
+        deltas_match_from_scratch([2, 3, 2, 2, 3, 2], &action, Cell::Link);
+        deltas_match_from_scratch([2, 2, 2, 3, 2, 2, 2, 2], &action, Cell::Link);
+        deltas_match_from_scratch([2, 2, 2, 2, 3, 2, 2, 2, 2, 2], &action, Cell::Link);
+    }
+
+    /// The value-semantic half of the models, swept over dimensions.
+    ///
+    /// [`deltas_match_from_scratch`] covers the *incremental* seam; these cover
+    /// what the observables read. Each is checked on a configuration whose answer
+    /// is fixed by construction rather than by a reference run, so the assertions
+    /// are exact at any dimension: a cold field has every bond, plaquette, loop,
+    /// and correlator entry equal to one, and a gauge transformation is a
+    /// symmetry of the energy whatever the lattice looks like.
+    fn observables_hold_on_known_configurations<const D: usize>(shape: [usize; D]) {
+        let lat = Lattice::new(shape);
+        let n_sites = lat.n_sites() as f64;
+
+        // Ising: cold is the ground state, `E = -j * n_links - h * n_sites`,
+        // since every one of the `D * n_sites` forward bonds is aligned.
+        let ising = Ising::new(1.5, 0.25);
+        let cold = Configuration::<2>::cold(&lat, Cell::Site);
+        assert_eq!(
+            ising.energy(&lat, &cold),
+            -1.5 * lat.n_links() as f64 - 0.25 * n_sites,
+            "{shape:?}"
+        );
+        assert_eq!(ising.magnetization(&cold), n_sites, "{shape:?}");
+
+        // The correlator is one row per axis, each `L_mu / 2 + 1` long, and all
+        // ones on a cold field including the `C_0` anchor.
+        let correlator = ising.correlator(&lat, &cold);
+        assert_eq!(correlator.len(), D, "{shape:?}: one row per axis");
+        for (mu, row) in correlator.iter().enumerate() {
+            assert_eq!(row.len(), shape[mu] / 2 + 1, "{shape:?}: axis {mu}");
+            assert!(row.iter().all(|&c| c == 1.0), "{shape:?}: axis {mu}");
+        }
+
+        if D < 2 {
+            return; // no plaquette below two dimensions, so nothing gauge-like
+        }
+
+        // Gauge: cold is the ground state, `E = -j * n_plaquettes`.
+        let gauge = Z2Gauge::new(1.5);
+        let cold = Configuration::<2>::cold(&lat, Cell::Link);
+        assert_eq!(
+            gauge.plaquette_sum(&lat, &cold),
+            lat.n_plaquettes() as f64,
+            "{shape:?}"
+        );
+        assert_eq!(
+            gauge.energy(&lat, &cold),
+            -1.5 * lat.n_plaquettes() as f64,
+            "{shape:?}"
+        );
+
+        // Every Wilson rectangle and every Polyakov line on a cold field is one.
+        let max_side = shape.iter().min().copied().unwrap_or(0) / 2;
+        let table = gauge.wilson_rectangles(&lat, &cold, max_side);
+        assert_eq!(table.len(), max_side + 1, "{shape:?}");
+        for (r, row) in table.iter().enumerate() {
+            for (t, &w) in row.iter().enumerate() {
+                assert_eq!(w, 1.0, "{shape:?}: W({r},{t})");
+                assert_eq!(w, table[t][r], "{shape:?}: table is symmetric");
+            }
+        }
+        for dir in 0..D {
+            assert_eq!(
+                gauge.polyakov_loop(&lat, &cold, dir),
+                1.0,
+                "{shape:?}: {dir}"
+            );
+        }
+
+        // A gauge transformation is a symmetry: flipping every link touching a
+        // site leaves the energy, the Wilson table, and every Polyakov line
+        // alone, because each closed loop crosses the site's links an even
+        // number of times. This is the sharpest check that `plaquette_links`,
+        // `loop_links`, and `site_links` all agree about the geometry, and the
+        // number of links a flip touches is `2 * D`, so it says more the higher
+        // the dimension goes.
+        let mut transformed = cold.clone();
+        for site in (0..lat.n_sites()).step_by(3) {
+            for link in lat.site_links(site) {
+                let flipped = State::new(1 - transformed.peek(link).index()).unwrap();
+                transformed.poke(link, flipped);
+            }
+        }
+        // Without this the rest is vacuous: flipping a site's links twice would
+        // put the configuration back and every assertion below would hold
+        // trivially.
+        assert_ne!(
+            transformed, cold,
+            "{shape:?}: the transformation left the configuration alone"
+        );
+        assert_eq!(
+            gauge.energy(&lat, &transformed),
+            gauge.energy(&lat, &cold),
+            "{shape:?}: gauge transformation changed the energy"
+        );
+        assert_eq!(
+            gauge.wilson_rectangles(&lat, &transformed, max_side),
+            table,
+            "{shape:?}: gauge transformation changed the Wilson table"
+        );
+        for dir in 0..D {
+            assert_eq!(
+                gauge.polyakov_loop(&lat, &transformed, dir),
+                1.0,
+                "{shape:?}: gauge transformation changed the Polyakov loop along {dir}"
+            );
+        }
+    }
+
+    /// The observables hold on known configurations at every dimension up to six.
+    ///
+    /// Six rather than the ten [`deltas_match_from_scratch`] reaches, because
+    /// `wilson_rectangles` needs room for a rectangle — it caps its sides at half
+    /// the shortest extent — so every extent here is at least four, and `4^10`
+    /// sites is far past what belongs in a unit test. The narrower sweep is the
+    /// one that costs volume; the exact energy check pays only for extents of two
+    /// and so goes further.
+    #[test]
+    fn observables_hold_in_every_dimension() {
+        observables_hold_on_known_configurations([6]);
+        observables_hold_on_known_configurations([4, 6]);
+        observables_hold_on_known_configurations([4, 6, 4]);
+        observables_hold_on_known_configurations([4, 6, 4, 4]);
+        observables_hold_on_known_configurations([4, 4, 6, 4, 4]);
+        observables_hold_on_known_configurations([4, 4, 4, 4, 4, 4]);
     }
 
     #[test]
@@ -1103,7 +1355,24 @@ mod tests {
         assert_eq!(action.energy_delta(&lat, &config, 7, same), 0.0);
     }
 
+    /// The dimension floor holds in release, unlike the cell-kind guards above.
+    ///
+    /// Deliberately not gated on `debug_assertions`: `D` is a compile-time
+    /// constant, so a real `assert!` folds away to nothing and there is no
+    /// reason to make this one debug-only. Below two dimensions a lattice has no
+    /// plaquettes, so the energy is zero for every configuration and a chain
+    /// accepts every flip — noise that looks like a sampled theory. A guard that
+    /// disappeared in release would hide that exactly where it matters.
     #[test]
+    #[should_panic(expected = "which need at least two dimensions")]
+    fn the_gauge_action_refuses_one_dimension_in_any_profile() {
+        let lat = Lattice::new([8]);
+        let config = Configuration::<2>::cold(&lat, Cell::Link);
+        Z2Gauge::new(1.0).energy(&lat, &config);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "gauge variables live on links")]
     fn the_gauge_action_rejects_a_site_field() {
         // Without the guard this surfaces further in as an out-of-range read,
@@ -1148,7 +1417,10 @@ mod tests {
         assert_eq!(AnyAction::Z2Gauge(Z2Gauge::new(1.0)).cell(), Cell::Link);
     }
 
+    // Debug-only, like its gauge twin below: the guard it asserts on is a
+    // `debug_assert!`, which release builds compile out.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "Ising spins live on sites")]
     fn the_ising_action_rejects_a_link_field() {
         let lat = Lattice::new([4, 4]);

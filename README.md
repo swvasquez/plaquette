@@ -19,10 +19,13 @@ cargo build
 
 | Model    | Dimension | Implementation     | Device   |
 | -------- | --------- | ------------------ | -------- |
-| Ising    | 2D        | Metropolis         | CPU      |
-| Ising    | 2D        | Site checkerboard  | CPU, GPU |
-| Z2 gauge | 3D        | Metropolis         | CPU      |
-| Z2 gauge | 3D        | Link checkerboard  | CPU, GPU |
+| Ising    | D ≥ 1     | Metropolis         | CPU      |
+| Ising    | D ≥ 1     | Site checkerboard  | CPU, GPU |
+| Z2 gauge | D ≥ 2     | Metropolis         | CPU      |
+| Z2 gauge | D ≥ 2     | Link checkerboard  | CPU, GPU |
+
+Note that memory use grows quickly with the dimension: the lattice stores about
+`48 * D * (D - 1)` bytes of precomputed geometry per site. In 16 GB that allows a lattice of size 360³ sites in three dimensions, but only 5¹⁰ sites in ten.
 
 Refer to [`docs/`](docs/) for descriptions of used algorithms.
 
@@ -30,13 +33,13 @@ Refer to [`docs/`](docs/) for descriptions of used algorithms.
 
 Model runs are configured via TOML. Runnable example code lives in [`examples/`](examples/).
 
-To run the 2D Ising model, call
+To run the Ising model, call
 
 ```bash
 cargo run --example ising -- examples/ising/run.toml
 ```
 
-Similarly, run the 3D Z2 gauge model via
+Similarly, run the Z2 gauge model via
 
 ```bash
 cargo run --example gauge -- examples/gauge/gauge.toml
