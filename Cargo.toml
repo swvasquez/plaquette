@@ -18,6 +18,11 @@ categories = ["science", "simulation"]
 missing_docs = "deny"
 unsafe_code = "deny"
 
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+redundant_explicit_links = "deny"
+
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 pollster = "1.0.1"

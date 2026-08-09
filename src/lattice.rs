@@ -97,8 +97,10 @@ impl<const D: usize> Lattice<D> {
     /// # Panics
     ///
     /// Panics if `D == 0`, if any extent is zero, or if the shape names more
-    /// sites or table entries than a `usize` can address — see
-    /// [`table_len`](Lattice::table_len).
+    /// sites or table entries than a `usize` can address. That last one is
+    /// otherwise silent: a wrapped length is *small*, so the allocation
+    /// succeeds and the lattice comes out empty with every other invariant
+    /// intact.
     pub fn new(shape: [usize; D]) -> Self {
         assert!(D > 0, "lattice dimension must be positive");
         assert!(

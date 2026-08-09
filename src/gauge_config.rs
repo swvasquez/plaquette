@@ -145,7 +145,7 @@ impl GaugeRunConfig {
     /// A driver names `D` in its own source and calls this right after loading,
     /// so a file written for another dimension is a clean message rather than a
     /// panic partway through a run. See
-    /// [`check_dimension`](crate::config::check_dimension) for why the dimension
+    /// [`check_dimension`] for why the dimension
     /// is a compile-time choice.
     pub fn check_dimension<const D: usize>(&self) -> Result<(), ConfigError> {
         check_dimension(&self.shape, D)

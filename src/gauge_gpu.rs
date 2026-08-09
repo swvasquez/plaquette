@@ -5,7 +5,7 @@
 //!
 //! The gauge sibling of [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain), and
 //! a separate type for the same reason
-//! [`LinkCheckerboard`](crate::updater::LinkCheckerboard) is separate from
+//! [`LinkCheckerboard`] is separate from
 //! [`SiteCheckerboard`](crate::updater::SiteCheckerboard): that one runs over a
 //! site field and this over a link field, so they share no line of the schedule.
 //! What they *do* share — encoding color passes, batching samples, and reading
