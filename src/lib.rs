@@ -3,27 +3,37 @@
 //! A run is assembled from a few interchangeable pieces: a [`Lattice`] fixes the
 //! geometry, an [`Action`] gives the energy of a [`Configuration`] on it, and an
 //! [`Updater`] proposes and accepts changes. A [`Chain`] drives those pieces to
-//! produce a stream of configurations, and [`measure`] turns each one into a
-//! [`Sample`] of observables that [`reduce`] aggregates into estimates with
-//! error bars.
+//! produce a stream of configurations, and a per-model measure function turns
+//! each one into a record of observables that [`reduce`] aggregates into
+//! estimates with error bars.
+//!
+//! Those seams — and the geometry, statistics, and device plumbing they rest on
+//! — live in the root modules and are re-exported here. The models live under
+//! [`models`], one submodule each, and are reached by their own paths:
+//! [`models::ising`], [`models::potts`], and [`models::gauge`] each hold the
+//! action, its observables, a run-config schema, and the samplers that drive
+//! it. Nothing at the root depends on anything under [`models`]; the models
+//! depend only on the root.
 //!
 //! Three models run today, each by Metropolis or by a checkerboard sweep, and
 //! each checkerboard on either the CPU or the GPU. The two colorings differ
 //! because the variables do: the Ising and Potts models color a *site* by the
 //! parity of its coordinate sum, while the Z2 gauge model colors a *link* by its
 //! direction as well as its base site's parity, so that no two links updated
-//! together share a plaquette. Each has a sampler — [`IsingSampler`],
-//! [`GaugeSampler`], [`PottsSampler`] — that builds a thermalized chain from a
-//! run configuration parsed from TOML, which is how the examples under
-//! `examples/` are driven.
+//! together share a plaquette. Each has a sampler —
+//! [`IsingSampler`](models::ising::IsingSampler),
+//! [`GaugeSampler`](models::gauge::GaugeSampler),
+//! [`PottsSampler`](models::potts::PottsSampler) — that builds a thermalized
+//! chain from a run configuration parsed from TOML, which is how the examples
+//! under `examples/` are driven.
 //!
 //! Every layer is generic over the lattice dimension `D`, which each model needs
 //! enough of to have the cell its energy scores: Ising and Potts sum over
 //! nearest-neighbor bonds and need one, the gauge action sums over plaquettes
 //! and needs two. The state count `Q` is generic the same way, and
-//! [`Potts`](model::Potts) is the model that exercises it — its labels stand for
-//! nothing, so the energy compares them instead of decoding them into values,
-//! while the other two are pinned at the two states `±1` names.
+//! [`Potts`](models::potts::Potts) is the model that exercises it — its labels
+//! stand for nothing, so the energy compares them instead of decoding them into
+//! values, while the other two are pinned at the two states `±1` names.
 //!
 //! Both are compile-time parameters throughout, so a driver names the pair it is
 //! built for rather than reading either from a file. A config file's `shape`
@@ -38,46 +48,26 @@
 // Lints are configured in Cargo.toml's `[lints]` table, which covers the tests
 // and examples too rather than the library target alone.
 
+pub mod action;
 pub mod chain;
 pub mod config;
 pub mod configuration;
 pub mod device;
-pub mod gauge_config;
-pub mod gauge_gpu;
-pub mod gauge_sampler;
-pub mod ising_config;
-pub mod ising_gpu;
-pub mod ising_sampler;
 pub mod lattice;
-pub mod model;
+pub mod models;
 pub mod observables;
-pub mod potts_config;
-pub mod potts_gpu;
-pub mod potts_sampler;
 pub mod rng;
 pub mod state;
 pub mod statistics;
 pub mod updater;
 
+pub use action::Action;
 pub use chain::Chain;
 pub use config::{ConfigError, Start, UpdaterKind};
 pub use configuration::{Cell, Configuration};
 pub use device::Gpu;
-pub use gauge_config::GaugeRunConfig;
-pub use gauge_gpu::GpuGaugeChain;
-pub use gauge_sampler::{AnyGaugeChain, GaugeSampler};
-pub use ising_config::IsingRunConfig;
-pub use ising_gpu::GpuIsingChain;
-pub use ising_sampler::{AnyIsingChain, IsingSampler};
 pub use lattice::{Lattice, Loop, Sign};
-pub use model::{Action, AnyAction};
-pub use observables::{
-    Correlator, GaugeSample, PottsSample, Sample, WilsonRectangles, correlator, gauge_measure,
-    measure, polyakov_loop, potts_correlator, potts_measure, wilson_rectangles,
-};
-pub use potts_config::PottsRunConfig;
-pub use potts_gpu::GpuPottsChain;
-pub use potts_sampler::{AnyPottsChain, PottsSampler};
+pub use observables::Correlator;
 pub use rng::{RandRng, Rng};
 pub use state::State;
 pub use statistics::{

@@ -12,7 +12,7 @@
 //! the `Params` layout, the neighbor table, and the two-color site
 //! checkerboard the shader implements.
 //!
-//! The coloring is compiled into the shader (`ising_checkerboard.wgsl`), so this
+//! The coloring is compiled into the shader (the Ising `checkerboard.wgsl`), so this
 //! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
 //! counter-based, keyed on `(seed, site, sweep)`, so the result is independent of
 //! GPU thread order — the property that lets the CPU site checkerboard serve as a
@@ -31,7 +31,7 @@ use crate::lattice::Lattice;
 const N_COLORS: u32 = 2;
 
 /// The compiled kernel: the shared preamble followed by the site checkerboard.
-const SHADER: &str = crate::device::shader_source!("ising_checkerboard.wgsl");
+const SHADER: &str = crate::device::shader_source!("checkerboard.wgsl");
 
 /// The static run parameters uploaded to the shader's uniform buffer.
 ///
@@ -175,8 +175,8 @@ impl Iterator for GpuIsingChain {
 mod tests {
     use super::*;
     use crate::device::require_gpu;
-    use crate::model::Ising;
-    use crate::observables::measure;
+    use crate::models::ising::Ising;
+    use crate::models::ising::measure;
     use crate::rng::RandRng;
 
     /// A device can be acquired on this machine.
@@ -307,7 +307,7 @@ mod tests {
     }
 
     /// Mean energy density and mean |m| over a set of samples.
-    fn mean_densities(samples: &[crate::observables::Sample], n_sites: f64) -> (f64, f64) {
+    fn mean_densities(samples: &[crate::models::ising::Sample], n_sites: f64) -> (f64, f64) {
         let count = samples.len() as f64;
         let e = samples.iter().map(|s| s.energy / n_sites).sum::<f64>() / count;
         let m = samples

@@ -337,12 +337,12 @@ pub fn susceptibility(magnetizations: &[f64], beta: f64, n_sites: f64) -> Derive
 ///
 /// The `3` is a convention rather than a universal constant, and what it is
 /// calibrated to matters once the series comes from somewhere other than
-/// [`Ising`](crate::model::Ising). A *signed* order parameter symmetric about
+/// [`Ising`](crate::models::ising::Ising). A *signed* order parameter symmetric about
 /// zero and near-Gaussian in the disordered phase satisfies `⟨m⁴⟩ = 3⟨m²⟩²`,
 /// which is what puts `U_4` at exactly `0` there, while sharp ordering gives
 /// `⟨m⁴⟩ = ⟨m²⟩²` and so `2/3` at the other end. A
-/// [`Potts`](crate::model::Potts) series arrives through
-/// [`order_parameter`](crate::model::Potts::order_parameter), which is
+/// [`Potts`](crate::models::potts::Potts) series arrives through
+/// [`order_parameter`](crate::models::potts::Potts::order_parameter), which is
 /// non-negative by construction and does not average to zero on a finite
 /// lattice: its ordered limit is still `2/3`, but its disordered value is a
 /// size-dependent number rather than the Ising anchor. That does not stop the

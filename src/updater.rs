@@ -50,9 +50,9 @@
 //! [`sweep`](Updater::sweep) still returns the net realized ΔE so a driver can
 //! accumulate it if profiling ever justifies it.
 
+use crate::action::Action;
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
-use crate::model::Action;
 use crate::rng::Rng;
 use crate::state::State;
 
@@ -297,7 +297,7 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for LinkCheckerboard {
 /// The types are fixed at compile time, but which one a run uses is a value read
 /// from a file — so the two have to meet at a single type. `AnyUpdater` is that
 /// type: it implements [`Updater`] by forwarding `sweep` to whichever updater it
-/// wraps, which is what lets [`IsingSampler`](crate::ising_sampler::IsingSampler) hold one field
+/// wraps, which is what lets [`IsingSampler`](crate::models::ising::sampler::IsingSampler) hold one field
 /// and [`Chain`](crate::chain::Chain) stay generic while the algorithm is chosen
 /// at runtime. Its variants mirror
 /// [`UpdaterKind`](crate::config::UpdaterKind) — a closed set, which is what
@@ -360,7 +360,9 @@ fn propose<const Q: usize>(current: State<Q>, rng: &mut impl Rng) -> State<Q> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Ising, Potts, Z2Gauge};
+    use crate::models::gauge::Z2Gauge;
+    use crate::models::ising::Ising;
+    use crate::models::potts::Potts;
     use crate::rng::RandRng;
 
     /// A scripted [`Rng`] handing back preset answers, so a test can pin whether

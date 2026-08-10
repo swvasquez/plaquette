@@ -29,7 +29,7 @@
 //! what anyone would plausibly run rather than as anything the library states.
 //! The exact `energy` against `energy_delta` check in `model.rs` goes to ten.
 
-use plaquette::{IsingRunConfig, IsingSampler, correlator, measure};
+use plaquette::models::ising::{IsingRunConfig, IsingSampler, correlator, measure};
 
 /// The number of samples each ordering test measures after warmup. A few hundred
 /// is plenty for the mean of `|m|` to settle deep in the ordered phase, and keeps

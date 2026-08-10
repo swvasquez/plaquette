@@ -8,9 +8,9 @@
 //! and hand out [`Configuration`]s until the batch drains.
 //!
 //! All three model backends —
-//! [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain),
-//! [`GpuGaugeChain`](crate::gauge_gpu::GpuGaugeChain), and
-//! [`GpuPottsChain`](crate::potts_gpu::GpuPottsChain) — are a constructor plus a
+//! [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain),
+//! [`GpuGaugeChain`](crate::models::gauge::gpu::GpuGaugeChain), and
+//! [`GpuPottsChain`](crate::models::potts::gpu::GpuPottsChain) — are a constructor plus a
 //! `DeviceSweeper`. They differ in what a color *is* (site parity, or direction
 //! and base-site parity), how many there are, which shader prices a move, how
 //! many states a variable has, and which lattice grade the variables sit on;
@@ -176,10 +176,15 @@ const MAX_PASSES_PER_SUBMIT: usize = 512;
 /// The preamble every checkerboard shader is compiled with: the state encoding
 /// and the counter-based random source, which must be byte-identical across
 /// backends. WGSL has no include directive, so the concatenation happens here.
+///
+/// Both `include_str!` paths resolve relative to the file that *invokes* the
+/// macro — each model's `gpu.rs` under `src/models/<name>/` — which is why the
+/// prelude climbs two directories back to the crate root and why each backend
+/// names its own `checkerboard.wgsl` bare.
 macro_rules! shader_source {
     ($model:literal) => {
         concat!(
-            include_str!("checkerboard_prelude.wgsl"),
+            include_str!("../../checkerboard_prelude.wgsl"),
             include_str!($model)
         )
     };

@@ -2,7 +2,7 @@
 //! from it.
 //!
 //! [`PottsSampler`] is to [`PottsRunConfig`] what
-//! [`IsingSampler`](crate::ising_sampler::IsingSampler) is to the Ising schema,
+//! [`IsingSampler`](crate::models::ising::sampler::IsingSampler) is to the Ising schema,
 //! and it owns the same thing: the **phasing**. It assembles the pieces a run
 //! needs, thermalizes once in its constructor, and then streams from its
 //! warmed-up state. A bare [`Chain`] yields pre-equilibrium configurations; this
@@ -34,9 +34,9 @@
 //! [`check_dimension`](PottsRunConfig::check_dimension) reports on. `Q` is the
 //! same story without the check: nothing in the file names a state count, so the
 //! driver's choice is the whole of it. See
-//! [`potts_config`](crate::potts_config) for why neither can come from the file,
-//! and [`POTTS_Q`](crate::potts_config::POTTS_Q) and
-//! [`POTTS_D`](crate::potts_config::POTTS_D) for the pair the shipped example
+//! [`potts_config`](crate::models::potts::run_config) for why neither can come from the file,
+//! and [`POTTS_Q`](crate::models::potts::run_config::POTTS_Q) and
+//! [`POTTS_D`](crate::models::potts::run_config::POTTS_D) for the pair the shipped example
 //! uses.
 //!
 //! It is a third near-duplicate of a sampler, which is the point at which that
@@ -49,9 +49,9 @@ use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
 use crate::device::{GPU_BATCH, Gpu};
 use crate::lattice::Lattice;
-use crate::model::Potts;
-use crate::potts_config::PottsRunConfig;
-use crate::potts_gpu::GpuPottsChain;
+use crate::models::potts::Potts;
+use crate::models::potts::gpu::GpuPottsChain;
+use crate::models::potts::run_config::PottsRunConfig;
 use crate::rng::RandRng;
 use crate::updater::{AnyUpdater, Metropolis, SiteCheckerboard};
 
@@ -136,7 +136,7 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
     /// Panics if the config is invalid (via `build`), which includes asking for
     /// an updater that schedules links rather than sites or naming a dimension
     /// other than `D`; if `Q` is below
-    /// [`MIN_STATES`](crate::potts_config::MIN_STATES); or if it selects the GPU
+    /// [`MIN_STATES`](crate::models::potts::run_config::MIN_STATES); or if it selects the GPU
     /// backend on a machine with no GPU adapter.
     pub fn new(config: &PottsRunConfig) -> Self {
         let (lattice, model, mut rng, mut state, beta) = config.build::<Q, D>();
@@ -199,8 +199,8 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
     /// nothing, and calling this again continues the same chain.
     ///
     /// ```
-    /// # use plaquette::potts_config::PottsRunConfig;
-    /// # use plaquette::{potts_measure, PottsSampler};
+    /// # use plaquette::models::potts::run_config::PottsRunConfig;
+    /// # use plaquette::models::potts::{PottsSampler, potts_measure};
     /// # let run = PottsRunConfig::parse("shape=[8,8]\nj=1.0\nbeta=1.5\nthermalize=10\nsweeps_between=1\nn_samples=5\nseed=1").unwrap();
     /// let mut sampler = PottsSampler::<3, 2>::new(&run);
     /// let (lattice, model) = (sampler.lattice(), sampler.model());
@@ -242,8 +242,8 @@ mod tests {
     use super::*;
     use crate::config::Start;
     use crate::configuration::Cell;
-    use crate::observables::potts_measure;
-    use crate::potts_config::{POTTS_D, POTTS_Q};
+    use crate::models::potts::potts_measure;
+    use crate::models::potts::run_config::{POTTS_D, POTTS_Q};
 
     fn config() -> PottsRunConfig {
         PottsRunConfig {

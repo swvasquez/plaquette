@@ -2,8 +2,8 @@
 //! run's parameters.
 //!
 //! [`PottsRunConfig`] is to [`Potts`] what
-//! [`IsingRunConfig`](crate::ising_config::IsingRunConfig) is to
-//! [`Ising`](crate::model::Ising), and it is a separate type rather than a
+//! [`IsingRunConfig`](crate::models::ising::run_config::IsingRunConfig) is to
+//! [`Ising`](crate::models::ising::Ising), and it is a separate type rather than a
 //! widened one because the two models' `h` are different shapes. Ising's is a
 //! single number, since `+1` and `−1` are values one dial can pull between;
 //! this model's is a list with one entry per label, since favoring red is not
@@ -38,7 +38,7 @@ use crate::config::{
 };
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
-use crate::model::{self, Potts};
+use crate::models::potts::{self as model, Potts};
 use crate::rng::RandRng;
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +56,7 @@ pub const MIN_STATES: usize = model::POTTS_MIN_STATES;
 ///
 /// Three, which is the smallest `q` that is not the Ising model in disguise and
 /// the one the two-dimensional transition is most often quoted at. Two would run
-/// the same physics [`Ising`](crate::model::Ising) already does, up to a factor
+/// the same physics [`Ising`](crate::models::ising::Ising) already does, up to a factor
 /// of two in the coupling; four is where the transition stops being continuous.
 pub const POTTS_Q: usize = 3;
 

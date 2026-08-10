@@ -35,10 +35,10 @@
 //! Lattice extents are kept even throughout, because the GPU schedule requires
 //! them.
 
-use plaquette::potts_config::PottsRunConfig;
-use plaquette::{
-    Estimate, IsingRunConfig, IsingSampler, PottsSampler, measure, potts_measure, reduce,
-};
+use plaquette::models::ising::{IsingRunConfig, IsingSampler, measure};
+use plaquette::models::potts::run_config::PottsRunConfig;
+use plaquette::models::potts::{PottsSampler, potts_measure};
+use plaquette::{Estimate, reduce};
 
 /// Samples per run. A few hundred is enough for the contrasts asserted here
 /// without making the suite slow.

@@ -29,11 +29,10 @@
 use std::time::Instant;
 
 use plaquette::chain::Chain;
-use plaquette::model::Z2Gauge;
+use plaquette::models::gauge::GpuGaugeChain;
+use plaquette::models::gauge::Z2Gauge;
 use plaquette::rng::RandRng;
-use plaquette::{
-    Cell, Configuration, Gpu, GpuGaugeChain, Lattice, LinkCheckerboard, Metropolis, Updater,
-};
+use plaquette::{Cell, Configuration, Gpu, Lattice, LinkCheckerboard, Metropolis, Updater};
 
 const BETA: f64 = 0.75;
 const J: f64 = 1.0;

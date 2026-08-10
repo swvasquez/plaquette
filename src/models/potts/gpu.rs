@@ -3,7 +3,7 @@
 //! `Iterator<Item = Configuration>` interface as the CPU
 //! [`Chain`](crate::chain::Chain).
 //!
-//! The Potts sibling of [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain), and
+//! The Potts sibling of [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain), and
 //! close enough to it that the two share their whole schedule: the same
 //! two-color site checkerboard over the same neighbor table, launched one thread
 //! per site. What they do not share is what a thread computes, because the
@@ -11,7 +11,7 @@
 //! rather than a sum of signed products, and the proposal has to *draw* among
 //! the `Q - 1` other labels where the Ising kernel simply flips. That is two
 //! bodies with nothing in common but their loop bounds, which is why this is a
-//! separate shader rather than a branch inside `ising_checkerboard.wgsl`.
+//! separate shader rather than a branch inside the Ising `checkerboard.wgsl`.
 //!
 //! Everything about batching samples and reading them back lives in
 //! `DeviceSweeper`, shared with the other two backends; what this module owns is
@@ -23,7 +23,7 @@
 //! count, which the source has no way to see. Substituting that one number is
 //! what lets the device path take any `Q` rather than a capped one.
 //!
-//! The coloring is compiled into the shader (`potts_checkerboard.wgsl`), so this
+//! The coloring is compiled into the shader (`checkerboard.wgsl`), so this
 //! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
 //! counter-based, keyed on `(seed, site, sweep)`, so the result is independent of
 //! GPU thread order — the property that lets the CPU site checkerboard serve as a
@@ -35,7 +35,7 @@ use crate::device::{
     site_neighbor_table, state_words,
 };
 use crate::lattice::Lattice;
-use crate::model::{self, Potts};
+use crate::models::potts::{self as model, Potts};
 
 /// Color passes per sweep: the two coordinate-sum parities, as for Ising. A
 /// site's color does not depend on the dimension — a step along any axis flips
@@ -44,7 +44,7 @@ const N_COLORS: u32 = 2;
 
 /// The kernel *template*: the shared preamble followed by the site checkerboard,
 /// still carrying the one token the host has to fill in.
-const SHADER_TEMPLATE: &str = crate::device::shader_source!("potts_checkerboard.wgsl");
+const SHADER_TEMPLATE: &str = crate::device::shader_source!("checkerboard.wgsl");
 
 /// The token in that template standing for the number of `vec4` slots the
 /// per-label offsets occupy.
@@ -116,7 +116,7 @@ struct Params {
 /// [`Configuration<Q>`] *is*, so it cannot be anything but a type parameter;
 /// `D` is read once in [`new`](GpuPottsChain::new) to build the neighbor table
 /// and never needed again, so it is a parameter of the constructor alone — the
-/// same split [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain) makes.
+/// same split [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain) makes.
 pub struct GpuPottsChain<const Q: usize> {
     sweeper: DeviceSweeper<Q>,
 }
@@ -138,7 +138,7 @@ impl<const Q: usize> GpuPottsChain<Q> {
     /// # Panics
     ///
     /// Panics if `batch` is zero, if `Q` is below
-    /// [`Potts::MIN_STATES`](crate::model::Potts::MIN_STATES), if `start` is not
+    /// [`Potts::MIN_STATES`](crate::models::potts::Potts::MIN_STATES), if `start` is not
     /// a site field of this lattice, or if any extent is odd. There is no upper
     /// bound on `Q`: the kernel is generated for the state count it is given.
     #[allow(clippy::too_many_arguments)]
@@ -249,7 +249,7 @@ impl<const Q: usize> Iterator for GpuPottsChain<Q> {
 mod tests {
     use super::*;
     use crate::device::require_gpu;
-    use crate::observables::potts_measure;
+    use crate::models::potts::potts_measure;
     use crate::rng::RandRng;
 
     /// With `sweeps_between = 0` a "sample" runs no sweeps, so the round-trip

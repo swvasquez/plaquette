@@ -19,9 +19,10 @@
 use std::time::Instant;
 
 use plaquette::chain::Chain;
-use plaquette::model::Ising;
+use plaquette::models::ising::GpuIsingChain;
+use plaquette::models::ising::Ising;
 use plaquette::rng::RandRng;
-use plaquette::{Cell, Configuration, Gpu, GpuIsingChain, Lattice, Metropolis};
+use plaquette::{Cell, Configuration, Gpu, Lattice, Metropolis};
 
 const BETA: f64 = 0.44;
 const J: f64 = 1.0;

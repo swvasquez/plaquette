@@ -2,8 +2,8 @@
 //! model it configures.
 //!
 //! A run config is one struct per model —
-//! [`IsingRunConfig`](crate::ising_config::IsingRunConfig) and
-//! [`GaugeRunConfig`](crate::gauge_config::GaugeRunConfig) — because the two
+//! [`IsingRunConfig`](crate::models::ising::run_config::IsingRunConfig) and
+//! [`GaugeRunConfig`](crate::models::gauge::run_config::GaugeRunConfig) — because the two
 //! models take different
 //! parameters and a schema wide enough for both would carry a hole for whichever
 //! one is running. What they do share is the vocabulary those schemas are
@@ -84,9 +84,9 @@ pub enum Start {
 /// every entry: the two checkerboard schedules each name the grade they color,
 /// and a model accepts only the one matching its field. A gauge run rejects the
 /// site schedules and the GPU backend in
-/// [`validate`](crate::gauge_config::GaugeRunConfig::validate), and an Ising run
+/// [`validate`](crate::models::gauge::run_config::GaugeRunConfig::validate), and an Ising run
 /// rejects the link schedule in
-/// [`validate`](crate::ising_config::IsingRunConfig::validate), rather than each
+/// [`validate`](crate::models::ising::run_config::IsingRunConfig::validate), rather than each
 /// going through a separate, narrower enum. That keeps each rule where it can
 /// say what went wrong, and admitting a further schedule is a change to
 /// validation rather than a new type and a mapping between the two.
@@ -105,14 +105,14 @@ pub enum UpdaterKind {
     /// as `link_checkerboard`.
     LinkCheckerboard,
     /// The site checkerboard schedule run on the GPU
-    /// ([`GpuIsingChain`](crate::ising_gpu::GpuIsingChain)); serializes as
+    /// ([`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain)); serializes as
     /// `gpu_site_checkerboard`. Backend and schedule are one choice rather than
     /// two, which keeps illegal combinations unrepresentable — there is no way
     /// to name a GPU run without also naming the coloring its kernel is written
     /// for.
     GpuSiteCheckerboard,
     /// The link checkerboard schedule run on the GPU
-    /// ([`GpuGaugeChain`](crate::gauge_gpu::GpuGaugeChain)); serializes as
+    /// ([`GpuGaugeChain`](crate::models::gauge::gpu::GpuGaugeChain)); serializes as
     /// `gpu_link_checkerboard`. The link counterpart of
     /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard), and fused for
     /// the same reason.

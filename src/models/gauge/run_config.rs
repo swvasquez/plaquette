@@ -2,8 +2,8 @@
 //! parameters.
 //!
 //! [`GaugeRunConfig`] is to [`Z2Gauge`] what
-//! [`IsingRunConfig`](crate::ising_config::IsingRunConfig) is to
-//! [`Ising`](crate::model::Ising), and it is a separate type rather than a
+//! [`IsingRunConfig`](crate::models::ising::run_config::IsingRunConfig) is to
+//! [`Ising`](crate::models::ising::Ising), and it is a separate type rather than a
 //! widened one because the two models take different parameters: there is no
 //! external field here, and no field can be added — the plaquette energy is
 //! invariant under flipping every link that touches a site, and a term reading
@@ -32,7 +32,7 @@ use crate::config::{
 };
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
-use crate::model::Z2Gauge;
+use crate::models::gauge::Z2Gauge;
 use crate::rng::RandRng;
 use serde::{Deserialize, Serialize};
 

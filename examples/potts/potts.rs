@@ -28,11 +28,9 @@
 //! cargo run --example potts -- path/to/run.toml  # or any other config
 //! ```
 
-use plaquette::potts_config::{POTTS_D, POTTS_Q, PottsRunConfig};
-use plaquette::{
-    PottsSample, PottsSampler, binder_cumulant, potts_correlator, potts_measure, reduce,
-    specific_heat, susceptibility,
-};
+use plaquette::models::potts::run_config::{POTTS_D, POTTS_Q, PottsRunConfig};
+use plaquette::models::potts::{PottsSample, PottsSampler, potts_correlator, potts_measure};
+use plaquette::{binder_cumulant, reduce, specific_heat, susceptibility};
 
 /// The number of states this program is built for.
 ///

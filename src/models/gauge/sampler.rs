@@ -2,14 +2,14 @@
 //! from it.
 //!
 //! [`GaugeSampler`] is to [`GaugeRunConfig`] what
-//! [`IsingSampler`](crate::ising_sampler::IsingSampler) is to the Ising schema,
+//! [`IsingSampler`](crate::models::ising::sampler::IsingSampler) is to the Ising schema,
 //! and it owns the same thing: the **phasing**. It assembles the pieces a run
 //! needs, thermalizes once in its constructor, and then streams from its
 //! warmed-up state. A bare [`Chain`] yields pre-equilibrium configurations; this
 //! has already thermalized before it gives you anything.
 //!
 //! It also owns the **backend choice**, the same way
-//! [`IsingSampler`](crate::ising_sampler::IsingSampler) does. The run's
+//! [`IsingSampler`](crate::models::ising::sampler::IsingSampler) does. The run's
 //! [`UpdaterKind`] picks between the CPU chain and the GPU chain, and the
 //! sampler holds whichever the config asked for.
 //! [`samples`](GaugeSampler::samples) returns an [`AnyGaugeChain`] over it — a
@@ -32,15 +32,15 @@
 //! Measurement stays entirely with the consumer, and the sampler's job is to hand
 //! over what measuring needs: [`lattice`](GaugeSampler::lattice) and
 //! [`model`](GaugeSampler::model) give owned copies, so a consumer reads them once
-//! and then maps [`gauge_measure`](crate::observables::gauge_measure) or
-//! [`wilson_rectangles`](crate::observables::wilson_rectangles) over the stream.
+//! and then maps [`gauge_measure`](crate::models::gauge::gauge_measure) or
+//! [`wilson_rectangles`](crate::models::gauge::wilson_rectangles) over the stream.
 //! Which of those to call, and at what loop sizes, is not a run parameter — the
 //! configurations are the same either way — which is why none of it appears in
 //! the config.
 //!
 //! ```
-//! # use plaquette::gauge_config::GaugeRunConfig;
-//! # use plaquette::{GaugeSampler, gauge_measure};
+//! # use plaquette::models::gauge::run_config::GaugeRunConfig;
+//! # use plaquette::models::gauge::{GaugeSampler, gauge_measure};
 //! # let run = GaugeRunConfig::parse("shape=[4,4,4]\nj=1.0\nbeta=0.75\nthermalize=10\nsweeps_between=1\nn_samples=5\nseed=1").unwrap();
 //! let mut sampler = GaugeSampler::<3>::new(&run);
 //! let (lattice, model) = (sampler.lattice(), sampler.model());
@@ -55,10 +55,10 @@ use crate::chain::Chain;
 use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
 use crate::device::{GPU_BATCH, Gpu};
-use crate::gauge_config::GaugeRunConfig;
-use crate::gauge_gpu::GpuGaugeChain;
 use crate::lattice::Lattice;
-use crate::model::Z2Gauge;
+use crate::models::gauge::Z2Gauge;
+use crate::models::gauge::gpu::GpuGaugeChain;
+use crate::models::gauge::run_config::GaugeRunConfig;
 use crate::rng::RandRng;
 use crate::updater::{AnyUpdater, LinkCheckerboard, Metropolis};
 
@@ -235,7 +235,7 @@ mod tests {
     use super::*;
     use crate::config::{Start, UpdaterKind};
     use crate::configuration::Cell;
-    use crate::observables::{gauge_measure, wilson_rectangles};
+    use crate::models::gauge::{gauge_measure, wilson_rectangles};
 
     fn config() -> GaugeRunConfig {
         GaugeRunConfig {

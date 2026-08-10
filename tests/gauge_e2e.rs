@@ -38,10 +38,8 @@
 //! exact `energy` against `energy_delta` check in `model.rs` goes to ten.
 //! Lattice extents are kept even because the GPU schedule requires them.
 
-use plaquette::{
-    Derived, Estimate, GaugeRunConfig, GaugeSampler, creutz_ratio, gauge_measure, reduce,
-    wilson_rectangles,
-};
+use plaquette::models::gauge::{GaugeRunConfig, GaugeSampler, gauge_measure, wilson_rectangles};
+use plaquette::{Derived, Estimate, creutz_ratio, reduce};
 
 /// Largest Wilson side to collect. Two is enough for the 2x2 Creutz ratio, and
 /// stays within half the extent of every box that asks for a table.

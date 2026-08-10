@@ -27,7 +27,7 @@ use crate::config::{
 };
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
-use crate::model::Ising;
+use crate::models::ising::Ising;
 use crate::rng::RandRng;
 use serde::{Deserialize, Serialize};
 

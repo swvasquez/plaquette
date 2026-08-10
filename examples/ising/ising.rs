@@ -30,11 +30,9 @@
 //! cargo run --example ising -- path/to/run.toml  # or any other config
 //! ```
 
-use plaquette::ising_config::IsingRunConfig;
-use plaquette::{
-    IsingSampler, Sample, binder_cumulant, correlator, measure, reduce, specific_heat,
-    susceptibility,
-};
+use plaquette::models::ising::run_config::IsingRunConfig;
+use plaquette::models::ising::{IsingSampler, Sample, correlator, measure};
+use plaquette::{binder_cumulant, reduce, specific_heat, susceptibility};
 
 /// The lattice dimension this program is built for.
 ///

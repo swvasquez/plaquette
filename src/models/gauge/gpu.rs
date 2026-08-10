@@ -3,7 +3,7 @@
 //! `Iterator<Item = Configuration>` interface as the CPU
 //! [`Chain`](crate::chain::Chain).
 //!
-//! The gauge sibling of [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain), and
+//! The gauge sibling of [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain), and
 //! a separate type for the same reason
 //! [`LinkCheckerboard`] is separate from
 //! [`SiteCheckerboard`](crate::updater::SiteCheckerboard): that one runs over a
@@ -13,7 +13,7 @@
 //! about the gauge model: the `Params` layout, the staple table, and the
 //! `2D`-color link checkerboard the shader implements.
 //!
-//! The coloring is compiled into the shader (`gauge_checkerboard.wgsl`), so this
+//! The coloring is compiled into the shader (`checkerboard.wgsl`), so this
 //! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
 //! counter-based, keyed on `(seed, link, sweep)`, so the result is independent of
 //! GPU thread order — the property that lets the CPU link checkerboard serve as a
@@ -25,11 +25,11 @@ use crate::device::{
     DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors, state_words,
 };
 use crate::lattice::Lattice;
-use crate::model::Z2Gauge;
+use crate::models::gauge::Z2Gauge;
 use crate::updater::LinkCheckerboard;
 
 /// The compiled kernel: the shared preamble followed by the link checkerboard.
-const SHADER: &str = crate::device::shader_source!("gauge_checkerboard.wgsl");
+const SHADER: &str = crate::device::shader_source!("checkerboard.wgsl");
 
 /// The static run parameters uploaded to the shader's uniform buffer.
 ///
@@ -54,7 +54,7 @@ struct Params {
 /// be moved and driven freely. Fixed at `Q = 2`.
 ///
 /// The type carries no dimension, for the reason
-/// [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain) does not: the lattice is
+/// [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain) does not: the lattice is
 /// read once in [`new`](GpuGaugeChain::new) to build the tables, and what
 /// survives is device buffers and counts.
 pub struct GpuGaugeChain {
@@ -188,8 +188,8 @@ impl Iterator for GpuGaugeChain {
 mod tests {
     use super::*;
     use crate::device::require_gpu;
-    use crate::model::Z2Gauge;
-    use crate::observables::gauge_measure;
+    use crate::models::gauge::Z2Gauge;
+    use crate::models::gauge::gauge_measure;
     use crate::rng::RandRng;
 
     /// With `sweeps_between = 0` a "sample" runs no sweeps, so the round-trip

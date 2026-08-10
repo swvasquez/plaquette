@@ -19,7 +19,7 @@
 //! not something you assume.
 //!
 //! The cost is that the invariant now lives in a convention rather than the
-//! type. [`IsingSampler`](crate::ising_sampler::IsingSampler) is the blessed path; reach for
+//! type. [`IsingSampler`](crate::models::ising::sampler::IsingSampler) is the blessed path; reach for
 //! `Chain` directly only when doing the phasing yourself.
 //! [`advance`](Chain::advance) is the discarding form and allocates nothing;
 //! pulling warmup configs through the iterator instead is how you keep the
@@ -41,8 +41,8 @@
 //! callers bound a run with `.take(n)`.
 //!
 //! ```
-//! # use plaquette::{Cell, Lattice, Configuration, Metropolis, measure};
-//! # use plaquette::model::Ising;
+//! # use plaquette::{Cell, Lattice, Configuration, Metropolis};
+//! # use plaquette::models::ising::{Ising, measure};
 //! # use plaquette::rng::RandRng;
 //! # use plaquette::chain::Chain;
 //! # let lat = Lattice::new([8, 8]);
@@ -61,9 +61,9 @@
 //! let samples: Vec<_> = chain.take(100).map(|c| measure(&model, &lat, &c)).collect();
 //! ```
 
+use crate::action::Action;
 use crate::configuration::Configuration;
 use crate::lattice::Lattice;
-use crate::model::Action;
 use crate::rng::Rng;
 use crate::updater::Updater;
 
@@ -190,8 +190,8 @@ where
 mod tests {
     use super::*;
     use crate::configuration::Cell;
-    use crate::model::Ising;
-    use crate::observables::{self, Sample};
+    use crate::models::ising::Ising;
+    use crate::models::ising::{self as observables, Sample};
     use crate::rng::RandRng;
     use crate::updater::Metropolis;
 

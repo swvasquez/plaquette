@@ -55,7 +55,7 @@ incremental energy then agrees with the difference of two from-scratch energies
 exactly rather than up to rounding. Note that the two counts are *not*
 complements of one another once $q > 2$: a neighbor may carry a third label and
 enter neither. That is the first place a delta written for two states quietly
-fails, and it is what the three-state unit test in `model.rs` is there to catch.
+fails, and it is what the three-state unit test in `models/potts` is there to catch.
 
 ## The per-label offset
 

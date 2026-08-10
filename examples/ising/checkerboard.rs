@@ -19,8 +19,9 @@
 //! ```
 
 use plaquette::config::{Start, UpdaterKind};
-use plaquette::ising_config::IsingRunConfig;
-use plaquette::{Estimate, IsingSampler, Sample, measure, reduce};
+use plaquette::models::ising::run_config::IsingRunConfig;
+use plaquette::models::ising::{IsingSampler, Sample, measure};
+use plaquette::{Estimate, reduce};
 
 /// Thermalize, stream `n_samples`, and reduce the energy density and `|m|`.
 ///

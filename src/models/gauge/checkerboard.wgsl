@@ -1,7 +1,7 @@
 // Checkerboard Metropolis sweep for the Z2 gauge model (Q = 2), in any dimension
 // admitting a plaquette (D >= 2).
 //
-// The link counterpart of `ising_checkerboard.wgsl`. Variables live on links, and
+// The link counterpart of the Ising `checkerboard.wgsl`. Variables live on links, and
 // the unit of interaction is the plaquette rather than the bond, so what two
 // threads must avoid is sharing a plaquette, not sharing a bond. Base-site parity
 // alone cannot deliver that — two of a plaquette's four links share a base site —

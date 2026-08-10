@@ -48,11 +48,11 @@
 //! the lattice volume times the perimeter, per sample, which is a good deal more
 //! work than the Ising example's two lattice scans.
 
-use plaquette::gauge_config::GaugeRunConfig;
-use plaquette::{
-    Estimate, GaugeSample, GaugeSampler, creutz_ratio, gauge_measure, polyakov_loop, reduce,
-    specific_heat, wilson_rectangles,
+use plaquette::models::gauge::run_config::GaugeRunConfig;
+use plaquette::models::gauge::{
+    GaugeSample, GaugeSampler, gauge_measure, polyakov_loop, wilson_rectangles,
 };
+use plaquette::{Estimate, creutz_ratio, reduce, specific_heat};
 
 /// The lattice dimension this program is built for.
 ///

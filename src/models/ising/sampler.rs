@@ -29,10 +29,10 @@ use crate::chain::Chain;
 use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
 use crate::device::{GPU_BATCH, Gpu};
-use crate::ising_config::IsingRunConfig;
-use crate::ising_gpu::GpuIsingChain;
 use crate::lattice::Lattice;
-use crate::model::Ising;
+use crate::models::ising::Ising;
+use crate::models::ising::gpu::GpuIsingChain;
+use crate::models::ising::run_config::IsingRunConfig;
 use crate::rng::RandRng;
 use crate::updater::{AnyUpdater, Metropolis, SiteCheckerboard};
 
@@ -183,8 +183,8 @@ impl<const D: usize> IsingSampler<D> {
     /// nothing, and calling this again continues the same chain.
     ///
     /// ```
-    /// # use plaquette::ising_config::IsingRunConfig;
-    /// # use plaquette::{measure, IsingSampler};
+    /// # use plaquette::models::ising::run_config::IsingRunConfig;
+    /// # use plaquette::models::ising::{IsingSampler, measure};
     /// # let run = IsingRunConfig::parse("shape=[8,8]\nj=1.0\nbeta=0.44\nthermalize=10\nsweeps_between=1\nn_samples=5\nseed=1").unwrap();
     /// let mut sampler = IsingSampler::<2>::new(&run);
     /// let (lattice, model) = (sampler.lattice(), sampler.model());
@@ -225,7 +225,7 @@ impl<const D: usize> IsingSampler<D> {
 mod tests {
     use super::*;
     use crate::config::Start;
-    use crate::observables::measure;
+    use crate::models::ising::measure;
 
     fn config() -> IsingRunConfig {
         IsingRunConfig {
