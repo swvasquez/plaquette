@@ -31,6 +31,75 @@ Note that memory use grows quickly with the dimension: the lattice stores about
 
 Refer to [`docs/`](docs/) for descriptions of used algorithms.
 
+## Architecture
+
+A simulation generates near-independent snapshots of the system, measures
+observables on each, and averages those measurements into a result with an
+error bar. The snapshots come from evolving the system through sweeps of the
+lattice, and one sweep makes as many update attempts as the lattice has
+variables. Each attempt is accepted with a probability set by the energy change
+it would cause. Consecutive states are still strongly correlated, so snapshots
+are taken many sweeps apart, leaving each one close to independent of the last.
+
+### Objects
+
+```
+  the driver -- the code running the simulation
+               |
+               | asks for the next snapshot
+               v
+  +------- Chain --------+                +--------- Rng ----------+
+  |  run a fixed number  |                |  random values for     |
+  |  of sweeps, then     |                |  the proposal and      |
+  |  yield a snapshot    |                |  the accept test       |
+  +----------------------+                +------------------------+
+               |                                      |
+               | drives each sweep                    |
+               |     +--------- random draws ---------+
+               v     v
+  +------ Updater -------+                +-------- Action --------+
+  |  pick a variable,    |   a proposed   |  prices a move:        |
+  |  propose a new value | ---- move ---> |  the energy change     |
+  |  accept or reject    | <- its cost -- |  it would cause        |
+  +----------------------+                +------------------------+
+        |                                              ^
+        | writes the                        reads the  |
+        | new value                     current state  |
+        v                                              |
+  +--------------------------- the system ---------------------------+
+  |                                                                  |
+  |  +--- Configuration ----+            +------ Lattice -------+    |
+  |  |  one State per cell  | -- on a -> |  shape, neighbors,   |    |
+  |  |  (a site or a link)  |            |  links, plaquettes   |    |
+  |  +----------------------+            +----------------------+    |
+  |                                                                  |
+  +------------------------------------------------------------------+
+```
+
+### Snapshot
+
+The driver — an example program, or a model's sampler — has already thermalized
+the system.
+
+1. The driver asks `Chain` for the next snapshot.
+2. `Chain` runs a fixed number of sweeps before handing one back, and each sweep
+   is a single call into `Updater`.
+3. `Updater` begins the sweep with a single update, picking a variable and
+   asking `Rng` for a proposed new value.
+4. `Action` prices that move, reading the geometry from `Lattice` and the
+   affected values from `Configuration`, and returns the energy change it would
+   cause.
+5. `Updater` accepts a downhill move outright and an uphill one only with a
+   probability set by that change and the temperature, writing an accepted value
+   into `Configuration` and leaving it untouched on a rejection.
+6. One sweep is as many of those updates as `Configuration` has variables.
+7. After the last sweep, `Chain` hands back a copy of `Configuration` as it
+   stands, and that copy is the snapshot.
+8. The driver measures observables on it, producing one `Sample`.
+
+After many snapshots, `statistics` averages the collected observables into an
+`Estimate` with an error bar.
+
 ## Usage
 
 Model runs are configured via TOML. Runnable example code lives in [`examples/`](examples/).
