@@ -6,6 +6,10 @@
 //! Value-semantic observables stay inherent methods on the concrete models
 //! rather than trait methods, so the trait stays energy-only.
 //!
+//! [`BondAction`] sits beside it as a second, narrower seam: not every model has
+//! one, and a model that does declares the two numbers a cluster update needs
+//! rather than another way of pricing a move.
+//!
 //! The models themselves — what the state indices *mean*, and everything that
 //! reads them — live under [`models`](crate::models); this module is only the
 //! vocabulary they are written in, which is what lets the updater name the seam
@@ -43,4 +47,41 @@ pub trait Action<const Q: usize, const D: usize> {
         var: usize,
         proposed: State<Q>,
     ) -> f64;
+}
+
+/// A model whose energy is a sum over nearest-neighbor site bonds of a
+/// two-valued term, symmetric under relabeling the `Q` states — the shape the
+/// Fortuin–Kasteleyn cluster construction needs.
+///
+/// Implemented alongside [`Action`] rather than as a supertrait of it: a cluster
+/// updater already receives an `&impl Action` in
+/// [`Updater::sweep`](crate::updater::Updater::sweep), so the supertrait would
+/// add nothing, and naming `D` here would leave it uninferable at a constructor
+/// that takes only the model — [`Potts`](crate::models::potts::Potts) implements
+/// `Action<Q, D>` for *every* `D`, so
+/// [`SwendsenWang::for_model`](crate::updater::SwendsenWang::for_model) could not
+/// resolve one and every call site would need a turbofish. See
+/// `docs/swendsen-wang.md`.
+///
+/// Both numbers are constant over a run, which is what lets an updater read them
+/// once at construction rather than querying the model per sweep. An algorithm
+/// whose model dependence evolved with the configuration — heat bath, say —
+/// would need a different seam.
+pub trait BondAction<const Q: usize> {
+    /// The per-bond energy gap `E(disagree) − E(agree)`, in the units of
+    /// [`Action::energy`]. The bond probability is `1 − exp(−β · gap)`.
+    ///
+    /// One number for the whole lattice, with no bond index: both models here
+    /// have uniform couplings. A disordered model with per-bond couplings would
+    /// want the index; adding it before one exists would be a guess at what it
+    /// should be keyed by.
+    fn bond_energy_gap(&self) -> f64;
+
+    /// Whether the energy is invariant under permuting the `Q` labels — `false`
+    /// whenever an external field or per-label offset is set.
+    ///
+    /// The predicate is equality of labels, which is the only agreement test
+    /// this trait knows about. A clock or O(n) model whose bonds agree by angle
+    /// rather than by name would need that generalized too.
+    fn relabel_invariant(&self) -> bool;
 }

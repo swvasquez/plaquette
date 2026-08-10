@@ -29,16 +29,23 @@
 //!
 //! The sharpest single check here is neither: at `q = 2` the Potts model *is* the
 //! Ising model at half the coupling, so two independently written actions driven
-//! through two independently written samplers must produce the same run. See
-//! [`potts_at_two_states_reproduces_an_ising_run`].
+//! through two independently written samplers must produce the same run — not
+//! statistically but configuration for configuration. It is made twice, once
+//! under Metropolis in [`potts_at_two_states_reproduces_an_ising_run`] and once
+//! under the cluster update in
+//! [`the_cluster_update_reproduces_an_ising_run_at_two_states`], and the second
+//! is where the two models' differing bond-gap conventions have to agree.
 //!
-//! Lattice extents are kept even throughout, because the GPU schedule requires
-//! them.
+//! Extents are kept even wherever a checkerboard runs, because that schedule
+//! requires them. The cluster tests deliberately break that habit: a cluster
+//! update has no coloring for the periodic wrap to spoil, so it is the one kind
+//! here that runs on an odd lattice, and
+//! [`the_cluster_backends_agree`] uses one to say so.
 
 use plaquette::models::ising::{IsingRunConfig, IsingSampler, measure};
 use plaquette::models::potts::run_config::PottsRunConfig;
 use plaquette::models::potts::{PottsSampler, potts_measure};
-use plaquette::{Estimate, reduce};
+use plaquette::{Cell, Configuration, Estimate, reduce};
 
 /// Samples per run. A few hundred is enough for the contrasts asserted here
 /// without making the suite slow.
@@ -363,6 +370,150 @@ fn three_dimensional_runs_order_below_the_transition_and_not_above() {
     assert_matches(&metropolis, &gpu, "gpu_site_checkerboard");
 }
 
+/// The cluster update samples the same distribution the local ones do.
+///
+/// This is the test that says Swendsen–Wang is *right*, and it is the only thing
+/// that does at this level: the tests below say it is fast, which a wrong
+/// algorithm can also be. Agreement is asserted statistically through
+/// [`assert_matches`], against a Metropolis run at the same coupling — and the
+/// two are not merely on different streams but running different moves, so
+/// nothing weaker than a distributional comparison is available.
+///
+/// A factor of two in the bond gap is the error worth designing against here.
+/// It would put the cluster run at an effective coupling of `2J` or `J/2`, both
+/// of which sit on the far side of `beta_c` from this one and move the order
+/// parameter by far more than the error bars allow.
+#[test]
+fn the_cluster_update_agrees_with_metropolis() {
+    let shape = [16, 16];
+    let metropolis = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260960, "metropolis");
+    let cluster = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260961, "swendsen_wang");
+    report("2D metropolis", &metropolis);
+    report("2D swendsen_wang", &cluster);
+    assert_matches(&metropolis, &cluster, "swendsen_wang");
+
+    // Three dimensions as well, since the bond walk and the labeling both derive
+    // their bounds from the dimension and a two-dimensional run would not
+    // notice either going wrong.
+    let shape = [6, 6, 6];
+    let metropolis = run::<3, 3>(shape, 1.0, 0.65, 20260962, "metropolis");
+    let cluster = run::<3, 3>(shape, 1.0, 0.65, 20260963, "swendsen_wang");
+    report("3D metropolis", &metropolis);
+    report("3D swendsen_wang", &cluster);
+    assert_matches(&metropolis, &cluster, "swendsen_wang");
+}
+
+/// The device cluster backend agrees with the host one.
+///
+/// Distributional rather than bit-for-bit: the host draws its bonds from a
+/// stream in bond order and the device keys a counter on `(seed, bond, sweep)`,
+/// so the two never share a stream. The lattice is deliberately **odd**, which
+/// no other GPU kind in this crate can run — a cluster update has no coloring
+/// for the periodic wrap to break — so this doubles as the end-to-end statement
+/// that the even-extent rule did not leak onto the new kind.
+#[test]
+fn the_cluster_backends_agree() {
+    if !gpu_available() {
+        return;
+    }
+    let shape = [15, 15];
+    let cpu = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260970, "swendsen_wang");
+    let gpu = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260971, "gpu_swendsen_wang");
+    report("odd swendsen_wang", &cpu);
+    report("odd gpu_swendsen_wang", &gpu);
+    assert_matches(&cpu, &gpu, "gpu_swendsen_wang");
+}
+
+/// Samples the autocorrelation comparison takes, at a stride of one sweep.
+///
+/// A stride of one is what makes the comparison readable: `reduce` reports
+/// `tau_int` in units of *samples*, so a sample of one sweep is the only way the
+/// number it returns is a number of sweeps. The count is large because the
+/// Metropolis arm is the slow one and `reduce` cannot resolve a correlation time
+/// it has not run several tens of.
+const TAU_SAMPLES: usize = 4000;
+
+/// Chain-mean energy density and order parameter of a `q = 3` run sitting on the
+/// square-lattice critical coupling, sampled every sweep.
+fn at_criticality(shape: [usize; 2], updater: &str, seed: u64) -> Measured {
+    let toml = format!(
+        "shape = {shape:?}\n\
+         j = 1.0\n\
+         beta = {}\n\
+         updater = \"{updater}\"\n\
+         thermalize = 1000\n\
+         sweeps_between = 1\n\
+         n_samples = {TAU_SAMPLES}\n\
+         seed = {seed}\n\
+         start = \"hot\"\n",
+        beta_c(3)
+    );
+    drive::<3, 2>(&toml, TAU_SAMPLES)
+}
+
+/// How much shorter the cluster update's correlation time must be than the local
+/// one's at the critical point.
+///
+/// The measured ratio at `L = 32` is comfortably above this — the local chain
+/// runs at an integrated autocorrelation time of a couple of hundred sweeps and
+/// the cluster chain at around ten — so the margin is set loose enough to be
+/// seed-robust rather than tight enough to be a measurement. The claim being
+/// tested is that the gap is a change of regime, not that it has a particular
+/// size.
+const TAU_RATIO: f64 = 8.0;
+
+/// At the critical point the cluster update decorrelates in a sweep or two while
+/// the local one takes tens — the whole reason the algorithm exists.
+///
+/// This is the performance claim of `docs/swendsen-wang.md` reduced to something
+/// a test can hold: the correlation time of a local update grows as `L^2` at
+/// criticality and a cluster update's as roughly `L^{1/2}`, so at a lattice
+/// large enough to see it the two are not close. Thirty-two squared is where the
+/// gap is unambiguous and the Metropolis arm still finishes in a few seconds.
+///
+/// Both `tau_int` values are in sweeps, because the stride is one. That unit is
+/// honest about what it measures and deliberately not a benchmark: a cluster
+/// sweep costs more wall-clock than a local one, so the ratio here is a
+/// statement about the dynamics rather than about the runtime. See the sweep
+/// section of `docs/swendsen-wang.md`.
+///
+/// Only the *cluster* arm's reliability is asserted, and the asymmetry is the
+/// point. A short `tau_int` from a chain that never decorrelated would be an
+/// artifact and would fake the whole result, so the fast side has to prove it
+/// resolved its own autocorrelation. The Metropolis side does not: at this
+/// lattice size four thousand sweeps leave its `n_eff` in single figures, so its
+/// `tau_int` is a floor rather than a measurement — which can only understate
+/// the gap the assertion is about.
+#[test]
+fn the_cluster_update_decorrelates_far_faster_at_criticality() {
+    let shape = [32, 32];
+    let metropolis = at_criticality(shape, "metropolis", 20260980);
+    let cluster = at_criticality(shape, "swendsen_wang", 20260981);
+    report("critical metropolis", &metropolis);
+    report("critical swendsen_wang", &cluster);
+
+    assert!(
+        cluster.energy.is_reliable() && cluster.order.is_reliable(),
+        "the cluster chain must resolve its own autocorrelation: \
+         n_eff = {:.0} (energy), {:.0} (order)",
+        cluster.energy.n_eff,
+        cluster.order.n_eff
+    );
+
+    for (what, local, global) in [
+        ("energy density", &metropolis.energy, &cluster.energy),
+        ("order parameter", &metropolis.order, &cluster.order),
+    ] {
+        assert!(
+            local.tau_int > TAU_RATIO * global.tau_int,
+            "{what}: metropolis tau_int = {:.2} sweeps is not {TAU_RATIO}x the \
+             cluster update's {:.2}",
+            local.tau_int,
+            global.tau_int
+        );
+    }
+}
+
 /// At two states, a Potts run at coupling `2J` reproduces a zero-field Ising run
 /// at `J` — configuration for configuration.
 ///
@@ -432,6 +583,79 @@ fn potts_at_two_states_reproduces_an_ising_run() {
     assert!(
         (potts_mean - (ising_mean + offset)).abs() < 1e-9,
         "mean energies should agree once the constant offset is removed"
+    );
+}
+
+/// The same two-state correspondence under the *cluster* update, and it is again
+/// exact rather than statistical.
+///
+/// This is the sharpest statement available about the bond gap, which is the one
+/// number the two models state differently and by far the likeliest place for a
+/// cluster implementation to go quietly wrong. Potts scores an agreeing bond
+/// `-J_p` and a disagreeing one `0`, so its gap is `J_p`; Ising scores `-J_i`
+/// and `+J_i`, so its gap is `2 J_i`. Under the `J_p = 2 J_i` map that makes the
+/// two models the same physics, the two gaps come out *equal* — and equal gaps
+/// mean equal bond probabilities, which is what puts the two chains in lockstep
+/// rather than merely in agreement.
+///
+/// Lockstep is worth spelling out, because it is what makes this bit-for-bit
+/// where the corresponding Metropolis test needed only equal `energy_delta`s.
+/// Both samplers seed one generator and draw the same hot start from it. A
+/// cluster sweep then consumes randomness at exactly two places: a uniform per
+/// *agreeing* bond, in the order `cluster::site_clusters` walks them, and one
+/// label draw per cluster. The bond walk is a property of the lattice, the
+/// agreement test reads two configurations that are equal, and both models draw
+/// their labels with `next_below(2)` — so the two chains consume the same draws
+/// in the same order and cannot diverge.
+///
+/// The consequence is that a wrong factor of two on either side does not merely
+/// shift a mean, it desynchronizes the two chains within a sweep or two and the
+/// per-sample equality fails outright. Nothing here has a tolerance to hide in.
+#[test]
+fn the_cluster_update_reproduces_an_ising_run_at_two_states() {
+    const J: f64 = 1.0;
+    let shape = [16, 16];
+    let beta = 0.5; // ordered for Ising (beta_c ~ 0.4407), and so for Potts at 2J
+    let seed = 20260990;
+
+    let potts_toml = run_toml(shape, 2.0 * J, beta, seed, "swendsen_wang");
+    let potts_config = PottsRunConfig::parse(&potts_toml).expect("hand-written config is valid");
+    let mut potts = PottsSampler::<2, 2>::new(&potts_config);
+
+    let ising_toml = run_toml(shape, J, beta, seed, "swendsen_wang");
+    let ising_config = IsingRunConfig::parse(&ising_toml).expect("hand-written config is valid");
+    let mut ising = IsingSampler::<2>::new(&ising_config);
+
+    let lattice = potts.lattice();
+    let (potts_model, ising_model) = (potts.model(), ising.model());
+    let offset = -J * lattice.n_links() as f64;
+
+    let mut moved = false;
+    for (step, (from_potts, from_ising)) in potts
+        .samples()
+        .take(N_SAMPLES)
+        .zip(ising.samples().take(N_SAMPLES))
+        .enumerate()
+    {
+        assert_eq!(
+            from_potts, from_ising,
+            "the two cluster chains diverged at sample {step}, which means the \
+             two models disagreed about the bond probability"
+        );
+        assert_eq!(
+            potts_measure(&potts_model, &lattice, &from_potts).energy,
+            measure(&ising_model, &lattice, &from_ising).energy + offset,
+            "per-sample energy correspondence at sample {step}"
+        );
+        // A frozen pair of chains would satisfy every assertion above, so the
+        // run has to be seen to move: at this coupling the ordered phase still
+        // fluctuates, and a cluster sweep repaints a large fraction of the
+        // lattice each time.
+        moved |= from_potts != Configuration::<2>::cold(&lattice, Cell::Site);
+    }
+    assert!(
+        moved,
+        "the chains never left the all-one-label configuration"
     );
 }
 

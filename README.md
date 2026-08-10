@@ -21,8 +21,10 @@ cargo build
 | -------- | --------- | ------------------ | -------- |
 | Ising    | D ≥ 1     | Metropolis         | CPU      |
 | Ising    | D ≥ 1     | Site checkerboard  | CPU, GPU |
+| Ising    | D ≥ 1     | Swendsen–Wang      | CPU, GPU |
 | Potts    | D ≥ 1     | Metropolis         | CPU      |
 | Potts    | D ≥ 1     | Site checkerboard  | CPU, GPU |
+| Potts    | D ≥ 1     | Swendsen–Wang      | CPU, GPU |
 | Z2 gauge | D ≥ 2     | Metropolis         | CPU      |
 | Z2 gauge | D ≥ 2     | Link checkerboard  | CPU, GPU |
 
@@ -36,10 +38,12 @@ Refer to [`docs/`](docs/) for descriptions of used algorithms.
 A simulation generates near-independent snapshots of the system, measures
 observables on each, and averages those measurements into a result with an
 error bar. The snapshots come from evolving the system through sweeps of the
-lattice, and one sweep makes as many update attempts as the lattice has
-variables. Each attempt is accepted with a probability set by the energy change
-it would cause. Consecutive states are still strongly correlated, so snapshots
-are taken many sweeps apart, leaving each one close to independent of the last.
+lattice. A local update makes as many attempts per sweep as the lattice has
+variables, and accepts each one with a probability set by the energy change it
+would cause. A cluster update instead changes a whole connected region in one
+move and always accepts it. Consecutive states are still strongly correlated, so
+snapshots are taken many sweeps apart, leaving each one close to independent of
+the last.
 
 ### Objects
 

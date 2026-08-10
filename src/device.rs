@@ -91,7 +91,7 @@ const WORKGROUP_SIZE: u32 = 64;
 /// stays contiguous and the last row's leftover threads fall out on the
 /// kernel's own bounds check. The cap is a parameter so the arithmetic can be
 /// tested without a device.
-fn grid_for(per_axis: u32, threads: usize) -> (u32, u32) {
+pub(crate) fn grid_for(per_axis: u32, threads: usize) -> (u32, u32) {
     let total = (threads as u64).div_ceil(u64::from(WORKGROUP_SIZE)).max(1);
     let width = total.min(u64::from(per_axis));
     let height = total.div_ceil(width);
@@ -109,7 +109,7 @@ fn grid_for(per_axis: u32, threads: usize) -> (u32, u32) {
 /// and both are checked, since every buffer here is bound whole. `what` names
 /// the table, because a wgpu validation failure names only a byte count and a
 /// binding index, which a caller cannot turn back into a lattice.
-fn check_fits(device: &wgpu::Device, bytes: u64, what: &str) {
+pub(crate) fn check_fits(device: &wgpu::Device, bytes: u64, what: &str) {
     let limits = device.limits();
     let binding = u64::from(limits.max_storage_buffer_binding_size);
     let buffer = limits.max_buffer_size;
@@ -151,9 +151,11 @@ macro_rules! shader_source {
 pub(crate) use shader_source;
 
 /// Bytes of push constants a sweep dispatch carries: `(sweep, color)` as two
-/// `u32`, matching the `Push` struct both shaders declare. It is also the limit
-/// [`Gpu::new`] requests, so raising it means raising that too.
-const PUSH_CONSTANT_BYTES: u32 = 8;
+/// `u32`, matching the `Push` struct the checkerboard shaders declare. It is
+/// also the limit [`Gpu::new`] requests, so raising it means raising that too.
+/// The cluster kernels use only the first word and pad out the second, rather
+/// than asking the device for a second push-constant size.
+pub(crate) const PUSH_CONSTANT_BYTES: u32 = 8;
 
 /// Everything a model backend must decide before a sweep can run.
 pub(crate) struct SweepSetup<'a> {
@@ -219,7 +221,7 @@ pub(crate) struct DeviceSweeper<const Q: usize> {
     colors: u32,
     sweeps_between: usize,
     batch: usize,
-    /// Workgroups to launch, as a `(width, height)` grid — see `dispatch_grid`.
+    /// Workgroups to launch, as a `(width, height)` grid — see `grid_for`.
     dispatch: (u32, u32),
     /// Global sweep counter — the RNG key, so every sweep draws differently.
     sweeps_done: u32,

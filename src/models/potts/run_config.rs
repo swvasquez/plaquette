@@ -200,6 +200,12 @@ impl PottsRunConfig {
     /// says nothing about a label on a site. A schedule that colors in parallel
     /// additionally needs even extents.
     ///
+    /// A cluster schedule carries a rule of its own: it needs the label symmetry,
+    /// so a non-zero `h` is refused. That is the graceful counterpart of the
+    /// panic in [`SwendsenWang::for_model`](crate::updater::SwendsenWang::for_model),
+    /// the same pairing [`check_dimension`](PottsRunConfig::check_dimension) and
+    /// `shape_array` already use.
+    ///
     /// `thermalize` and `sweeps_between` may be zero — no warmup and no
     /// decorrelation gap are unusual but legitimate.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -226,6 +232,17 @@ impl PottsRunConfig {
             )));
         }
         check_updater(self.updater, Cell::Site, &self.shape)?;
+        // The load-time counterpart of `SwendsenWang::for_model`'s panic. A
+        // cluster move relabels a whole cluster at once, which is only
+        // weight-preserving when nothing distinguishes one label from another,
+        // and an offset is exactly what distinguishes them.
+        if self.updater.builds_clusters() && self.h.iter().any(|&h_a| h_a != 0.0) {
+            return Err(ConfigError::Invalid(format!(
+                "{:?} relabels whole clusters at once, which needs the label \
+                 symmetry a per-label offset breaks, but h{:?} is not all zero",
+                self.updater, self.h
+            )));
+        }
         if self.n_samples == 0 {
             return Err(ConfigError::Invalid(
                 "n_samples must be positive, or the run records nothing".to_string(),
@@ -472,6 +489,8 @@ mod tests {
             (UpdaterKind::Metropolis, "metropolis"),
             (UpdaterKind::SiteCheckerboard, "site_checkerboard"),
             (UpdaterKind::GpuSiteCheckerboard, "gpu_site_checkerboard"),
+            (UpdaterKind::SwendsenWang, "swendsen_wang"),
+            (UpdaterKind::GpuSwendsenWang, "gpu_swendsen_wang"),
         ] {
             let mut config = sample_config();
             config.updater = kind;
@@ -503,6 +522,49 @@ mod tests {
             config.validate().is_ok(),
             "an odd extent is fine on the CPU"
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_cluster_updater_with_offsets() {
+        // The load-time half of the pair `SwendsenWang::for_model` panics on: a
+        // per-label offset is exactly what makes relabeling a whole cluster
+        // change the energy, so the move would sample the wrong distribution
+        // rather than fail.
+        for kind in [UpdaterKind::SwendsenWang, UpdaterKind::GpuSwendsenWang] {
+            let mut config = sample_config();
+            config.updater = kind;
+            config.h = vec![0.1, 0.0, 0.0];
+            let message = invalid_message(&config);
+            assert!(message.contains("label symmetry"), "{message}");
+            assert!(message.contains(&format!("{kind:?}")), "{message}");
+
+            // Absent and all-zero both mean the symmetric model, and both run.
+            config.h = Vec::new();
+            assert!(config.validate().is_ok(), "{kind:?} with no offsets");
+            config.h = vec![0.0, 0.0, 0.0];
+            assert!(config.validate().is_ok(), "{kind:?} with zero offsets");
+        }
+    }
+
+    #[test]
+    fn a_cluster_updater_accepts_odd_extents_even_on_the_gpu() {
+        // The one place a reader is likely to expect `GpuSwendsenWang` to behave
+        // like `GpuSiteCheckerboard` and be wrong. The even-extent rule exists
+        // because an odd wrap puts two same-color neighbors in one parallel
+        // pass; a cluster update has no coloring to break, so any shape runs.
+        for kind in [UpdaterKind::SwendsenWang, UpdaterKind::GpuSwendsenWang] {
+            let mut config = sample_config();
+            config.updater = kind;
+            config.shape = vec![15, 15, 7];
+            assert!(config.validate().is_ok(), "{kind:?} on an odd lattice");
+        }
+
+        // The contrast, so this test would notice if the rule leaked the other
+        // way and stopped applying to the coloring that does need it.
+        let mut checkerboard = sample_config();
+        checkerboard.updater = UpdaterKind::GpuSiteCheckerboard;
+        checkerboard.shape = vec![15, 15, 7];
+        assert!(invalid_message(&checkerboard).contains("even extents"));
     }
 
     #[test]

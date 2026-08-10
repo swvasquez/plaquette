@@ -10,13 +10,19 @@
 //! symmetric, and why the checkerboard reorderings still sample the Boltzmann
 //! distribution — is derived in `docs/metropolis.md`.
 //!
+//! [`SwendsenWang`] is the one updater here that is not a Metropolis schedule at
+//! all. It builds its own set of variables stochastically, changes all of them
+//! at once, and is accepted with probability one, so it shares no kernel with
+//! the others — only the seam. `docs/swendsen-wang.md` derives it.
+//!
 //! The updater holds no chain state: the [`Configuration`] *is* the current
 //! state, mutated in place, and `β` is passed per call so one updater serves a
 //! whole temperature scan. It keeps no running energy either;
 //! [`sweep`](Updater::sweep) returns the net realized ΔE, and re-anchoring
 //! against a from-scratch [`Action::energy`] stays the driver's job.
 
-use crate::action::Action;
+use crate::action::{Action, BondAction};
+use crate::cluster;
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::rng::Rng;
@@ -209,13 +215,135 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for LinkCheckerboard {
     }
 }
 
+/// The Swendsen–Wang cluster update: bond neighbors that agree, then give each
+/// resulting cluster a fresh label.
+///
+/// Unlike the other updaters this one carries state — the model's bond gap, read
+/// once at construction — so it is built with [`for_model`](SwendsenWang::for_model)
+/// rather than named directly. Reading it once is what keeps [`Updater`] a
+/// uniform capability rather than a relation between an updater and an action:
+/// Swendsen–Wang's whole dependence on the model is two numbers that do not move
+/// over a run. See `docs/swendsen-wang.md` for the algorithm and for why the
+/// move is accepted unconditionally.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SwendsenWang {
+    /// The model's `E(disagree) − E(agree)` per bond, from
+    /// [`BondAction::bond_energy_gap`].
+    bond_gap: f64,
+}
+
+impl SwendsenWang {
+    /// Build a cluster updater for `model`, capturing its bond gap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model is not invariant under relabeling — a per-label
+    /// offset or an external field breaks the symmetry the cluster move relies
+    /// on, and the update would sample the wrong distribution rather than fail.
+    /// Panics too if the gap is negative or not finite: a negative gap makes the
+    /// bond probability negative, so no bond would ever open and the chain would
+    /// quietly sample the infinite-temperature model. Both are the loud
+    /// counterparts of load-time rules in the run configs. See
+    /// `docs/swendsen-wang.md`.
+    pub fn for_model<const Q: usize, M: BondAction<Q>>(model: &M) -> Self {
+        assert!(
+            model.relabel_invariant(),
+            "the cluster move relabels a whole cluster at once, which is only \
+             weight-preserving when the energy is invariant under relabeling; \
+             this model has a per-label offset or an external field set"
+        );
+        let bond_gap = model.bond_energy_gap();
+        assert!(
+            bond_gap.is_finite() && bond_gap >= 0.0,
+            "the bond probability 1 - exp(-beta * gap) needs a finite, \
+             non-negative gap, got {bond_gap}; an antiferromagnetic coupling is \
+             frustrated rather than merely inverted and needs a different \
+             construction"
+        );
+        SwendsenWang { bond_gap }
+    }
+
+    /// The probability `1 − exp(−β · gap)` that a bond between two *agreeing*
+    /// sites is opened at inverse temperature `beta`.
+    ///
+    /// Public because the device backend needs the same number and must not
+    /// arrive at it by its own arithmetic: a cluster chain that opened its bonds
+    /// at a different rate would sample a different model while looking
+    /// perfectly healthy. Going through here also means the device path inherits
+    /// the construction guards rather than restating them.
+    pub fn bond_probability(&self, beta: f64) -> f64 {
+        1.0 - (-beta * self.bond_gap).exp()
+    }
+}
+
+impl<const Q: usize, const D: usize> Updater<Q, D> for SwendsenWang {
+    /// One cluster decomposition of the whole lattice, then one fresh label per
+    /// cluster — a single move touching every site, not `n_vars` of them.
+    ///
+    /// The returned `ΔE` is a from-scratch difference rather than an
+    /// accumulation, since a cluster move does not price itself one site at a
+    /// time. That is two extra `O(D·V)` scans on top of a labeling pass that is
+    /// already `Θ(D·V)` — a constant factor, paid to keep the seam uniform.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config` is not a site field, or if `Q` is below two.
+    fn sweep(
+        &self,
+        config: &mut Configuration<Q>,
+        lattice: &Lattice<D>,
+        action: &impl Action<Q, D>,
+        beta: f64,
+        rng: &mut impl Rng,
+    ) -> f64 {
+        assert_eq!(
+            config.cell(),
+            Cell::Site,
+            "the cluster update bonds nearest-neighbor sites, so the \
+             configuration must be a site field"
+        );
+        assert!(
+            Q >= 2,
+            "the cluster update redraws a label among the Q states, which needs \
+             at least two"
+        );
+
+        let before = action.energy(lattice, config);
+        let p = self.bond_probability(beta);
+
+        // The short-circuit is part of the contract, not an optimization: a
+        // uniform is drawn only for a pair that *agrees*, so the position in the
+        // stream depends on the configuration. Drawing unconditionally would
+        // sample the same distribution and put every existing run on a different
+        // stream.
+        let clusters = cluster::site_clusters(lattice, |i, j| {
+            config.peek(i) == config.peek(j) && rng.next_f64() < p
+        });
+
+        // A *redraw*, not a flip: a cluster may come back on the label it had.
+        // At Q = 2 that differs from the textbook "flip each cluster with
+        // probability one half" only in bookkeeping, and both are correct.
+        let fresh: Vec<State<Q>> = (0..clusters.n_clusters())
+            .map(|_| State::new(rng.next_below(Q)).expect("next_below(Q) < Q"))
+            .collect();
+        for (site, &label) in clusters.labels().iter().enumerate() {
+            config.poke(site, fresh[label]);
+        }
+
+        action.energy(lattice, config) - before
+    }
+}
+
 /// A runtime choice among the built-in updaters, so an updater named in a config
 /// file can be selected without the caller committing to a type at compile time.
 ///
 /// Implements [`Updater`] by forwarding `sweep` to whichever updater it wraps.
 /// Its variants mirror [`UpdaterKind`](crate::config::UpdaterKind) — a closed
 /// set, which is what makes the choice recordable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// It is `PartialEq` but not `Eq`, because [`SwendsenWang`] carries a bond gap
+/// and floats have no total equality.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AnyUpdater {
     /// The random-site schedule, [`Metropolis`].
     Metropolis(Metropolis),
@@ -223,6 +351,8 @@ pub enum AnyUpdater {
     SiteCheckerboard(SiteCheckerboard),
     /// The link checkerboard schedule, [`LinkCheckerboard`].
     LinkCheckerboard(LinkCheckerboard),
+    /// The cluster update, [`SwendsenWang`].
+    SwendsenWang(SwendsenWang),
 }
 
 impl<const Q: usize, const D: usize> Updater<Q, D> for AnyUpdater {
@@ -238,6 +368,7 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for AnyUpdater {
             AnyUpdater::Metropolis(u) => u.sweep(config, lattice, action, beta, rng),
             AnyUpdater::SiteCheckerboard(u) => u.sweep(config, lattice, action, beta, rng),
             AnyUpdater::LinkCheckerboard(u) => u.sweep(config, lattice, action, beta, rng),
+            AnyUpdater::SwendsenWang(u) => u.sweep(config, lattice, action, beta, rng),
         }
     }
 }
@@ -720,6 +851,309 @@ mod tests {
         let net = LinkCheckerboard.sweep(&mut config, &lat, &action, 0.5, &mut rng);
 
         assert_eq!(net, action.energy(&lat, &config) - before);
+    }
+
+    /// A real generator with a tally of the draws taken through it — what a
+    /// [`ScriptedRng`] cannot be for the cluster update, whose draw *count*
+    /// depends on the configuration it is handed.
+    struct Counting<R> {
+        inner: R,
+        uniforms: usize,
+        below: usize,
+    }
+
+    impl<R: Rng> Counting<R> {
+        fn new(inner: R) -> Self {
+            Counting {
+                inner,
+                uniforms: 0,
+                below: 0,
+            }
+        }
+    }
+
+    impl<R: Rng> Rng for Counting<R> {
+        fn next_f64(&mut self) -> f64 {
+            self.uniforms += 1;
+            self.inner.next_f64()
+        }
+
+        fn next_below(&mut self, n: usize) -> usize {
+            self.below += 1;
+            self.inner.next_below(n)
+        }
+    }
+
+    /// A model whose energy is not invariant under relabeling is refused at
+    /// construction rather than sampled wrongly.
+    #[test]
+    #[should_panic(expected = "invariant under relabeling")]
+    fn the_cluster_update_refuses_a_potts_model_with_offsets() {
+        SwendsenWang::for_model(&Potts::<3>::new(1.0, [0.5, 0.0, 0.0]));
+    }
+
+    /// The same rule reached through the other implementor, whose symmetry is
+    /// broken by a field rather than by a per-label offset.
+    #[test]
+    #[should_panic(expected = "invariant under relabeling")]
+    fn the_cluster_update_refuses_an_ising_model_with_a_field() {
+        SwendsenWang::for_model(&Ising::new(1.0, 0.25));
+    }
+
+    /// An antiferromagnetic coupling is refused too. Nothing would fail on its
+    /// own: the bond probability would come out negative, no bond would open,
+    /// and the chain would sample the infinite-temperature model while reporting
+    /// the coupling it was given.
+    #[test]
+    #[should_panic(expected = "non-negative gap")]
+    fn the_cluster_update_refuses_an_antiferromagnetic_coupling() {
+        SwendsenWang::for_model(&Potts::<3>::symmetric(-1.0));
+    }
+
+    /// The two implementors' gaps differ by the factor of two their conventions
+    /// differ by, which is what makes a Potts run at `2J` and an Ising run at
+    /// `J` open their bonds with the same probability.
+    #[test]
+    fn the_two_conventions_give_the_same_bond_probability() {
+        let j = 0.75;
+        let potts = SwendsenWang::for_model(&Potts::<2>::symmetric(2.0 * j));
+        let ising = SwendsenWang::for_model(&Ising::new(j, 0.0));
+        assert_eq!(potts, ising);
+        assert_eq!(potts.bond_gap, 2.0 * j);
+    }
+
+    /// At `beta = 0` no bond opens, so every site is its own cluster and gets an
+    /// independent fresh label — the infinite-temperature limit, and the case
+    /// where the cluster update degenerates to resampling the whole lattice.
+    ///
+    /// The cluster count is read off the generator: one label draw per cluster.
+    #[test]
+    fn at_zero_beta_every_site_is_its_own_cluster() {
+        fn probe<const Q: usize, const D: usize>(shape: [usize; D]) {
+            let lat = Lattice::new(shape);
+            let action = Potts::<Q>::symmetric(1.0);
+            let updater = SwendsenWang::for_model(&action);
+            let mut config = Configuration::<Q>::cold(&lat, Cell::Site);
+            let mut rng = Counting::new(RandRng::seed_from_u64(4));
+
+            updater.sweep(&mut config, &lat, &action, 0.0, &mut rng);
+
+            assert_eq!(
+                rng.below,
+                lat.n_sites(),
+                "{shape:?} at Q = {Q}: one label draw per cluster, and at p = 0 \
+                 there are as many clusters as sites"
+            );
+            // A cold start agrees on every bond, so each of the `D * n_sites`
+            // bonds still costs its uniform even though none of them opens.
+            assert_eq!(rng.uniforms, D * lat.n_sites(), "{shape:?} at Q = {Q}");
+        }
+
+        probe::<2, 2>([4, 6]);
+        probe::<3, 2>([4, 6]);
+        probe::<4, 2>([4, 6]);
+        probe::<3, 3>([3, 4, 5]);
+    }
+
+    /// A uniform is drawn for an agreeing pair and for no other, which is what
+    /// fixes where a cluster run sits in the generator's stream.
+    ///
+    /// The short-circuit in `sweep` is a contract rather than an optimization.
+    /// Drawing unconditionally would sample exactly the same distribution — a
+    /// disagreeing bond cannot open whatever the draw says — but it would shift
+    /// every existing chain onto a different stream, so every recorded run would
+    /// stop reproducing while every test of the physics kept passing. Nothing
+    /// else here would notice, which is why the draw count is asserted against a
+    /// number counted independently.
+    #[test]
+    fn a_uniform_is_drawn_for_an_agreeing_pair_and_no_other() {
+        let lat = Lattice::new([4, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+        let updater = SwendsenWang::for_model(&action);
+
+        let mut setup = RandRng::seed_from_u64(20260811);
+        let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut setup);
+
+        // Count the agreeing bonds by the same forward-column walk, before the
+        // sweep touches the configuration.
+        let mut agreeing = 0usize;
+        for site in 0..lat.n_sites() {
+            for &partner in lat.site_neighbors(site).iter().step_by(2) {
+                agreeing += usize::from(config.peek(site) == config.peek(partner));
+            }
+        }
+        let bonds = 2 * lat.n_sites(); // D * n_sites
+        assert!(
+            agreeing > 0 && agreeing < bonds,
+            "the fixture must hold bonds of both kinds, got {agreeing} of {bonds}"
+        );
+
+        let mut rng = Counting::new(RandRng::seed_from_u64(1));
+        updater.sweep(&mut config, &lat, &action, 0.7, &mut rng);
+
+        assert_eq!(
+            rng.uniforms,
+            agreeing,
+            "a uniform per agreeing bond and none for the {} that disagree",
+            bonds - agreeing
+        );
+    }
+
+    /// One seed, one sweep, one answer — including through the data-dependent
+    /// path above, where how many draws are taken depends on the configuration.
+    #[test]
+    fn a_cluster_sweep_is_reproducible_from_its_seed() {
+        let lat = Lattice::new([6, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+        let updater = SwendsenWang::for_model(&action);
+
+        let run = |seed: u64| {
+            let mut setup = RandRng::seed_from_u64(5);
+            let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut setup);
+            let mut rng = RandRng::seed_from_u64(seed);
+            let mut net = 0.0;
+            for _ in 0..8 {
+                net += updater.sweep(&mut config, &lat, &action, 0.8, &mut rng);
+            }
+            (config, net)
+        };
+
+        assert_eq!(run(42), run(42));
+        assert_ne!(
+            run(42).0,
+            run(43).0,
+            "a different seed should give a different chain"
+        );
+    }
+
+    /// At very large `beta` every agreeing bond opens, so a uniform start comes
+    /// back as one cluster carrying one label everywhere.
+    ///
+    /// A uniform start is the point: at large `beta` a *disagreeing* bond never
+    /// opens whatever the coupling, so only a configuration that already agrees
+    /// everywhere collapses to a single cluster.
+    #[test]
+    fn at_large_beta_a_uniform_lattice_is_one_cluster() {
+        fn probe<const Q: usize, const D: usize>(shape: [usize; D]) {
+            let lat = Lattice::new(shape);
+            let action = Potts::<Q>::symmetric(1.0);
+            let updater = SwendsenWang::for_model(&action);
+            let mut config = Configuration::<Q>::cold(&lat, Cell::Site);
+            let mut rng = Counting::new(RandRng::seed_from_u64(9));
+
+            updater.sweep(&mut config, &lat, &action, 40.0, &mut rng);
+
+            assert_eq!(rng.below, 1, "{shape:?} at Q = {Q}: one cluster, one draw");
+            let first = config.peek(0);
+            assert!(
+                config.variables().iter().all(|&s| s == first),
+                "{shape:?} at Q = {Q}: one cluster must land on one label"
+            );
+        }
+
+        probe::<2, 2>([4, 6]);
+        probe::<3, 2>([4, 6]);
+        probe::<4, 2>([4, 6]);
+        probe::<3, 3>([3, 4, 5]);
+    }
+
+    /// The net `ΔE` a cluster sweep returns equals `H(after) − H(before)`, the
+    /// invariant every other updater is held to.
+    ///
+    /// Trivially true as written, since the sweep computes exactly that
+    /// difference — which is the point: a regression that stopped computing the
+    /// return value at all would show up here and nowhere else.
+    #[test]
+    fn the_cluster_sweep_net_delta_equals_the_energy_change() {
+        fn probe<const Q: usize, const D: usize>(shape: [usize; D]) {
+            let lat = Lattice::new(shape);
+            let action = Potts::<Q>::symmetric(1.0);
+            let updater = SwendsenWang::for_model(&action);
+            let mut rng = RandRng::seed_from_u64(20260810);
+            let mut config = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
+            let before = action.energy(&lat, &config);
+
+            let net = updater.sweep(&mut config, &lat, &action, 0.6, &mut rng);
+
+            assert_eq!(net, action.energy(&lat, &config) - before, "{shape:?}");
+            assert_ne!(net, 0.0, "{shape:?}: a hot lattice should move");
+        }
+
+        probe::<2, 2>([8, 8]);
+        probe::<3, 2>([8, 8]);
+        probe::<4, 2>([8, 8]);
+        probe::<3, 3>([4, 4, 4]);
+    }
+
+    /// The cluster update runs on an odd lattice, where no parallel coloring
+    /// could: there is no coloring to collide, only a graph to label.
+    #[test]
+    fn the_cluster_update_runs_on_odd_extents() {
+        let lat = Lattice::new([3, 5, 3]);
+        let action = Potts::<3>::symmetric(1.0);
+        let updater = SwendsenWang::for_model(&action);
+        let mut rng = RandRng::seed_from_u64(3);
+        let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
+        let before = action.energy(&lat, &config);
+
+        let net = updater.sweep(&mut config, &lat, &action, 0.5, &mut rng);
+
+        assert_eq!(net, action.energy(&lat, &config) - before);
+    }
+
+    /// The cluster update reaches the same distribution the single-site schedule
+    /// does, on a lattice small enough that the mean order parameter is a sharp
+    /// enough statistic to separate a wrong bond probability.
+    ///
+    /// A factor of two in the gap — the likeliest implementation error — moves
+    /// this well outside the window.
+    #[test]
+    fn the_cluster_update_matches_the_metropolis_distribution() {
+        fn mean_order(updater: &AnyUpdater, seed: u64) -> f64 {
+            let lat = Lattice::new([8, 8]);
+            let action = Potts::<3>::symmetric(1.0);
+            let mut rng = RandRng::seed_from_u64(seed);
+            let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
+            let mut chain =
+                crate::chain::Chain::new(&mut config, &lat, &action, updater, 1.1, &mut rng, 2);
+            chain.advance(200);
+            let n = 400;
+            chain
+                .take(n)
+                .map(|c| action.order_parameter(&c))
+                .sum::<f64>()
+                / n as f64
+        }
+
+        let action = Potts::<3>::symmetric(1.0);
+        let metropolis = mean_order(&AnyUpdater::Metropolis(Metropolis), 17);
+        let cluster = mean_order(
+            &AnyUpdater::SwendsenWang(SwendsenWang::for_model(&action)),
+            23,
+        );
+
+        assert!(
+            (metropolis - cluster).abs() < 0.04,
+            "mean order parameter: metropolis {metropolis}, swendsen-wang {cluster}"
+        );
+    }
+
+    /// A link field is rejected rather than silently misread as a lattice of
+    /// sites, the same guard the link schedule carries the other way round.
+    #[test]
+    #[should_panic(expected = "must be a site field")]
+    fn the_cluster_update_rejects_a_link_field() {
+        let lat = Lattice::new([4, 4]);
+        let action = Potts::<3>::symmetric(1.0);
+        let updater = SwendsenWang::for_model(&action);
+        let mut config = Configuration::<3>::cold(&lat, Cell::Link);
+        updater.sweep(
+            &mut config,
+            &lat,
+            &action,
+            1.0,
+            &mut RandRng::seed_from_u64(1),
+        );
     }
 
     /// A site field is rejected rather than silently misread as links.

@@ -392,9 +392,15 @@ mod tests {
     fn validate_rejects_the_site_updaters() {
         // The rule the Ising schema does not have: both site schedules are built
         // around a site field, so neither is a valid way to run this.
+        // The cluster kinds are refused by exactly the same rule and need no
+        // rule of their own: they name `Cell::Site` too, so `check_updater`
+        // stops them before anything asks whether a plaquette energy has a bond
+        // graph. (It does not — see the note on `Z2Gauge`.)
         for kind in [
             UpdaterKind::SiteCheckerboard,
             UpdaterKind::GpuSiteCheckerboard,
+            UpdaterKind::SwendsenWang,
+            UpdaterKind::GpuSwendsenWang,
         ] {
             let mut config = sample_config();
             config.updater = kind;

@@ -17,7 +17,7 @@ pub use run_config::PottsRunConfig;
 pub use sampler::{AnyPottsChain, PottsSampler};
 
 use super::axis_pair_sums;
-use crate::action::Action;
+use crate::action::{Action, BondAction};
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::observables::Correlator;
@@ -305,6 +305,18 @@ impl<const Q: usize, const D: usize> Action<Q, D> for Potts<Q> {
         let offset = self.h[proposed.index()] - self.h[current.index()];
 
         -self.j * change as f64 - offset
+    }
+}
+
+impl<const Q: usize> BondAction<Q> for Potts<Q> {
+    /// Breaking one agreeing bond costs `j`, since the delta convention scores
+    /// an agreeing bond `-j` and a disagreeing one zero.
+    fn bond_energy_gap(&self) -> f64 {
+        self.j
+    }
+
+    fn relabel_invariant(&self) -> bool {
+        self.is_symmetric()
     }
 }
 

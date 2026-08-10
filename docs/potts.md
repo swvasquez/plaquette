@@ -220,7 +220,7 @@ per site on the square lattice, where each site carries two forward bonds. At
 $q = 2$ this is checkable against Onsager independently: the exact critical Ising
 energy is $-\sqrt2 J_I$ per site, and pushing it through the constant offset
 between the two models lands on exactly $-J(1 + 1/\sqrt2)$. This is what
-`the_critical_energy_matches_the_exact_duality_value` asserts, and it is the
+`the_critical_energy_sits_just_below_the_exact_duality_value` asserts, and it is the
 Potts counterpart of the exact area law the gauge suite is checked against.
 
 Reading it accurately is harder than stating it, and the two obstacles push
@@ -291,19 +291,26 @@ the endpoints should not be read as though they were Ising's.
 
 ## Cluster updates
 
-The algorithms Potts is best known for are not implemented. Swendsen–Wang and
-Wolff build a cluster of like-labelled sites by opening each agreeing bond with
-probability $1 - e^{-\beta J}$ and then relabel the whole cluster at once, which
-near criticality moves the configuration much further per sweep than any
-single-site scheme can — the correlation time grows far more slowly with the
-lattice size, where local Metropolis suffers the full critical slowing down.
+The algorithm Potts is best known for is Swendsen–Wang, and it is what the model
+should be run with anywhere near the transition. It opens each agreeing bond
+with probability $1 - e^{-\beta J}$, labels the connected clusters those open
+bonds make, and gives each cluster a freshly drawn label — a move that changes
+an unbounded number of sites at once and is accepted with probability one.
+`docs/swendsen-wang.md` derives it, and everything below is a pointer into that
+file rather than a second account of it.
 
-They are absent because they are a different *shape* of move rather than a
-different schedule for the same one. Everything here — `Metropolis`,
-`SiteCheckerboard`, and the GPU kernel alike — is built from a single-variable
-propose-and-accept step over a set of variables chosen in some order, whereas a
-cluster move constructs its own set stochastically, changes an unbounded number
-of variables at once, and is accepted with probability one. That is a question
-about what the `Updater` seam should be, not an addition behind the one that
-exists, and it is worth answering when a second cluster algorithm is on the table
-rather than guessed at from the first.
+Which updater to reach for follows from where the run sits. Away from the
+transition a local update decorrelates in a sweep or two and there is nothing to
+escape, so `metropolis` or `site_checkerboard` is the simpler choice and the GPU
+checkerboard is the fastest of the three on a large box. Close to $\beta_c$ the
+comparison inverts entirely: the local correlation time grows as $L^2$ and the
+cluster one as roughly $L^{1/2}$, so by the sizes at which a critical
+measurement is worth making, the local updates are not slower but unusable. The
+critical-energy test in `tests/potts_e2e.rs` documents that trade in detail from
+the local side, and it is exactly what a cluster run removes.
+
+The cluster kinds carry one restriction the local ones do not: they need the
+relabelling symmetry, so a run with a non-zero $h$ is refused rather than
+approximated. The offsets and the cluster update are alternatives, not options
+to combine — see `docs/swendsen-wang.md` for what the repair would be and why it
+is not built.

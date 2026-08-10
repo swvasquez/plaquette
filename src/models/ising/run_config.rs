@@ -152,6 +152,9 @@ impl IsingRunConfig {
     /// [`Cell::Site`]: this model's variables live on sites, so it takes the
     /// grade-neutral Metropolis or a site schedule and refuses a link one, and a
     /// schedule that colors in parallel additionally needs even extents.
+    ///
+    /// One rule on top of those is this schema's own: a cluster schedule needs
+    /// the spin-flip symmetry a field breaks, so a non-zero `h` is refused.
     pub fn validate(&self) -> Result<(), ConfigError> {
         check_shape(&self.shape, MIN_DIMENSION, "nearest-neighbor bonds")?;
         // `is_finite` first, so the comparison below is NaN-free.
@@ -174,6 +177,17 @@ impl IsingRunConfig {
             )));
         }
         check_updater(self.updater, Cell::Site, &self.shape)?;
+        // A cluster move relabels a whole cluster at once, which is only
+        // weight-preserving when the two spin values are interchangeable — and a
+        // field is exactly what tells them apart. The graceful counterpart of
+        // `SwendsenWang::for_model`'s panic.
+        if self.updater.builds_clusters() && self.h != 0.0 {
+            return Err(ConfigError::Invalid(format!(
+                "{:?} relabels whole clusters at once, which needs the spin-flip \
+                 symmetry an external field breaks, but h is {}",
+                self.updater, self.h
+            )));
+        }
         if self.n_samples == 0 {
             return Err(ConfigError::Invalid(
                 "n_samples must be positive, or the run records nothing".to_string(),
@@ -329,6 +343,66 @@ mod tests {
             IsingRunConfig::parse(&text).unwrap().updater,
             UpdaterKind::GpuSiteCheckerboard
         );
+    }
+
+    #[test]
+    fn parses_and_round_trips_the_cluster_updater() {
+        let mut config = sample_config();
+        config.updater = UpdaterKind::SwendsenWang;
+
+        let text = config.to_toml().unwrap();
+        assert!(text.contains(r#"updater = "swendsen_wang""#));
+        assert_eq!(
+            IsingRunConfig::parse(&text).unwrap().updater,
+            UpdaterKind::SwendsenWang
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_cluster_updater_with_a_field() {
+        // A field tells the two spin values apart, which is exactly the symmetry
+        // flipping a whole cluster at once relies on. The load-time counterpart
+        // of `SwendsenWang::for_model`'s panic.
+        for kind in [UpdaterKind::SwendsenWang, UpdaterKind::GpuSwendsenWang] {
+            let mut config = sample_config();
+            config.updater = kind;
+            config.h = 0.25;
+            let message = invalid_message(&config);
+            assert!(
+                message.contains("spin-flip symmetry"),
+                "{kind:?}: {message}"
+            );
+
+            config.h = 0.0;
+            assert!(config.validate().is_ok(), "{kind:?}: field-free is fine");
+        }
+    }
+
+    #[test]
+    fn parses_and_round_trips_the_gpu_cluster_updater() {
+        // The device cluster chain names no model, so this schema accepts the
+        // kind rather than refusing it for want of a backend.
+        let mut config = sample_config();
+        config.updater = UpdaterKind::GpuSwendsenWang;
+
+        let text = config.to_toml().unwrap();
+        assert!(text.contains(r#"updater = "gpu_swendsen_wang""#));
+        assert_eq!(
+            IsingRunConfig::parse(&text).unwrap().updater,
+            UpdaterKind::GpuSwendsenWang
+        );
+    }
+
+    #[test]
+    fn validate_accepts_an_odd_extent_for_a_cluster_kind() {
+        // A cluster update has no coloring for the periodic wrap to spoil, so
+        // unlike the GPU checkerboard it runs on any shape.
+        for kind in [UpdaterKind::SwendsenWang, UpdaterKind::GpuSwendsenWang] {
+            let mut config = sample_config();
+            config.updater = kind;
+            config.shape = vec![9, 7];
+            assert!(config.validate().is_ok(), "{kind:?} on an odd lattice");
+        }
     }
 
     #[test]

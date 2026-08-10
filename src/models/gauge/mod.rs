@@ -48,6 +48,14 @@ use crate::state::State;
 /// exactly twice and the two flips cancel; a term `-h * sum_l σ_l` reading
 /// individual links would notice that flip and destroy the local symmetry that
 /// makes this a gauge theory.
+///
+/// For the same structural reason there is no
+/// [`BondAction`](crate::action::BondAction) impl, and its absence is a
+/// statement rather than an omission: that trait describes an energy summed over
+/// nearest-neighbor *pairs*, which is what lets a cluster algorithm turn the
+/// lattice into a graph and open one bond at a time. A product over four links
+/// at once has no pairwise graph to build, so the Fortuin–Kasteleyn construction
+/// does not apply here at all. See `docs/swendsen-wang.md`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Z2Gauge {
     /// Plaquette coupling `J`.

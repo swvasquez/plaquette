@@ -136,6 +136,13 @@ symmetric — every other label is offered with probability $1/(q-1)$ from any
 label — which is the condition the acceptance rule needs to drop the proposal
 probabilities above, and it reduces to the flip at $q = 2$.
 
+One thing the coloring does not carry is the cluster update. A checkerboard is a
+device for making single-site moves independent of one another, and a cluster
+move has no single-site moves to separate — its whole point is that the sites it
+changes are chosen together, precisely because they interact. So there is no
+checkerboard variant of Swendsen–Wang, and the parallelism a device run gets
+from it comes from somewhere else entirely; `docs/swendsen-wang.md` says where.
+
 ## Checkerboard on links
 
 A gauge model poses the same problem and needs a different coloring. Its variables

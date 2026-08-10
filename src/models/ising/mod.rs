@@ -19,7 +19,7 @@ pub use run_config::IsingRunConfig;
 pub use sampler::{AnyIsingChain, IsingSampler};
 
 use super::{axis_pair_sums, decode};
-use crate::action::Action;
+use crate::action::{Action, BondAction};
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
 use crate::observables::Correlator;
@@ -140,6 +140,21 @@ impl<const D: usize> Action<2, D> for Ising {
             .sum();
 
         -(ds as f64) * (self.j * neighbor_sum as f64 + self.h)
+    }
+}
+
+impl BondAction<2> for Ising {
+    /// Twice the coupling, not the coupling: a `±1` bond scores `-j` aligned and
+    /// `+j` anti-aligned, so breaking it costs `2j` where the Potts delta
+    /// convention costs `j`. Same physics, different bookkeeping — see
+    /// `docs/swendsen-wang.md`, since this factor of two is the likeliest place
+    /// for a cluster implementation to go quietly wrong.
+    fn bond_energy_gap(&self) -> f64 {
+        2.0 * self.j
+    }
+
+    fn relabel_invariant(&self) -> bool {
+        self.h == 0.0
     }
 }
 

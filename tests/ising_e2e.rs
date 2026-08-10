@@ -153,37 +153,92 @@ fn gpu_checkerboard_orders_at_low_temperature() {
 /// returns one row per axis, so at `D = 1` there is a single row, and a chain
 /// with `2 * D = 2` neighbors per site is the narrowest neighbor table the
 /// updaters ever walk.
+///
+/// Both the local and the cluster update are held to the same closed form, and
+/// for the cluster one this is the whole of its validation on this model. What
+/// it catches is the bond gap. Ising's `±1` convention makes a broken bond cost
+/// `2J` where Potts's delta convention makes it cost `J`, so the bond
+/// probability is `1 - exp(-2 beta J)` here — and a chain run at the other one
+/// would sample a perfectly healthy Ising model at *half* the coupling. At
+/// `beta = 0.4` that moves `t` from `0.380` to `0.197` and the near-neighbor
+/// correlator by nearly a fifth, which is an order of magnitude outside the
+/// tolerance below. One dimension is also where a cluster update is at its most
+/// exposed: with two neighbors per site a cluster is an interval, so the bond
+/// probability sets its length distribution directly rather than through a
+/// percolation threshold.
 #[test]
 fn one_dimensional_correlator_matches_the_exact_solution() {
     const N: usize = 16;
     const BETA: f64 = 0.4;
     const SAMPLES: usize = 4000;
 
-    let text = run_toml([N], BETA, "metropolis", SAMPLES);
-    let config = IsingRunConfig::parse(&text).expect("run config should parse");
-    let mut sampler = IsingSampler::<1>::new(&config);
-    let (lattice, model) = (sampler.lattice(), sampler.model());
+    for updater in ["metropolis", "swendsen_wang"] {
+        let text = run_toml([N], BETA, updater, SAMPLES);
+        let config = IsingRunConfig::parse(&text).expect("run config should parse");
+        let mut sampler = IsingSampler::<1>::new(&config);
+        let (lattice, model) = (sampler.lattice(), sampler.model());
 
-    // Accumulate the per-config correlator along the one axis there is.
-    let mut sums = [0.0f64; N / 2 + 1];
-    for c in sampler.samples().take(SAMPLES) {
-        for (slot, value) in sums
-            .iter_mut()
-            .zip(&correlator(&model, &lattice, &c).per_axis[0])
-        {
-            *slot += value;
+        // Accumulate the per-config correlator along the one axis there is.
+        let mut sums = [0.0f64; N / 2 + 1];
+        for c in sampler.samples().take(SAMPLES) {
+            for (slot, value) in sums
+                .iter_mut()
+                .zip(&correlator(&model, &lattice, &c).per_axis[0])
+            {
+                *slot += value;
+            }
+        }
+
+        let t = (BETA * config.j).tanh();
+        for (r, &sum) in sums.iter().enumerate() {
+            let measured = sum / SAMPLES as f64;
+            let exact = (t.powi(r as i32) + t.powi((N - r) as i32)) / (1.0 + t.powi(N as i32));
+            assert!(
+                (measured - exact).abs() < 0.02,
+                "{updater}: C_{r} measured {measured:.4} vs exact {exact:.4}"
+            );
         }
     }
+}
 
-    let t = (BETA * config.j).tanh();
-    for (r, &sum) in sums.iter().enumerate() {
-        let measured = sum / SAMPLES as f64;
-        let exact = (t.powi(r as i32) + t.powi((N - r) as i32)) / (1.0 + t.powi(N as i32));
-        assert!(
-            (measured - exact).abs() < 0.02,
-            "C_{r}: measured {measured:.4} vs exact {exact:.4}"
-        );
+/// The cluster update agrees with the local one on both the CPU and the GPU.
+///
+/// `beta = 0.5` sits just inside the ordered phase, where `|m|` is about 0.91 and
+/// still moving — which is what makes this decisive about the bond gap. Ising
+/// scores a broken bond at twice what the Potts delta convention charges, and a
+/// cluster run that used the wrong one would sample at an effective coupling of
+/// half or double this. Half lands at `beta = 0.25`, well into the disordered
+/// phase; double lands at `beta = 1.0`, where `|m|` is pinned near one. Either
+/// misses the window below by more than ten times its width.
+///
+/// The GPU arm also says the device cluster chain is genuinely model-free. It is
+/// the same `GpuClusterChain` the Potts runs use, reaching this model through
+/// `BondAction` alone, so what is being checked here is that the seam carries the
+/// right number rather than that a second kernel was written correctly.
+#[test]
+fn the_cluster_update_agrees_with_metropolis() {
+    let shape = [16, 16];
+    let beta = 0.5;
+
+    let metropolis = mean_abs_magnetization(shape, beta, "metropolis");
+    let cluster = mean_abs_magnetization(shape, beta, "swendsen_wang");
+    assert!(
+        (0.7..0.99).contains(&metropolis),
+        "the reference should be ordered without saturating: {metropolis:.4}"
+    );
+    assert!(
+        (metropolis - cluster).abs() < 0.05,
+        "cluster disagrees on the CPU: metropolis {metropolis:.4} vs cluster {cluster:.4}"
+    );
+
+    if !gpu_available() {
+        return;
     }
+    let gpu = mean_abs_magnetization(shape, beta, "gpu_swendsen_wang");
+    assert!(
+        (metropolis - gpu).abs() < 0.05,
+        "cluster disagrees on the GPU: metropolis {metropolis:.4} vs gpu {gpu:.4}"
+    );
 }
 
 /// Three dimensions: the same ordering contrast the two-dimensional tests make,

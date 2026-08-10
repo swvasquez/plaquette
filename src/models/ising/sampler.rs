@@ -29,12 +29,13 @@ use crate::chain::Chain;
 use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
 use crate::device::{GPU_BATCH, Gpu};
+use crate::gpu_cluster::GpuClusterChain;
 use crate::lattice::Lattice;
 use crate::models::ising::Ising;
 use crate::models::ising::gpu::GpuIsingChain;
 use crate::models::ising::run_config::IsingRunConfig;
 use crate::rng::RandRng;
-use crate::updater::{AnyUpdater, Metropolis, SiteCheckerboard};
+use crate::updater::{AnyUpdater, Metropolis, SiteCheckerboard, SwendsenWang};
 
 /// The evolving state an [`IsingSampler`] streams from, one variant per backend.
 ///
@@ -51,6 +52,14 @@ enum Engine {
     /// Boxed because the device chain is far larger than the CPU variant, and an
     /// enum is sized by its largest one.
     Gpu(Box<GpuIsingChain>),
+    /// The device cluster chain, boxed for the same reason. A separate variant
+    /// rather than a mode of `Gpu`, because the two device backends are separate
+    /// types — one drives a fixed number of dispatches per sweep and the other
+    /// iterates until its labeling converges. It is not an Ising type: the
+    /// cluster move is a uniform redraw whatever the states mean, so one chain
+    /// serves every model implementing
+    /// [`BondAction`](crate::action::BondAction).
+    GpuCluster(Box<GpuClusterChain<2>>),
 }
 
 /// A stream of thermalized [`Configuration`]s, over either backend.
@@ -69,6 +78,8 @@ pub enum AnyIsingChain<'a, const D: usize> {
     Cpu(Chain<'a, 2, D, Ising, AnyUpdater, RandRng>),
     /// A mutable borrow of the sampler's persistent device chain.
     Gpu(&'a mut GpuIsingChain),
+    /// A mutable borrow of the sampler's persistent device *cluster* chain.
+    GpuCluster(&'a mut GpuClusterChain<2>),
 }
 
 impl<const D: usize> Iterator for AnyIsingChain<'_, D> {
@@ -78,6 +89,7 @@ impl<const D: usize> Iterator for AnyIsingChain<'_, D> {
         match self {
             AnyIsingChain::Cpu(chain) => chain.next(),
             AnyIsingChain::Gpu(chain) => chain.next(),
+            AnyIsingChain::GpuCluster(chain) => chain.next(),
         }
     }
 }
@@ -119,40 +131,54 @@ impl<const D: usize> IsingSampler<D> {
         let (lattice, model, mut rng, mut state, beta) = config.build::<D>();
         let sweeps_between = config.sweeps_between;
 
-        let engine = if let UpdaterKind::GpuSiteCheckerboard = config.updater {
-            let gpu = Gpu::new().expect("GPU backend requested but no GPU adapter is available");
-            let mut chain = GpuIsingChain::new(
-                gpu,
-                &lattice,
-                config.j,
-                config.h,
-                beta,
-                config.seed,
-                &state,
-                sweeps_between,
-                GPU_BATCH,
-            );
-            chain.advance(config.thermalize);
-            Engine::Gpu(Box::new(chain))
-        } else {
-            let updater = match config.updater {
-                UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
-                UpdaterKind::SiteCheckerboard => AnyUpdater::SiteCheckerboard(SiteCheckerboard),
-                UpdaterKind::LinkCheckerboard => {
-                    unreachable!("rejected by IsingRunConfig::validate")
+        // A `match` over the device kinds rather than a chain of `if let`s: there
+        // are two of them now, and they build different types.
+        let engine = match config.updater {
+            UpdaterKind::GpuSiteCheckerboard => {
+                let mut chain = GpuIsingChain::new(
+                    require_adapter(),
+                    &lattice,
+                    config.j,
+                    config.h,
+                    beta,
+                    config.seed,
+                    &state,
+                    sweeps_between,
+                    GPU_BATCH,
+                );
+                chain.advance(config.thermalize);
+                Engine::Gpu(Box::new(chain))
+            }
+            UpdaterKind::GpuSwendsenWang => {
+                let mut chain = GpuClusterChain::new(
+                    require_adapter(),
+                    &lattice,
+                    &model,
+                    beta,
+                    config.seed,
+                    &state,
+                    sweeps_between,
+                );
+                chain.advance(config.thermalize);
+                Engine::GpuCluster(Box::new(chain))
+            }
+            on_cpu => {
+                let updater = match on_cpu {
+                    UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
+                    UpdaterKind::SiteCheckerboard => AnyUpdater::SiteCheckerboard(SiteCheckerboard),
+                    UpdaterKind::SwendsenWang => {
+                        AnyUpdater::SwendsenWang(SwendsenWang::for_model(&model))
+                    }
+                    other => unreachable!("rejected by IsingRunConfig::validate: {other:?}"),
+                };
+                // Warm up a transient chain over the loose pieces, then stow them.
+                Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
+                    .advance(config.thermalize);
+                Engine::Cpu {
+                    rng,
+                    updater,
+                    state,
                 }
-                UpdaterKind::GpuSiteCheckerboard => unreachable!("handled by the outer branch"),
-                UpdaterKind::GpuLinkCheckerboard => {
-                    unreachable!("rejected by IsingRunConfig::validate")
-                }
-            };
-            // Warm up a transient chain over the loose pieces, then stow them.
-            Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
-                .advance(config.thermalize);
-            Engine::Cpu {
-                rng,
-                updater,
-                state,
             }
         };
 
@@ -217,8 +243,17 @@ impl<const D: usize> IsingSampler<D> {
                 *sweeps_between,
             )),
             Engine::Gpu(chain) => AnyIsingChain::Gpu(chain.as_mut()),
+            Engine::GpuCluster(chain) => AnyIsingChain::GpuCluster(chain.as_mut()),
         }
     }
+}
+
+/// A device for a run whose config asked for one, or a panic saying so.
+///
+/// Shared by the two device branches above so the message a user without an
+/// adapter sees does not depend on which backend they named.
+fn require_adapter() -> Gpu {
+    Gpu::new().expect("GPU backend requested but no GPU adapter is available")
 }
 
 #[cfg(test)]
@@ -265,6 +300,43 @@ mod tests {
 
         assert_eq!(configs.len(), 5);
         assert!(configs.iter().all(|c| c.n_vars() == 64));
+    }
+
+    /// A cluster-configured run streams too. This model has the CPU cluster
+    /// update and no device counterpart, which is what keeps `BondAction` a seam
+    /// with two real consumers rather than a trait shaped by one model.
+    #[test]
+    fn streams_with_the_cluster_updater() {
+        let mut run = config();
+        run.updater = UpdaterKind::SwendsenWang;
+
+        let mut sampler = IsingSampler::<2>::new(&run);
+        let configs: Vec<_> = sampler.samples().take(5).collect();
+
+        assert_eq!(configs.len(), 5);
+        assert!(configs.iter().all(|c| c.n_vars() == 64));
+    }
+
+    /// The device cluster backend streams through the same interface, on an odd
+    /// lattice no other GPU kind here can run.
+    ///
+    /// The chain it builds is the shared `GpuClusterChain`, not an Ising type:
+    /// the cluster move is a uniform redraw over the states whatever they mean,
+    /// so nothing about the device path needed writing twice.
+    #[test]
+    fn streams_with_the_gpu_cluster_updater() {
+        if crate::device::require_gpu().is_none() {
+            return;
+        }
+        let mut run = config();
+        run.updater = UpdaterKind::GpuSwendsenWang;
+        run.shape = vec![9, 7];
+
+        let mut sampler = IsingSampler::<2>::new(&run);
+        let configs: Vec<_> = sampler.samples().take(5).collect();
+
+        assert_eq!(configs.len(), 5);
+        assert!(configs.iter().all(|c| c.n_vars() == 63));
     }
 
     /// A GPU-configured run streams through the same interface. Skips when no GPU

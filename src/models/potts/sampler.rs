@@ -12,10 +12,12 @@
 //! the CPU chain and the GPU chain, and the sampler holds whichever the config
 //! asked for. [`samples`](PottsSampler::samples) returns an [`AnyPottsChain`]
 //! over it — a thin front yielding [`Configuration`]s the same way regardless of
-//! backend, so a consumer's loop never names CPU or GPU. The three schedules on
-//! offer are the ones that update sites, the same set the Ising side takes;
-//! [`PottsRunConfig::validate`] rejects the link schedules, whose
-//! direction-and-parity coloring says nothing about a label on a site.
+//! backend, so a consumer's loop never names CPU or GPU. What is on offer is
+//! every kind that updates sites — the three Metropolis schedules and the two
+//! cluster ones; [`PottsRunConfig::validate`] rejects the link schedules, whose
+//! direction-and-parity coloring says nothing about a label on a site, and
+//! rejects a cluster kind on a model whose per-label offsets break the
+//! relabeling symmetry it rests on.
 //!
 //! It streams and keeps no history: the consumer decides what to retain. Because
 //! the warmed-up state stays here, `samples` can be called again to draw more
@@ -48,12 +50,13 @@ use crate::chain::Chain;
 use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
 use crate::device::{GPU_BATCH, Gpu};
+use crate::gpu_cluster::GpuClusterChain;
 use crate::lattice::Lattice;
 use crate::models::potts::Potts;
 use crate::models::potts::gpu::GpuPottsChain;
 use crate::models::potts::run_config::PottsRunConfig;
 use crate::rng::RandRng;
-use crate::updater::{AnyUpdater, Metropolis, SiteCheckerboard};
+use crate::updater::{AnyUpdater, Metropolis, SiteCheckerboard, SwendsenWang};
 
 /// The evolving state a [`PottsSampler`] streams from, one variant per backend.
 ///
@@ -70,6 +73,11 @@ enum Engine<const Q: usize> {
     /// Boxed because the device chain is far larger than the CPU variant, and an
     /// enum is sized by its largest one.
     Gpu(Box<GpuPottsChain<Q>>),
+    /// The device cluster chain, boxed for the same reason. A separate variant
+    /// rather than a mode of `Gpu`, because the two device backends are separate
+    /// types — one drives a fixed number of dispatches per sweep and the other
+    /// iterates until its labeling converges.
+    GpuCluster(Box<GpuClusterChain<Q>>),
 }
 
 /// A stream of thermalized label [`Configuration`]s, over either backend.
@@ -89,6 +97,8 @@ pub enum AnyPottsChain<'a, const Q: usize, const D: usize> {
     Cpu(Chain<'a, Q, D, Potts<Q>, AnyUpdater, RandRng>),
     /// A mutable borrow of the sampler's persistent device chain.
     Gpu(&'a mut GpuPottsChain<Q>),
+    /// A mutable borrow of the sampler's persistent device *cluster* chain.
+    GpuCluster(&'a mut GpuClusterChain<Q>),
 }
 
 impl<const Q: usize, const D: usize> Iterator for AnyPottsChain<'_, Q, D> {
@@ -98,6 +108,7 @@ impl<const Q: usize, const D: usize> Iterator for AnyPottsChain<'_, Q, D> {
         match self {
             AnyPottsChain::Cpu(chain) => chain.next(),
             AnyPottsChain::Gpu(chain) => chain.next(),
+            AnyPottsChain::GpuCluster(chain) => chain.next(),
         }
     }
 }
@@ -142,33 +153,53 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
         let (lattice, model, mut rng, mut state, beta) = config.build::<Q, D>();
         let sweeps_between = config.sweeps_between;
 
-        let engine = if let UpdaterKind::GpuSiteCheckerboard = config.updater {
-            let gpu = Gpu::new().expect("GPU backend requested but no GPU adapter is available");
-            let mut chain = GpuPottsChain::new(
-                gpu,
-                &lattice,
-                &model,
-                beta,
-                config.seed,
-                &state,
-                sweeps_between,
-                GPU_BATCH,
-            );
-            chain.advance(config.thermalize);
-            Engine::Gpu(Box::new(chain))
-        } else {
-            let updater = match config.updater {
-                UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
-                UpdaterKind::SiteCheckerboard => AnyUpdater::SiteCheckerboard(SiteCheckerboard),
-                other => unreachable!("rejected by PottsRunConfig::validate: {other:?}"),
-            };
-            // Warm up a transient chain over the loose pieces, then stow them.
-            Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
-                .advance(config.thermalize);
-            Engine::Cpu {
-                rng,
-                updater,
-                state,
+        // A `match` over the device kinds rather than a chain of `if let`s: there
+        // are two of them now, and they build different types.
+        let engine = match config.updater {
+            UpdaterKind::GpuSiteCheckerboard => {
+                let mut chain = GpuPottsChain::new(
+                    require_adapter(),
+                    &lattice,
+                    &model,
+                    beta,
+                    config.seed,
+                    &state,
+                    sweeps_between,
+                    GPU_BATCH,
+                );
+                chain.advance(config.thermalize);
+                Engine::Gpu(Box::new(chain))
+            }
+            UpdaterKind::GpuSwendsenWang => {
+                let mut chain = GpuClusterChain::new(
+                    require_adapter(),
+                    &lattice,
+                    &model,
+                    beta,
+                    config.seed,
+                    &state,
+                    sweeps_between,
+                );
+                chain.advance(config.thermalize);
+                Engine::GpuCluster(Box::new(chain))
+            }
+            on_cpu => {
+                let updater = match on_cpu {
+                    UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
+                    UpdaterKind::SiteCheckerboard => AnyUpdater::SiteCheckerboard(SiteCheckerboard),
+                    UpdaterKind::SwendsenWang => {
+                        AnyUpdater::SwendsenWang(SwendsenWang::for_model(&model))
+                    }
+                    other => unreachable!("rejected by PottsRunConfig::validate: {other:?}"),
+                };
+                // Warm up a transient chain over the loose pieces, then stow them.
+                Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
+                    .advance(config.thermalize);
+                Engine::Cpu {
+                    rng,
+                    updater,
+                    state,
+                }
             }
         };
 
@@ -233,8 +264,17 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
                 *sweeps_between,
             )),
             Engine::Gpu(chain) => AnyPottsChain::Gpu(chain.as_mut()),
+            Engine::GpuCluster(chain) => AnyPottsChain::GpuCluster(chain.as_mut()),
         }
     }
+}
+
+/// A device for a run whose config asked for one, or a panic saying so.
+///
+/// Shared by the two device branches above so the message a user without an
+/// adapter sees does not depend on which backend they named.
+fn require_adapter() -> Gpu {
+    Gpu::new().expect("GPU backend requested but no GPU adapter is available")
 }
 
 #[cfg(test)]
@@ -302,6 +342,40 @@ mod tests {
 
         assert_eq!(configs.len(), 5);
         assert!(configs.iter().all(|c| c.n_vars() == 64));
+    }
+
+    /// A cluster-configured run streams too, over the same interface.
+    #[test]
+    fn streams_with_the_cluster_updater() {
+        let mut run = config();
+        run.updater = UpdaterKind::SwendsenWang;
+
+        let mut sampler = PottsSampler::<POTTS_Q, POTTS_D>::new(&run);
+        let configs: Vec<_> = sampler.samples().take(5).collect();
+
+        assert_eq!(configs.len(), 5);
+        assert!(configs.iter().all(|c| c.n_vars() == 64));
+        assert!(configs.iter().all(|c| c.cell() == Cell::Site));
+    }
+
+    /// The device cluster backend reaches the same interface, on an *odd*
+    /// lattice — which no other GPU kind can run, and which the sampler
+    /// therefore has to carry all the way through without an even-extent guard
+    /// firing somewhere in the middle.
+    #[test]
+    fn streams_with_the_gpu_cluster_updater() {
+        if crate::device::require_gpu().is_none() {
+            return;
+        }
+        let mut run = config();
+        run.updater = UpdaterKind::GpuSwendsenWang;
+        run.shape = vec![9, 7];
+
+        let mut sampler = PottsSampler::<POTTS_Q, POTTS_D>::new(&run);
+        let configs: Vec<_> = sampler.samples().take(5).collect();
+
+        assert_eq!(configs.len(), 5);
+        assert!(configs.iter().all(|c| c.n_vars() == 63));
     }
 
     /// The state count is the driver's alone, and it really does reach the

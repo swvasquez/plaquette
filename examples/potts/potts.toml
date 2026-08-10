@@ -26,14 +26,26 @@ beta = 1.0        # inverse temperature; beta_c = ln(1 + sqrt(q)) ~ 1.0050 at q 
 # differences between entries matter, so the usual choice offsets one label and
 # leaves the rest at zero. The list must be exactly `const Q` long, and that is
 # checked when the run is built rather than when the file is parsed, since
-# nothing here says what Q is.
+# nothing here says what Q is. An offset is refused by the cluster updaters
+# below, which need the label symmetry it breaks.
 #
 # h = [0.1, 0.0, 0.0]
 
 # Driver controls. The gap is wider than the Ising example's, because a local
 # update decorrelates slowly this close to a continuous transition — raise the
 # lattice size and the printed n_eff collapses, which is the critical slowing
-# down that cluster algorithms exist to escape (see docs/potts.md).
+# down cluster algorithms exist to escape (see docs/swendsen-wang.md).
+#
+# The alternatives to "metropolis" are "site_checkerboard" and
+# "gpu_site_checkerboard", which are the same physics under a different schedule,
+# and the two cluster kinds "swendsen_wang" and "gpu_swendsen_wang", which are a
+# different move: they relabel whole clusters at once and are the thing to reach
+# for near beta_c. Swap the line below for
+#
+#     updater = "swendsen_wang"
+#
+# and watch n_eff stop collapsing as the lattice grows. Cluster runs need the `h`
+# above left out, and unlike the checkerboards they run on odd extents.
 updater = "metropolis"  # update algorithm; optional, defaults to "metropolis"
 thermalize = 1000       # warmup sweeps, discarded
 sweeps_between = 10     # decorrelation sweeps between samples

@@ -84,6 +84,24 @@ pub enum UpdaterKind {
     /// the same reason as
     /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard).
     GpuLinkCheckerboard,
+    /// The Swendsen–Wang cluster update on the CPU
+    /// ([`SwendsenWang`](crate::updater::SwendsenWang)).
+    ///
+    /// It runs on any lattice shape, unlike the parallel kinds — see
+    /// [`colors_in_parallel`](UpdaterKind::colors_in_parallel) — and needs a
+    /// model whose energy is invariant under relabeling, which each schema
+    /// checks against its own field or offsets.
+    SwendsenWang,
+    /// The Swendsen–Wang cluster update run on the GPU
+    /// ([`GpuClusterChain`](crate::gpu_cluster::GpuClusterChain)), fused for the
+    /// same reason as
+    /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard).
+    ///
+    /// Unlike the checkerboard kinds this one names no model. A cluster move is a
+    /// uniform redraw over the states whatever the states mean, so one device
+    /// chain serves every model implementing
+    /// [`BondAction`](crate::action::BondAction).
+    GpuSwendsenWang,
 }
 
 impl UpdaterKind {
@@ -95,9 +113,27 @@ impl UpdaterKind {
     pub fn cell(self) -> Option<Cell> {
         match self {
             UpdaterKind::Metropolis => None,
-            UpdaterKind::SiteCheckerboard | UpdaterKind::GpuSiteCheckerboard => Some(Cell::Site),
+            UpdaterKind::SiteCheckerboard
+            | UpdaterKind::GpuSiteCheckerboard
+            | UpdaterKind::SwendsenWang
+            | UpdaterKind::GpuSwendsenWang => Some(Cell::Site),
             UpdaterKind::LinkCheckerboard | UpdaterKind::GpuLinkCheckerboard => Some(Cell::Link),
         }
+    }
+
+    /// Whether this kind builds clusters, and so needs a model whose energy is
+    /// invariant under relabeling.
+    ///
+    /// Asked by both site schemas, which then check their own symmetry-breaking
+    /// term — Ising's field, Potts's per-label offsets — since what breaks the
+    /// symmetry is the model's business and not this enum's. It is the load-time
+    /// counterpart of the panic in
+    /// [`SwendsenWang::for_model`](crate::updater::SwendsenWang::for_model).
+    pub fn builds_clusters(self) -> bool {
+        matches!(
+            self,
+            UpdaterKind::SwendsenWang | UpdaterKind::GpuSwendsenWang
+        )
     }
 
     /// Whether this kind colors in parallel, so its coloring must be
@@ -108,6 +144,14 @@ impl UpdaterKind {
     /// Both schemas ask this in `validate` so an odd shape fails at load rather
     /// than when the device chain is built; the device constructors assert it
     /// again, since they are reachable without a config.
+    ///
+    /// This is `false` for [`GpuSwendsenWang`](UpdaterKind::GpuSwendsenWang),
+    /// which is the one answer here a reader is likely to expect the other way
+    /// round. What the even extents protect is a *coloring*: an odd extent wraps
+    /// two same-color neighbors together, so a color stops being independent. A
+    /// cluster update has no coloring — it labels a graph, and the graph is
+    /// whatever the bonds make of it — so a device cluster run is correct on any
+    /// shape.
     pub fn colors_in_parallel(self) -> bool {
         matches!(
             self,

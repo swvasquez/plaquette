@@ -16,7 +16,15 @@
 //! depend only on the root.
 //!
 //! Three models run today, each by Metropolis or by a checkerboard sweep, and
-//! each checkerboard on either the CPU or the GPU. The two colorings differ
+//! each checkerboard on either the CPU or the GPU. The two spin models also run
+//! by the Swendsen–Wang cluster update, which is a different shape of move
+//! rather than another schedule for the same one: it builds its own set of sites
+//! stochastically, changes all of them at once, and is never rejected. Both run
+//! it on the CPU or the GPU, over one shared device chain that names no model.
+//! It is what to reach for near a continuous transition,
+//! where a local update stops decorrelating at all — see `docs/swendsen-wang.md`
+//! — and it is unavailable to the gauge model, whose plaquette energy has no
+//! pairwise bond graph to build clusters on. The two colorings differ
 //! because the variables do: the Ising and Potts models color a *site* by the
 //! parity of its coordinate sum, while the Z2 gauge model colors a *link* by its
 //! direction as well as its base site's parity, so that no two links updated
@@ -50,9 +58,11 @@
 
 pub mod action;
 pub mod chain;
+pub mod cluster;
 pub mod config;
 pub mod configuration;
 pub mod device;
+pub mod gpu_cluster;
 pub mod lattice;
 pub mod models;
 pub mod observables;
@@ -61,11 +71,13 @@ pub mod state;
 pub mod statistics;
 pub mod updater;
 
-pub use action::Action;
+pub use action::{Action, BondAction};
 pub use chain::Chain;
+pub use cluster::{SiteClusters, site_clusters};
 pub use config::{ConfigError, Start, UpdaterKind};
 pub use configuration::{Cell, Configuration};
 pub use device::Gpu;
+pub use gpu_cluster::GpuClusterChain;
 pub use lattice::{Lattice, Loop, Sign};
 pub use observables::Correlator;
 pub use rng::{RandRng, Rng};
@@ -74,4 +86,6 @@ pub use statistics::{
     Derived, Estimate, MIN_EFFECTIVE_SAMPLES, binder_cumulant, creutz_ratio, reduce, specific_heat,
     susceptibility,
 };
-pub use updater::{AnyUpdater, LinkCheckerboard, Metropolis, SiteCheckerboard, Updater};
+pub use updater::{
+    AnyUpdater, LinkCheckerboard, Metropolis, SiteCheckerboard, SwendsenWang, Updater,
+};
