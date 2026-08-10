@@ -1,18 +1,10 @@
-//! Config vocabulary: the pieces every run config is written in, whichever
-//! model it configures.
+//! Config vocabulary shared by the per-model run configs
+//! ([`IsingRunConfig`](crate::models::ising::run_config::IsingRunConfig) and
+//! [`GaugeRunConfig`](crate::models::gauge::run_config::GaugeRunConfig)): how a
+//! load can fail, where a chain starts, and which algorithm advances it.
 //!
-//! A run config is one struct per model —
-//! [`IsingRunConfig`](crate::models::ising::run_config::IsingRunConfig) and
-//! [`GaugeRunConfig`](crate::models::gauge::run_config::GaugeRunConfig) — because the two
-//! models take different
-//! parameters and a schema wide enough for both would carry a hole for whichever
-//! one is running. What they do share is the vocabulary those schemas are
-//! written in: how a load can fail, where a chain starts, and which algorithm
-//! advances it. Those live here so neither schema owns them and neither has to
-//! reach into the other's module to name them.
-//!
-//! Sharing stops at the vocabulary. The two schemas stay separate types with
-//! separate entry points, and a caller names the one it means.
+//! The schemas stay separate types — one wide enough for both would carry a
+//! hole for whichever model is running.
 
 use crate::configuration::Cell;
 use serde::{Deserialize, Serialize};
@@ -20,19 +12,12 @@ use serde::{Deserialize, Serialize};
 /// Check that a config's shape names `expected` axes, the dimension the driver
 /// was built for.
 ///
-/// The dimension is the one run parameter a file cannot decide on its own. Every
-/// layer of the library is generic over `D`, but `D` is a compile-time parameter
-/// and a file is read at runtime, so a driver names the dimension it is built for
-/// and this reports a file that disagrees. Naming it in the driver rather than
-/// dispatching on it at load is deliberate: a dispatch would have to instantiate
-/// the whole sampler stack once per dimension, and once a second parameter is
-/// generic — the state count `Q`, for a Potts or `U(1)` model — the set of
-/// instantiations to enumerate is a grid rather than a list. Fixing the point at
-/// compile time is also what the lattice-gauge codes do.
-///
-/// This is the graceful path, for a driver that wants to report a mismatch and
-/// exit. `build` panics on the same condition, as the backstop for a caller that
-/// skipped the check.
+/// `D` is a compile-time parameter and a file is read at runtime, so a driver
+/// names its dimension and this reports a file that disagrees; dispatching on
+/// the dimension at load would mean instantiating the whole sampler stack once
+/// per value, so the point is fixed at compile time as the lattice-gauge codes
+/// do. This is the graceful path — `build` panics on the same condition, as the
+/// backstop for a caller that skipped the check.
 pub fn check_dimension(shape: &[usize], expected: usize) -> Result<(), ConfigError> {
     if shape.len() != expected {
         return Err(ConfigError::Invalid(format!(
@@ -47,10 +32,8 @@ pub fn check_dimension(shape: &[usize], expected: usize) -> Result<(), ConfigErr
 /// A config's shape as the fixed-width array a [`Lattice`](crate::lattice::Lattice)
 /// needs, or a panic if it does not name `D` axes.
 ///
-/// The panicking counterpart of [`check_dimension`], for the point where a
-/// driver has already committed to a `D` and is building the run. Both schemas
-/// convert here rather than each spelling out the conversion, so the message a
-/// caller who skipped the check sees is written once.
+/// The panicking counterpart of [`check_dimension`], shared by both schemas so
+/// the message a caller who skipped the check sees is written once.
 pub(crate) fn shape_array<const D: usize>(shape: &[usize]) -> [usize; D] {
     <[usize; D]>::try_from(shape).unwrap_or_else(|_| {
         panic!(
@@ -73,49 +56,33 @@ pub enum Start {
     Hot,
 }
 
-/// Which update algorithm a run uses to advance the chain.
-///
-/// The *serializable choice of* an updater, not an updater itself — hence the
-/// name, which also avoids colliding with the
-/// [`Updater`](crate::updater::Updater) trait. Being a closed set is what makes
-/// it recordable, unlike an arbitrary caller-supplied implementation.
+/// Which update algorithm a run uses to advance the chain — the *serializable
+/// choice of* an [`Updater`](crate::updater::Updater), not an updater itself.
 ///
 /// The set is the union across models, not a promise that every model runs
-/// every entry: the two checkerboard schedules each name the grade they color,
-/// and a model accepts only the one matching its field. A gauge run rejects the
-/// site schedules and the GPU backend in
-/// [`validate`](crate::models::gauge::run_config::GaugeRunConfig::validate), and an Ising run
-/// rejects the link schedule in
-/// [`validate`](crate::models::ising::run_config::IsingRunConfig::validate), rather than each
-/// going through a separate, narrower enum. That keeps each rule where it can
-/// say what went wrong, and admitting a further schedule is a change to
-/// validation rather than a new type and a mapping between the two.
+/// every entry: each schema's `validate` rejects the kinds that color the wrong
+/// grade, rather than each model carrying a separate, narrower enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdaterKind {
     /// Single-variable-flip Metropolis on the CPU
     /// ([`Metropolis`](crate::updater::Metropolis)).
     Metropolis,
-    /// Single-spin-flip Metropolis under a site checkerboard schedule, on the
-    /// CPU ([`SiteCheckerboard`](crate::updater::SiteCheckerboard)); serializes
-    /// as `site_checkerboard`.
+    /// Metropolis under a site checkerboard schedule, on the CPU
+    /// ([`SiteCheckerboard`](crate::updater::SiteCheckerboard)).
     SiteCheckerboard,
-    /// Single-link-flip Metropolis under a link checkerboard schedule, on the
-    /// CPU ([`LinkCheckerboard`](crate::updater::LinkCheckerboard)); serializes
-    /// as `link_checkerboard`.
+    /// Metropolis under a link checkerboard schedule, on the CPU
+    /// ([`LinkCheckerboard`](crate::updater::LinkCheckerboard)).
     LinkCheckerboard,
     /// The site checkerboard schedule run on the GPU
-    /// ([`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain)); serializes as
-    /// `gpu_site_checkerboard`. Backend and schedule are one choice rather than
-    /// two, which keeps illegal combinations unrepresentable — there is no way
-    /// to name a GPU run without also naming the coloring its kernel is written
-    /// for.
+    /// ([`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain)). Backend
+    /// and schedule are one variant, so a GPU run cannot be named without the
+    /// coloring its kernel is written for.
     GpuSiteCheckerboard,
     /// The link checkerboard schedule run on the GPU
-    /// ([`GpuGaugeChain`](crate::models::gauge::gpu::GpuGaugeChain)); serializes as
-    /// `gpu_link_checkerboard`. The link counterpart of
-    /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard), and fused for
-    /// the same reason.
+    /// ([`GpuGaugeChain`](crate::models::gauge::gpu::GpuGaugeChain)), fused for
+    /// the same reason as
+    /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard).
     GpuLinkCheckerboard,
 }
 
@@ -123,31 +90,24 @@ impl UpdaterKind {
     /// Which lattice cell this kind's schedule colors, or `None` for a schedule
     /// that reads a bare variable index and so works on either grade.
     ///
-    /// This is the one fact behind both schemas' updater rule: a model accepts a
-    /// kind when the kind is grade-neutral or names the model's own grade.
-    /// Stating it once here — rather than as an allowlist on one side and a
-    /// denylist on the other — is what keeps the two from drifting when a kind
-    /// is added, since a new variant must answer this question to compile.
+    /// The one fact behind both schemas' updater rule, stated here so a new
+    /// variant must answer it to compile rather than the two rules drifting.
     pub fn cell(self) -> Option<Cell> {
         match self {
-            // Metropolis draws a uniform index and hands it to a grade-neutral
-            // `energy_delta`; nothing in it knows a site from a link.
             UpdaterKind::Metropolis => None,
             UpdaterKind::SiteCheckerboard | UpdaterKind::GpuSiteCheckerboard => Some(Cell::Site),
             UpdaterKind::LinkCheckerboard | UpdaterKind::GpuLinkCheckerboard => Some(Cell::Link),
         }
     }
 
-    /// Whether this kind colors in parallel, so that its coloring must be
-    /// collision-free *simultaneously* and every extent therefore has to be
-    /// even.
+    /// Whether this kind colors in parallel, so its coloring must be
+    /// collision-free *simultaneously* and every extent has to be even.
     ///
     /// The requirement follows from the pass running concurrently, not from the
     /// work happening on a device — a parallel CPU schedule would need it too.
-    /// Both config schemas ask this in `validate` so an odd shape is a load-time
-    /// error naming the axis, rather than a panic when the device chain is
-    /// built. The device constructors still assert it, since they are reachable
-    /// without a config at all.
+    /// Both schemas ask this in `validate` so an odd shape fails at load rather
+    /// than when the device chain is built; the device constructors assert it
+    /// again, since they are reachable without a config.
     pub fn colors_in_parallel(self) -> bool {
         matches!(
             self,
@@ -159,13 +119,10 @@ impl UpdaterKind {
 /// Check that `shape` describes a lattice this model can live on: at least
 /// `min_dimension` axes, each of positive extent.
 ///
-/// The dimension floor is the one thing the two schemas genuinely disagree
-/// about, and it follows from which cell the model's energy scores. Ising scores
-/// links, which exist in one dimension; the gauge action scores plaquettes,
-/// which need a pair of directions and so two. Below its bound a model does not
-/// fail loudly — the cell count goes to zero and the energy comes out
-/// identically zero — so the bound has to be stated rather than left to the
-/// arithmetic. `scores` names the cell for the message.
+/// The floor follows from which cell the model's energy scores (`scores` names
+/// it for the message): links need one dimension, plaquettes two. Below the
+/// bound nothing fails loudly — the cell count and energy come out identically
+/// zero — so the bound has to be stated rather than left to the arithmetic.
 pub(crate) fn check_shape(
     shape: &[usize],
     min_dimension: usize,
@@ -189,17 +146,13 @@ pub(crate) fn check_shape(
 /// Check that `updater` can advance a field on `cell` over a lattice of
 /// `shape`, or say what is wrong with the pairing.
 ///
-/// The two rules both schemas apply, in one place. First the grade: a schedule
-/// colors a particular kind of cell (see [`UpdaterKind::cell`]) and only a
-/// grade-neutral one or a matching one can run here — the site checkerboard's
-/// coordinate parity says nothing about a variable on a link, and a run under it
-/// would not be a slower version of the same physics, it would be wrong. Then
-/// the shape: a parallel color pass needs every extent even, because under
-/// periodic boundaries an odd extent wraps a variable onto a same-color one, so
-/// a color stops being collision-free and detailed balance breaks silently
-/// rather than loudly. See `docs/metropolis.md`. Sequential schedules have no
-/// such requirement, which is why the second rule asks about the updater and not
-/// about the shape alone.
+/// The two rules both schemas apply, in one place. The grade: only a
+/// grade-neutral schedule or one coloring `cell` itself can run here — a
+/// mismatched schedule would be wrong physics, not slower physics. The shape: a
+/// parallel color pass needs every extent even, or an odd extent wraps a
+/// variable onto a same-color one and detailed balance breaks silently; see
+/// `docs/metropolis.md`. Sequential schedules have no such requirement, which
+/// is why the second rule asks about the updater and not the shape alone.
 pub(crate) fn check_updater(
     updater: UpdaterKind,
     cell: Cell,

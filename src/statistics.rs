@@ -1,36 +1,21 @@
 //! Statistics: turn a measured *series* into estimates with honest error bars.
 //!
 //! This is the ensemble layer, the complement of
-//! [`observables`](crate::observables). An observable is a function of one
-//! configuration; everything here is a function of the whole series, so its
-//! input is always a slice of numbers the consumer already collected, never a
-//! configuration.
+//! [`observables`](crate::observables): everything here takes a slice of
+//! numbers the consumer already collected, never a configuration.
 //!
-//! There are two shapes. [`reduce`] is the *primary* reduction: every scalar
-//! series goes through the identical call and comes back as an [`Estimate`],
-//! whose `mean`, `stderr`, `tau_int`, and `n_eff` are facets of one
-//! automatic-windowing computation. The *derived* reduction is a blocked
-//! jackknife over per-block moment sums, returning a [`Derived`] that carries no
-//! `tau_int`/`n_eff` — a fluctuation is a function of moments, not of a time
-//! series, so an autocorrelation time is meaningless for it.
-//!
-//! The three fluctuation quantities ([`specific_heat`], [`susceptibility`],
-//! [`binder_cumulant`]) build their moment feature columns and hand them to
-//! `jackknife_features`, which forms each leave-one-block-out estimate as
-//! `total − block_b` in O(1) — moments are additive over blocks, so the whole
-//! jackknife is one O(N) pass rather than a re-scan per block. [`creutz_ratio`]
-//! is derived for the same reason without being a fluctuation: it is a nonlinear
-//! function of four separate ensemble means, so its error has to be propagated
-//! through that function rather than averaged, which is exactly what the
-//! jackknife does.
+//! [`reduce`] is the primary reduction, returning an [`Estimate`]; the derived
+//! reduction ([`specific_heat`], [`susceptibility`], [`binder_cumulant`],
+//! [`creutz_ratio`]) is a blocked jackknife returning a [`Derived`], which
+//! carries a block count in place of `tau_int`/`n_eff`. Why the two differ, and
+//! what makes an error bar trustworthy, are in `docs/statistics.md`.
 
-/// The reduction of one scalar series: a mean and its autocorrelation-corrected
-/// error, with the diagnostics that say whether that error can be trusted.
+/// The reduction of one scalar series: a mean, its autocorrelation-corrected
+/// error, and the diagnostics that say whether that error can be trusted.
 ///
-/// `tau_int` is the integrated autocorrelation time and `n_eff = N / (2·tau_int)`
-/// the effective sample count. A visible `n_eff` far below `N` is what tells a
-/// user their error bars are untrustworthy — so these travel *attached to every
-/// mean*, not as an opt-in extra.
+/// The diagnostics travel *attached to every mean*, not as an opt-in extra: an
+/// `n_eff` far below `N` is what tells a user their error bars are
+/// untrustworthy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Estimate {
     /// Sample mean of the series.
@@ -48,28 +33,24 @@ pub struct Estimate {
 /// [`Estimate`] because it carries no `tau_int`/`n_eff`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Derived {
-    /// Full-series plug-in value of the estimator. Always computed from all the
-    /// samples, so it is unaffected by how the blocking below turns out.
+    /// Full-series plug-in value of the estimator, computed from all the
+    /// samples — unaffected by how the blocking turns out.
     pub value: f64,
     /// Jackknife standard error over blocks, or `NaN` when there were too few
-    /// blocks to measure a scatter at all. Never zero-by-default: a zero here
-    /// would read as perfect certainty.
+    /// blocks to measure a scatter — never zero, which would read as perfect
+    /// certainty.
     pub stderr: f64,
-    /// How many blocks the error rests on — the jackknife's counterpart to
-    /// [`Estimate::n_eff`], and the number that says whether `stderr` can be
-    /// trusted. Fewer than 2 means `stderr` is `NaN`.
+    /// How many blocks the error rests on — this layer's counterpart to
+    /// [`Estimate::n_eff`]. Fewer than 2 means `stderr` is `NaN`.
     pub n_blocks: usize,
 }
 
 /// The effective sample size below which an autocorrelation estimate cannot be
 /// believed.
 ///
-/// The usual lattice requirement is `N > 50·tau_int`, which is exactly
-/// `n_eff > 25`. Below it `tau_int` stops being a measurement and becomes the
-/// ceiling of what a run that length can perceive, since the windowing in
-/// [`reduce`] caps it near `N/5` however correlated the data really is.
-/// Everything downstream — `n_eff`, the jackknife block length, every `stderr` —
-/// then comes out too optimistic with nothing in its value to show it.
+/// The usual lattice requirement `N > 50·tau_int` is exactly `n_eff > 25`.
+/// Below it `tau_int` has saturated rather than been measured, so every
+/// downstream `stderr` is too optimistic — see `docs/statistics.md`.
 pub const MIN_EFFECTIVE_SAMPLES: f64 = 25.0;
 
 impl Estimate {
@@ -94,16 +75,11 @@ impl Derived {
 
 /// Reduce a scalar series to its mean and autocorrelation-corrected error.
 ///
-/// The automatic-windowing procedure (Sokal / Madras–Sokal): build the
-/// normalized autocorrelation curve `rho(t)`, accumulate the running window sum
-/// `tau(W) = 0.5 + Σ_{t=1}^{W} rho(t)`, and truncate at the smallest `W ≥ 1`
-/// with `W ≥ c·tau(W)` (`c = 5`), cutting off the noisy tail. The autocovariance
-/// uses the biased `/N` normalization the windowing assumes, which damps that
-/// tail.
+/// Sokal automatic windowing with `c = 5`, over a `/N`-normalized
+/// autocovariance; see `docs/statistics.md`.
 ///
-/// A constant series returns zero error with `tau_int = 0.5`; so does a series
-/// shorter than two points, which cannot show autocorrelation at all. `tau_int`
-/// is clamped to `≥ 0.5` throughout.
+/// A constant series, or one shorter than two points, returns zero error with
+/// `tau_int = 0.5`; `tau_int` is clamped to `≥ 0.5` throughout.
 pub fn reduce(series: &[f64]) -> Estimate {
     let n = series.len();
     if n < 2 {
@@ -119,10 +95,8 @@ pub fn reduce(series: &[f64]) -> Estimate {
     let nf = n as f64;
     let mean = sample_mean(series);
 
-    // Autocovariance at lag 0: the variance, /N normalized.
     let c0 = series.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / nf;
     if c0 == 0.0 {
-        // Constant series: no scale to normalize by, no fluctuation to correct.
         return Estimate {
             mean,
             stderr: 0.0,
@@ -131,9 +105,6 @@ pub fn reduce(series: &[f64]) -> Estimate {
         };
     }
 
-    // Accumulate the window sum lag by lag, stopping as soon as the window
-    // closes (W ≥ c·tau(W)). If it never closes up to the largest lag N−1, keep
-    // the widest window's value.
     let c = 5.0;
     let mut tau = 0.5;
     let mut tau_int = 0.5;
@@ -165,36 +136,19 @@ pub fn reduce(series: &[f64]) -> Estimate {
     }
 }
 
-/// Estimate a derived quantity and its error by a *blocked* jackknife, over
-/// per-block feature sums rather than re-scanned slices.
+/// Estimate a derived quantity and its error by a *blocked* jackknife over
+/// per-block feature sums.
 ///
-/// Every fluctuation here is a function of raw power-moments of one series
-/// (`⟨x²⟩ − ⟨x⟩²`, `1 − ⟨x⁴⟩/(3⟨x²⟩²)`), and moments are additive over blocks —
-/// so leave-one-block-out is `total − block_b`, an O(1) update per block after a
-/// single O(N) accumulation. The old slice-based form rebuilt an O(N) leave-out
-/// copy per block, making a run O(N · n_blocks); at 400k samples that was minutes.
-/// This is O(N · n_features) with `n_features ≤ 3`.
+/// Every caller's estimator is a function of moments, and moments are additive
+/// over blocks, so leave-one-block-out is `total − block_b`: one O(N) pass per
+/// column, then O(1) per block. A non-additive estimator would justify bringing
+/// a slice-based form back.
 ///
-/// `features` are aligned columns of length N — the caller supplies whatever
-/// moments (and centering) its estimator needs. `estimator` receives the vector
-/// of *leave-out means*, one per column, and returns the derived value for that
-/// leave-out set. The blocked jackknife itself is otherwise unchanged: `n_b =
-/// N / block_len` whole blocks, remainder dropped, `value` the full-series
-/// plug-in, error `sqrt((n_b−1)/n_b · Σ_b (theta_(b) − theta_bar)²)`, and the
-/// same refusal — `NaN` with `n_blocks` when there are fewer than two blocks.
-///
-/// No general slice-based form is kept: every caller is a moment estimator, and
-/// leaving a known-O(N·n_b) path around invites misuse. A genuinely non-moment
-/// estimator (one that isn't additive over blocks) would justify bringing it back.
-///
-/// # Contract: the caller owns the block length
-///
-/// `block_len` is a physics decision — it must be at least the correlation time
-/// of *every* column the estimator consumes, since a combination of moments
-/// decorrelates only as fast as its slowest integrand. Use [`block_len_for`] to
-/// take the max over them. Blocks longer than needed widen the error (wasteful
-/// but honest); blocks shorter than the correlation time understate it, the
-/// dangerous direction.
+/// `features` are aligned columns of length N; `estimator` maps the vector of
+/// *leave-out means*, one per column, to the derived value. `value` is the
+/// full-series plug-in; the error and the choice of `block_len` are described in
+/// `docs/statistics.md`. Whole blocks only, remainder dropped; fewer than two
+/// blocks return `NaN`. Size `block_len` with [`block_len_for`].
 fn jackknife_features(
     features: &[&[f64]],
     block_len: usize,
@@ -203,8 +157,8 @@ fn jackknife_features(
     let n_features = features.len();
     let n = features[0].len();
 
-    // The full-series plug-in uses all N samples (the remainder included), so the
-    // reported value is exactly what the pre-refactor slice form returned.
+    // The full-series plug-in uses all N samples — remainder included, unlike
+    // the error below.
     let total_n: Vec<f64> = features.iter().map(|col| col.iter().sum::<f64>()).collect();
     let value = {
         let means: Vec<f64> = total_n.iter().map(|s| s / n as f64).collect();
@@ -221,9 +175,8 @@ fn jackknife_features(
         };
     }
 
-    // One O(N) pass per column: the per-block partial sums over the whole-block
-    // prefix, and their total. The remainder past `used` is dropped, matching the
-    // old form's block handling exactly.
+    // Per-block partial sums over the whole-block prefix; samples past `used`
+    // are dropped.
     let used = block_len * n_b;
     let mut partials = vec![vec![0.0; n_features]; n_b];
     let mut total_used = vec![0.0; n_features];
@@ -236,7 +189,7 @@ fn jackknife_features(
         }
     }
 
-    // Leave-one-block-out is total − block_b, in O(1) per column per block.
+    // Leave-one-block-out: total − block_b.
     let leave_n = (used - block_len) as f64;
     let mut means = vec![0.0; n_features];
     let mut thetas = Vec::with_capacity(n_b);
@@ -259,41 +212,29 @@ fn jackknife_features(
 
 // --- instantiations: one physics formula each, over its moment features ---
 
-/// Block length for an estimator, sized by the slowest series it consumes.
+/// Block length for an estimator, sized by the slowest series it consumes:
+/// the max `tau_int` over the columns, blocked by `ceil(2·tau)`.
 ///
-/// A fluctuation depends on several moments at once (e.g. `⟨E⟩` and `⟨E²⟩`), and
-/// the combination decorrelates only as fast as its slowest integrand — near
-/// `T_c` the higher moment lags the lower one. So take the max `tau_int` over all
-/// of them and block by `ceil(2·tau)`. This can only *lengthen* blocks versus any
-/// single series, so it never understates the error.
-///
-/// This is the pragmatic bound. The tight version is the linearized (Gamma-method)
-/// autocorrelation of the derived quantity — project each sample onto the
-/// estimator's gradient and take that series' `tau_int` — which can be shorter
-/// than the max but never understates it. Not implemented here; this is the safe,
-/// much simpler improvement.
+/// The max can only *lengthen* blocks versus any single series, so it never
+/// understates the error. `docs/statistics.md` covers why, and the tighter
+/// Gamma-method alternative that is not implemented.
 fn block_len_for(series: &[&[f64]]) -> usize {
     let tau = series.iter().map(|s| reduce(s).tau_int).fold(0.5, f64::max);
     ((2.0 * tau).ceil() as usize).max(1)
 }
 
-/// Specific heat `C = beta²·(⟨E²⟩ − ⟨E⟩²)/N` from the energy series.
+/// Specific heat `C = beta²·(⟨E²⟩ − ⟨E⟩²)/N` from the series of *total*
+/// energies `E = Sample::energy`; `n_sites` is `N`.
 ///
-/// `energies` is the series of *total* energies `E = Sample::energy`; `n_sites`
-/// is `N`. Its integrands are `E` and `E²`, so the blocks are sized by whichever
-/// of the two decorrelates more slowly.
-///
-/// The features are centered by the global mean `Ē`: with `f0 = E − Ē` and
-/// `f1 = (E − Ē)²`, the estimator `β²·(⟨f1⟩ − ⟨f0⟩²)/N` is exactly `β²·Var(E)/N`
-/// for any center, but centering keeps every leave-out `⟨f0⟩ ≈ 0`, so the
-/// variance subtraction never differences two large nearly-equal numbers — the
-/// same stable center-then-square numerics the pre-refactor form used.
+/// The features are centered by the global mean `Ē` (`f0 = E − Ē`,
+/// `f1 = (E − Ē)²`), which leaves the estimator unchanged but avoids
+/// differencing two large nearly-equal numbers; see `docs/statistics.md`.
 pub fn specific_heat(energies: &[f64], beta: f64, n_sites: f64) -> Derived {
     let mean_e = sample_mean(energies);
     let f0: Vec<f64> = energies.iter().map(|e| e - mean_e).collect();
     let f1: Vec<f64> = f0.iter().map(|d| d * d).collect();
-    // Block length is sized from the raw integrands E and E² (tau_int of the
-    // centered square differs), while the jackknife runs on the centered features.
+    // Blocks are sized from the raw integrands E and E² (tau_int of the
+    // centered square differs); the jackknife runs on the centered features.
     let e_squared: Vec<f64> = energies.iter().map(|e| e * e).collect();
     let block_len = block_len_for(&[energies, &e_squared]);
     jackknife_features(&[&f0, &f1], block_len, move |m| {
@@ -301,23 +242,20 @@ pub fn specific_heat(energies: &[f64], beta: f64, n_sites: f64) -> Derived {
     })
 }
 
-/// Susceptibility `chi = beta·N·(⟨m²⟩ − ⟨|m|⟩²)` from the magnetization series.
+/// Susceptibility `chi = beta·N·(⟨m²⟩ − ⟨|m|⟩²)` from the series of *signed
+/// total* magnetizations `M = Sample::magnetization`.
 ///
-/// `magnetizations` is the series of *signed total* `M = Sample::magnetization`.
-/// Since `m² = |m|²`, the bracket is exactly the variance of `|m|` and is
-/// computed as one — which also means this estimator never sees the sign.
-///
-/// The series is reduced to `|m| = |M|/N`, so the sign-flip time (orders of
-/// magnitude longer at low temperature, and irrelevant to an even estimator)
-/// never enters. Its integrands are `|m|` and `m²`, so the blocks are sized by
-/// the slower of those, and the features are centered exactly as in
+/// The series is reduced to `|m| = |M|/N` first — both moments are even, so
+/// the sign-flip time (orders of magnitude longer at low temperature) never
+/// enters the estimate or the blocking. Features are centered as in
 /// [`specific_heat`] for the same stability.
 pub fn susceptibility(magnetizations: &[f64], beta: f64, n_sites: f64) -> Derived {
     let abs_m: Vec<f64> = magnetizations.iter().map(|m| (m / n_sites).abs()).collect();
     let mean_abs = sample_mean(&abs_m);
     let f0: Vec<f64> = abs_m.iter().map(|a| a - mean_abs).collect();
     let f1: Vec<f64> = f0.iter().map(|d| d * d).collect();
-    // Raw integrands |m| and m² size the blocks; centered features run the jackknife.
+    // Raw integrands |m| and m² size the blocks; the jackknife runs on the
+    // centered features.
     let m_squared: Vec<f64> = abs_m.iter().map(|a| a * a).collect();
     let block_len = block_len_for(&[&abs_m, &m_squared]);
     jackknife_features(&[&f0, &f1], block_len, move |m| {
@@ -327,29 +265,15 @@ pub fn susceptibility(magnetizations: &[f64], beta: f64, n_sites: f64) -> Derive
 
 /// Binder cumulant `U_4 = 1 − ⟨m⁴⟩/(3·⟨m²⟩²)` from the magnetization series.
 ///
-/// `U_4` is scale-invariant — the `1/N` factors in `m = M/N` cancel in the ratio
-/// — so no division by `n_sites` is needed and none is taken.
+/// `U_4` is scale-invariant — the `1/N` factors cancel in the ratio — so no
+/// division by `n_sites` is taken. Both moments are even in `M`, so as with
+/// [`susceptibility`] the series is reduced to `|M|`, and the raw moments are
+/// the features directly (no centering — a ratio of two similar-magnitude
+/// positives is well-conditioned).
 ///
-/// Both moments are even in `M`, so as with [`susceptibility`] the series is
-/// reduced to `|M|`. Its integrands are the raw moments `m²` and `m⁴`, so those
-/// are the features directly (no centering — a ratio of two similar-magnitude
-/// positives is well-conditioned), and the blocks are sized by the slower of them.
-///
-/// The `3` is a convention rather than a universal constant, and what it is
-/// calibrated to matters once the series comes from somewhere other than
-/// [`Ising`](crate::models::ising::Ising). A *signed* order parameter symmetric about
-/// zero and near-Gaussian in the disordered phase satisfies `⟨m⁴⟩ = 3⟨m²⟩²`,
-/// which is what puts `U_4` at exactly `0` there, while sharp ordering gives
-/// `⟨m⁴⟩ = ⟨m²⟩²` and so `2/3` at the other end. A
-/// [`Potts`](crate::models::potts::Potts) series arrives through
-/// [`order_parameter`](crate::models::potts::Potts::order_parameter), which is
-/// non-negative by construction and does not average to zero on a finite
-/// lattice: its ordered limit is still `2/3`, but its disordered value is a
-/// size-dependent number rather than the Ising anchor. That does not stop the
-/// cumulant doing its job — locating `beta_c` by where curves for different `L`
-/// cross needs only a dimensionless ratio of moments, not particular endpoints —
-/// but those endpoints should not be read as though they were Ising's. See
-/// `docs/potts.md`.
+/// The `3` is calibrated to a *signed*, symmetric order parameter; a
+/// non-negative one like Potts's needs a different constant. See
+/// `docs/potts.md` and `docs/statistics.md`.
 pub fn binder_cumulant(magnetizations: &[f64]) -> Derived {
     let m_squared: Vec<f64> = magnetizations.iter().map(|m| m * m).collect();
     let m_fourth: Vec<f64> = m_squared.iter().map(|s| s * s).collect();
@@ -359,44 +283,22 @@ pub fn binder_cumulant(magnetizations: &[f64]) -> Derived {
     })
 }
 
-/// Creutz ratio `chi(R,T)` — the string tension read off four adjacent Wilson
-/// loops, one series per loop size.
-///
-/// The logarithm of a Wilson loop average splits into an area term, a perimeter
-/// self-energy term, and a constant,
-/// `−log⟨W(R,T)⟩ = sigma·R·T + mu·(R+T) + c`, and only the first of the three is
-/// the string tension. The 2×2 combination
-///
-/// ```text
-/// chi(R,T) = −log[ ⟨W(R,T)⟩·⟨W(R−1,T−1)⟩ / ( ⟨W(R−1,T)⟩·⟨W(R,T−1)⟩ ) ]
-/// ```
-///
-/// cancels the other two exactly — the perimeters sum to `(R+T) + (R+T−2) −
-/// (R+T−1) − (R+T−1) = 0` and the constants cancel in pairs — while the areas
-/// leave `R·T + (R−1)(T−1) − (R−1)T − R(T−1) = 1`, so what is left is `sigma`
-/// plus whatever short-distance corrections the loops are still small enough to
-/// carry. Those corrections die out as the loops grow, which is why `chi` is
-/// reported per `(R,T)`: reading a plateau off the table is the caller's
-/// judgement, not this function's.
+/// Creutz ratio
+/// `chi(R,T) = −log[⟨W(R,T)⟩·⟨W(R−1,T−1)⟩ / (⟨W(R−1,T)⟩·⟨W(R,T−1)⟩)]` — the
+/// string tension read off four adjacent Wilson loops; the derivation and the
+/// short-distance caveat behind the per-`(R,T)` reporting are in
+/// `docs/z2-gauge.md`.
 ///
 /// The four arguments are the series for `(R,T)`, `(R−1,T−1)`, `(R−1,T)` and
-/// `(R,T−1)` in that order, sample-aligned and equally long — they come from the
-/// same chain, and the jackknife leaves out the same block of *configurations*
-/// from all four at once, which is what keeps their shared fluctuations
-/// correlated in the error rather than adding in quadrature. A trivial side
-/// (`R−1 = 0`) is the constant `1.0` series, so `chi(1,1)` reduces to
-/// `−log⟨W(1,1)⟩`, the mean plaquette.
+/// `(R,T−1)` in that order, sample-aligned from the same chain: the jackknife
+/// leaves out the same block of *configurations* from all four at once, which
+/// keeps their shared fluctuations correlated in the error rather than adding
+/// in quadrature. A trivial side (`R−1 = 0`) is the constant `1.0` series, so
+/// `chi(1,1)` reduces to `−log⟨W(1,1)⟩`, the mean plaquette.
 ///
-/// This is not a mean of anything measured per configuration but a nonlinear
-/// function of four means, so the four raw series are the features directly. No
-/// centering: Wilson averages are positive and of similar magnitude in the
-/// confined phase, so the ratio is well-conditioned, as in [`binder_cumulant`].
-/// When the ratio is not a positive finite number — a near-deconfined or simply
-/// too-noisy run, where a loop average can wander to zero or through it — the
-/// logarithm has no value to give and the estimator returns `NaN` rather than a
-/// clamped stand-in. That is the honest report that `chi` could not be resolved
-/// at this loop size, and it propagates: a single refusing leave-out block makes
-/// `stderr` `NaN` too.
+/// When the ratio is not a positive finite number — a near-deconfined or
+/// too-noisy run — the estimator returns `NaN` rather than a clamped stand-in,
+/// and a single refusing leave-out block makes `stderr` `NaN` too.
 pub fn creutz_ratio(w_rt: &[f64], w_r1t1: &[f64], w_r1t: &[f64], w_rt1: &[f64]) -> Derived {
     debug_assert!(
         [w_r1t1, w_r1t, w_rt1].iter().all(|s| s.len() == w_rt.len()),
@@ -423,22 +325,21 @@ fn sample_mean(xs: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
-    /// Mean of a per-sample transform: apply `f` to each sample, *then* average.
-    /// Test-side reference for the direct moment formulas.
+    /// Mean of a per-sample transform — test-side reference for the direct
+    /// moment formulas.
     fn sample_mean_map(xs: &[f64], f: impl Fn(f64) -> f64) -> f64 {
         xs.iter().map(|&x| f(x)).sum::<f64>() / xs.len() as f64
     }
 
-    /// The plain blocked-mean jackknife, as a single-feature call — the identity
-    /// estimator over one column. Stands in for the removed slice-based
-    /// `jackknife_blocks` in the tests that exercise the blocking mechanism itself.
+    /// The plain blocked-mean jackknife — the identity estimator over one
+    /// column — for tests that exercise the blocking mechanism itself.
     fn jack_mean(series: &[f64], block_len: usize) -> Derived {
         jackknife_features(&[series], block_len, |m| m[0])
     }
 
     /// Deterministic pseudo-random base for the correlation tests: splitmix64
-    /// mapped to `[-1, 1)`. Close enough to independent that a bare (`k = 1`)
-    /// series reduces to `tau_int ≈ 0.5`.
+    /// mapped to `[-1, 1)`, close enough to independent that a bare series
+    /// reduces to `tau_int ≈ 0.5`.
     fn base_value(i: usize) -> f64 {
         let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -447,18 +348,15 @@ mod tests {
         (z >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
     }
 
-    /// A length-`total` series where each base value is repeated `k` times. The
-    /// length is fixed as `k` grows, so a rising `tau_int` shows directly as a
-    /// falling `n_eff`.
+    /// A length-`total` series where each base value is repeated `k` times.
     fn run_correlated(total: usize, k: usize) -> Vec<f64> {
         (0..total).map(|i| base_value(i / k)).collect()
     }
 
     #[test]
     fn reduce_on_independent_series_gives_half_and_full_n() {
-        // A strictly alternating series has no positive autocorrelation, so the
-        // window closes at once and tau_int clamps to its floor of 0.5, leaving
-        // every sample independent: n_eff == N.
+        // An alternating series has no positive autocorrelation, so tau_int
+        // clamps to its floor of 0.5 and n_eff == N.
         let n = 512;
         let series: Vec<f64> = (0..n)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
@@ -485,8 +383,7 @@ mod tests {
 
     #[test]
     fn reduce_tau_rises_and_n_eff_falls_with_run_length() {
-        // Longer runs of repeated values mean slower decorrelation: tau_int must
-        // rise and n_eff must fall as k grows. Assert the ordering, not values.
+        // Assert the ordering as k grows, not values.
         let total = 1024;
         let e1 = reduce(&run_correlated(total, 1));
         let e4 = reduce(&run_correlated(total, 4));
@@ -510,8 +407,6 @@ mod tests {
 
     #[test]
     fn jackknife_value_matches_direct_plug_in() {
-        // The central value must be the full-series estimator, exactly — checked
-        // against the specific-heat formula computed directly.
         let energies: Vec<f64> = (0..200).map(|i| base_value(i) * 10.0).collect();
         let (beta, n_sites) = (0.4, 64.0);
 
@@ -531,9 +426,8 @@ mod tests {
 
     #[test]
     fn jackknife_refuses_rather_than_understating() {
-        // With too little data to form two blocks there is no scatter to measure.
-        // The value must still come back, but the error must be NaN — not zero,
-        // which would read as perfect certainty.
+        // Under two blocks the value still comes back but the error is NaN, not
+        // zero.
         let one = [42.0];
         let d = jack_mean(&one, block_len_for(&[&one]));
         assert!(d.n_blocks < 2, "n_blocks = {}", d.n_blocks);
@@ -543,8 +437,7 @@ mod tests {
 
     #[test]
     fn jackknife_reports_the_block_count_it_used() {
-        // An uncorrelated series blocks at length 1, so every sample is its own
-        // block and the count matches the series length.
+        // An uncorrelated series blocks at length 1: every sample its own block.
         let series: Vec<f64> = (0..200)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
@@ -555,9 +448,7 @@ mod tests {
 
     #[test]
     fn block_len_is_driven_by_the_slowest_series() {
-        // One series churns every sample (tau ~ 0.5), the other moves in long
-        // runs (large tau). The block length must follow the slow one — its
-        // 2*tau — not the fast one, so an estimator over both stays honest.
+        // The block length must follow the slow series' 2*tau, not the fast one.
         let fast: Vec<f64> = (0..1024)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
@@ -575,9 +466,8 @@ mod tests {
 
     #[test]
     fn saturated_autocorrelation_is_flagged_unreliable() {
-        // A series that flips once in 1000 samples never decorrelated within the
-        // run, so its true tau_int is unmeasurable and the windowing reports a
-        // ceiling near N/5. The flag is what says so.
+        // A single flip in 1000 samples never decorrelated within the run: the
+        // windowing reports its ceiling near N/5, and the flag is what says so.
         let one_flip: Vec<f64> = (0..1000)
             .map(|i| if i < 500 { 1.0 } else { -1.0 })
             .collect();
@@ -597,9 +487,8 @@ mod tests {
 
     #[test]
     fn block_count_collapses_on_correlated_data() {
-        // Both series are 200 samples long, but the correlated one supports only
-        // a handful of independent blocks. Its error bar rests on those few, and
-        // without `n_blocks` exposed you could not tell.
+        // Same length, but the correlated series supports only a handful of
+        // independent blocks — n_blocks is what exposes that.
         let independent: Vec<f64> = (0..200)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
@@ -613,11 +502,9 @@ mod tests {
 
     #[test]
     fn fluctuations_block_on_magnitude_not_sign() {
-        // Two timescales deliberately separated: the sign flips only every 500
-        // samples, while the magnitude churns every sample. Both fluctuation
-        // estimators use even moments only, so they are blind to the sign — the
-        // block length must follow the magnitude's short correlation, not the
-        // sign's long one.
+        // Two timescales deliberately separated: the sign flips every 500
+        // samples, the magnitude churns every sample. Even-moment estimators
+        // must block on the magnitude's short correlation, not the sign's.
         let n_sites = 64.0;
         let signed: Vec<f64> = (0..2000)
             .map(|i| {
@@ -627,7 +514,7 @@ mod tests {
             .collect();
         let magnitude: Vec<f64> = signed.iter().map(|m| m.abs()).collect();
 
-        // The two series really do have wildly different correlation times.
+        // Check the timescales really did separate.
         let (s, m) = (reduce(&signed), reduce(&magnitude));
         assert!(
             s.tau_int > 10.0 * m.tau_int,
@@ -651,8 +538,8 @@ mod tests {
             assert!(d.is_reliable(), "{name} n_blocks = {}", d.n_blocks);
         }
 
-        // The central values are plug-ins over the full series and never touched
-        // the blocking, so they must equal the direct formulas on signed data.
+        // The central values never touched the blocking, so they must equal the
+        // direct formulas on signed data.
         let mean_m2 = sample_mean_map(&signed, |x| (x / n_sites).powi(2));
         let mean_abs = sample_mean_map(&signed, |x| (x / n_sites).abs());
         let chi_direct = 0.4 * n_sites * (mean_m2 - mean_abs * mean_abs);
@@ -676,9 +563,8 @@ mod tests {
 
     #[test]
     fn block_length_change_leaves_central_values_untouched() {
-        // The block length only sizes the error; `value` is a full-series plug-in.
-        // On a fixed correlated series, all three must equal the direct formulas
-        // regardless of how the blocks come out.
+        // `value` is a full-series plug-in, so all three must equal the direct
+        // formulas regardless of how the blocks come out.
         let (beta, n_sites) = (0.4407, 64.0);
         let signed: Vec<f64> = (0..3000)
             .map(|i| {
@@ -706,8 +592,8 @@ mod tests {
         assert!((binder_cumulant(&signed).value - u4_direct).abs() < 1e-12);
     }
 
-    /// The exact `(E series, signed M series)` used to capture the reference
-    /// numbers below, so the equivalence test runs on the same data.
+    /// The exact series used to capture the reference numbers below, so the
+    /// equivalence test runs on the same data.
     fn reference_series() -> (Vec<f64>, Vec<f64>, f64, f64) {
         let (beta, n_sites) = (0.4407, 64.0);
         let signed: Vec<f64> = (0..3000)
@@ -756,9 +642,8 @@ mod tests {
 
     #[test]
     fn fluctuation_refuses_on_too_short_series() {
-        // Fewer than two blocks: the value still returns, but the error is NaN and
-        // n_blocks records how few there were. A one-sample series is the clean
-        // trigger — the windowing otherwise floors the block count above 1.
+        // A one-sample series is the clean trigger — the windowing otherwise
+        // floors the block count above 1.
         let d = susceptibility(&[48.0], 0.4407, 64.0);
         assert!(d.n_blocks < 2, "n_blocks = {}", d.n_blocks);
         assert!(d.stderr.is_nan(), "stderr = {}", d.stderr);
@@ -767,9 +652,8 @@ mod tests {
 
     #[test]
     fn variance_stays_stable_on_a_near_constant_series() {
-        // |m| ≈ 0.97 with ~1e-3 jitter: the variance is ~1e-7, small enough that a
-        // naive ⟨x²⟩−⟨x⟩² would cancel catastrophically. The centered features must
-        // still land on the reference variance and never go negative.
+        // |m| ≈ 0.97 with ~1e-3 jitter: the variance is ~1e-7, small enough that
+        // a naive ⟨x²⟩−⟨x⟩² would cancel catastrophically.
         let (beta, n_sites) = (0.4407, 1.0);
         let mags: Vec<f64> = (0..2000).map(|i| 0.97 + 1e-3 * base_value(i)).collect();
 
@@ -789,8 +673,7 @@ mod tests {
 
     #[test]
     fn binder_ordered_limit_is_two_thirds() {
-        // A magnetization series with no fluctuation (a nonzero constant) is the
-        // ordered phase: <m^4> = <m^2>^2, so U_4 -> 1 - 1/3 = 2/3.
+        // A nonzero constant series has <m^4> = <m^2>^2, so U_4 = 2/3.
         let mags = vec![2.0; 100];
         let d = binder_cumulant(&mags);
         assert!((d.value - 2.0 / 3.0).abs() < 1e-9, "U_4 = {}", d.value);
@@ -798,15 +681,12 @@ mod tests {
 
     #[test]
     fn creutz_reproduces_the_exact_two_dimensional_string_tension() {
-        // In two dimensions <W(R,T)> = tanh(beta)^(R*T) exactly, and the Creutz
-        // combination of areas collapses to 1 for every R,T — so chi must come
-        // back as -log(tanh beta) at *any* loop size, not just asymptotically.
-        // Constant series have no jackknife scatter, so the error must vanish too.
-        // beta = atanh(1/2), written through tanh(beta) directly: a power of two
-        // keeps every loop average exactly constant in floating point, so the
-        // jackknife really does see zero scatter. A constant the sample mean
-        // cannot reproduce to the last bit reads as a perfectly correlated series
-        // instead, which would swallow the whole run into one block.
+        // In two dimensions <W(R,T)> = tanh(beta)^(R*T) exactly (docs/z2-gauge.md),
+        // so chi must be -log(tanh beta) at any loop size, with zero error.
+        // tanh_beta is a power of two so every loop average is exactly constant
+        // in floating point: a constant the sample mean cannot reproduce to the
+        // last bit reads as a perfectly correlated series instead, which would
+        // swallow the whole run into one block.
         let tanh_beta: f64 = 0.5;
         let w = |r: u32, t: u32| vec![tanh_beta.powi((r * t) as i32); 400];
         let expected = -tanh_beta.ln();
@@ -825,9 +705,8 @@ mod tests {
 
     #[test]
     fn creutz_at_the_smallest_loop_is_minus_log_the_mean_plaquette() {
-        // R = T = 1 puts three of the four loops on the trivial `1.0` anchor that
-        // `wilson_rectangles` keeps in row and column zero, so the whole ratio is
-        // the (1,1) loop alone and chi(1,1) = -log<W(1,1)>.
+        // R = T = 1 puts three of the four loops on the trivial `1.0` anchor
+        // that `wilson_rectangles` keeps in row and column zero.
         let w11: Vec<f64> = (0..600).map(|i| 0.72 + 0.05 * base_value(i)).collect();
         let ones = vec![1.0; 600];
 
@@ -838,18 +717,16 @@ mod tests {
             "chi(1,1) = {}, want {expected}",
             d.value
         );
-        // A fluctuating loop must carry a real error bar, unlike the constant
-        // series above.
+        // Unlike the constant series above, a fluctuating loop must carry a
+        // real error bar.
         assert!(d.stderr > 0.0, "stderr = {}", d.stderr);
         assert!(d.is_reliable(), "n_blocks = {}", d.n_blocks);
     }
 
     #[test]
     fn creutz_refuses_a_non_positive_ratio() {
-        // A loop average that has wandered negative — a too-noisy or
-        // near-deconfined run — leaves the logarithm nothing to take. The refusal
-        // is NaN rather than a clamp, and it reaches the error bar as well, since
-        // every leave-out block inherits the same sign.
+        // A negative loop average leaves the logarithm nothing to take; the NaN
+        // reaches the error bar too, since every leave-out inherits the sign.
         let negative: Vec<f64> = (0..300).map(|i| -0.3 + 0.01 * base_value(i)).collect();
         let ones = vec![1.0; 300];
 
@@ -857,7 +734,7 @@ mod tests {
         assert!(d.value.is_nan(), "value = {}", d.value);
         assert!(d.stderr.is_nan(), "stderr = {}", d.stderr);
 
-        // A zero in the denominator is the same refusal: the ratio is not finite.
+        // A zero denominator is the same refusal: the ratio is not finite.
         let zeros = vec![0.0; 300];
         let d = creutz_ratio(&ones, &ones, &zeros, &ones);
         assert!(d.value.is_nan(), "value = {}", d.value);
@@ -865,8 +742,7 @@ mod tests {
 
     #[test]
     fn creutz_refuses_on_too_short_series() {
-        // The inherited too-few-blocks refusal: one sample cannot show a scatter,
-        // so the ratio still comes back but the error is NaN.
+        // The inherited too-few-blocks refusal.
         let one = [0.5];
         let unit = [1.0];
         let d = creutz_ratio(&one, &unit, &unit, &unit);
@@ -881,8 +757,7 @@ mod tests {
 
     #[test]
     fn creutz_blocks_on_the_slowest_of_its_four_series() {
-        // The combination decorrelates only as fast as its slowest ingredient, and
-        // the slow one here is a single corner of the 2x2 — blocking on any of the
+        // The slow series is a single corner of the 2x2; blocking on any of the
         // other three would leave far more blocks than the error can support.
         let fast: Vec<f64> = (0..2048).map(|i| 0.8 + 0.02 * base_value(i)).collect();
         let slow: Vec<f64> = (0..2048).map(|i| 0.6 + 0.02 * base_value(i / 16)).collect();
@@ -895,8 +770,7 @@ mod tests {
 
     #[test]
     fn binder_disordered_limit_is_zero() {
-        // Constructed so <m^4> = 3<m^2>^2 exactly: one third of the samples are
-        // nonzero, two thirds are zero, which makes <m^4>/<m^2>^2 = 1/f = 3 and
+        // One third nonzero, two thirds zero makes <m^4> = 3<m^2>^2 exactly, so
         // U_4 = 0 — the disordered anchor.
         let mut mags = vec![0.0; 300];
         for m in mags.iter_mut().take(100) {

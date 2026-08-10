@@ -1,15 +1,12 @@
 //! The ferromagnetic `q`-state Potts model: one unordered label out of `Q` on
-//! every site, coupled by agreement, and the observables that respect the
-//! relabelling symmetry.
+//! every site, coupled by agreement. The physics and conventions are in
+//! `docs/potts.md`.
 //!
-//! [`Potts`] owns the energy — bonds scored by whether the two labels agree,
-//! plus an optional per-label offset — and the value-semantic observables built
-//! on the label populations: the two order-parameter conventions and the
-//! connected correlator. [`potts_measure`] composes the primaries into a
-//! per-config [`PottsSample`], and [`potts_correlator`] wraps the model's scan
-//! in the shared [`Correlator`] record. The
-//! run-config schema and the CPU/GPU samplers sit in the submodules,
-//! re-exported here.
+//! [`Potts`] owns the energy and the observables built on the label
+//! populations; [`potts_measure`] composes the primaries into a per-config
+//! [`PottsSample`], and [`potts_correlator`] wraps the model's scan in the
+//! shared [`Correlator`] record. The run-config schema and the CPU/GPU
+//! samplers sit in the submodules, re-exported here.
 
 pub mod gpu;
 pub mod run_config;
@@ -39,43 +36,13 @@ use crate::state::State;
 /// agreeing neighbors lower the energy. Energies come out in the same units as
 /// `j` and `h`.
 ///
-/// The offset `h` is one number per label, and a site pays the one matching its
-/// own label whatever its neighbors are doing — a chemical potential per label,
-/// which is what the second sum literally is once it is read as `-sum_a h[a] *
-/// N_a` over the label populations. It is uniform across the lattice: every site
-/// carrying a given label gets the same number, so the sum is over the `Q`
-/// labels and not over anything geometric. Adding a constant to every entry
-/// shifts `H` by a constant and cancels out of every energy difference, so only
-/// the differences between entries carry content, and the usual choice is a
-/// single entry offset with the rest at zero.
-///
-/// The labels are *unordered*, and that is the whole character of the model.
-/// Nothing distinguishes one from another, so the energy only ever asks whether
-/// two indices are equal and never turns one into a number — which is why this
-/// is the one action here generic over `Q` rather than fixed at the two states
-/// the private `decode` knows. Permuting the `Q` labels the same way at every
-/// site leaves the energy untouched, and everything measured has to respect that
-/// symmetry; see [`order_parameter`](Potts::order_parameter) for why the Ising
-/// magnetization has no counterpart under it.
-///
-/// At `Q = 2` and zero offset this is the Ising model up to a factor of two in
-/// the coupling. Reading the two labels as `±1` gives
-/// `delta(s_i, s_j) = (1 + s_i s_j) / 2`, so `Potts` at coupling `2J` differs
-/// from zero-field [`Ising`](crate::models::ising::Ising) at `J` only by the constant `-J` per bond — the same
-/// energy landscape, and therefore the same `energy_delta` on every move. The
-/// offsets extend that: `h = [H, -H]` reproduces an Ising field of `H`, since
-/// Ising's `-h * sum_i s_i` gives `+h` to an up spin and `-h` to a down one.
-///
-/// Both models are kept rather than one wrapping the other: [`Ising`](crate::models::ising::Ising)'s
-/// observables are built on reading states as signs, its field is a scalar
-/// rather than a vector, and its GPU kernel is a faster specialized path.
-///
-/// The offsets break the relabelling symmetry, which is the point of having
-/// them. At `h = 0` the `Q` ordered ground states are exactly degenerate, so no
-/// label-specific average survives a long run; a nonzero entry lifts that
-/// degeneracy and picks one out. Everything measured on a symmetric run — the
-/// order parameters especially — is built to be invariant under relabelling, and
-/// that argument does not survive a nonzero `h`.
+/// The labels are *unordered*: the energy only ever asks whether two indices
+/// are equal and never turns one into a number, so permuting the `Q` labels
+/// the same way at every site leaves it untouched. A nonzero `h` breaks that
+/// symmetry, which is the point of the term. At `Q = 2` this is the Ising
+/// model up to a factor of two in the coupling, and `h = [H, -H]` reproduces
+/// an Ising field of `H`. The offset as a per-label chemical potential, the
+/// Ising map, and why both models are kept are all in `docs/potts.md`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Potts<const Q: usize> {
     /// Nearest-neighbor coupling `J`.
@@ -85,29 +52,21 @@ pub struct Potts<const Q: usize> {
     h: [f64; Q],
 }
 
-/// The fewest dimensions [`Potts`] is defined in.
+/// The fewest dimensions [`Potts`] is defined in: one, the same as
+/// [`Ising::MIN_DIMENSION`](crate::models::ising::Ising::MIN_DIMENSION) and for the same reason.
 ///
-/// One, the same as [`Ising::MIN_DIMENSION`](crate::models::ising::Ising::MIN_DIMENSION) and for the same reason: the energy
-/// scores nearest-neighbor bonds, and a ring of labels has them.
-///
-/// A free constant rather than an associated one, unlike the other two models',
-/// because `Potts` is generic over `Q` and reading an associated constant off it
-/// would mean naming some `Q` — which reads as though the floor depended on the
-/// state count. It does not, and neither does the one below, which *constrains*
-/// the state count and so certainly cannot be indexed by it.
-/// [`Potts::MIN_DIMENSION`] aliases this so the type still answers the question
-/// its siblings answer.
+/// A free constant rather than an associated one because `Potts` is generic
+/// over `Q`, and reading an associated constant would mean naming some `Q` —
+/// which reads as though the floor depended on the state count. It does not.
+/// [`Potts::MIN_DIMENSION`] aliases this.
 pub const POTTS_MIN_DIMENSION: usize = 1;
 
-/// The fewest states [`Potts`] is defined at.
+/// The fewest states [`Potts`] is defined at: two.
 ///
-/// Two. One state is not a small Potts model but no model at all: every site
-/// carries the same label, every bond agrees, the energy is the same constant
-/// for every configuration, and there is no other state to propose.
-/// [`Potts::order_parameter`] would divide by `Q - 1 = 0` on top of that. None of
-/// this fails loudly on its own — it produces a chain that runs and reports
-/// numbers — which is why the floor is stated rather than left to the
-/// arithmetic, exactly as [`Z2Gauge::MIN_DIMENSION`](crate::models::gauge::Z2Gauge::MIN_DIMENSION) is.
+/// At one state every bond agrees, the energy is constant, there is no other
+/// state to propose, and [`Potts::order_parameter`] divides by `Q - 1 = 0`.
+/// None of that fails loudly on its own — the chain runs and reports numbers —
+/// which is why the floor is asserted rather than left to the arithmetic.
 pub const POTTS_MIN_STATES: usize = 2;
 
 /// What every guard on [`POTTS_MIN_STATES`] says, so the places that check it
@@ -123,22 +82,13 @@ impl<const Q: usize> Potts<Q> {
     pub const MIN_STATES: usize = POTTS_MIN_STATES;
 
     /// A Potts action with nearest-neighbor coupling `j` and per-label energy
-    /// offsets `h`.
-    ///
-    /// Pass `[0.0; Q]` for the symmetric model, or use
-    /// [`symmetric`](Potts::symmetric), which says the same thing without making
-    /// the reader count zeros.
+    /// offsets `h`; use [`symmetric`](Potts::symmetric) for the all-zero `h`.
     pub fn new(j: f64, h: [f64; Q]) -> Self {
         Potts { j, h }
     }
 
-    /// A Potts action with coupling `j` and no per-label offsets — the symmetric
-    /// model, where all `Q` labels are interchangeable and the `Q` ordered ground
-    /// states are degenerate.
-    ///
-    /// This is the standard case and the one every exact result quoted in
-    /// `docs/potts.md` assumes, which is why it gets its own constructor rather
-    /// than a defaulted argument.
+    /// A Potts action with coupling `j` and no per-label offsets — the
+    /// symmetric model every exact result quoted in `docs/potts.md` assumes.
     pub fn symmetric(j: f64) -> Self {
         Potts::new(j, [0.0; Q])
     }
@@ -153,31 +103,21 @@ impl<const Q: usize> Potts<Q> {
         self.h
     }
 
-    /// Whether every offset is zero, so the `Q` labels are interchangeable.
-    ///
-    /// Read as a shortcut rather than as a question about the model: the offset
-    /// term is then identically zero for every configuration, so `energy` can
-    /// skip counting labels altogether. `Q` comparisons in place of a scan of
-    /// the lattice, on what is by default every run.
+    /// Whether every offset is zero, letting `energy` skip the label scan on
+    /// what is by default every run.
     fn is_symmetric(&self) -> bool {
         self.h.iter().all(|&h_a| h_a == 0.0)
     }
 
     /// How many sites carry each label — the one lattice scan every quantity
-    /// below is a reduction of, and the only thing any of them reads.
+    /// below is a reduction of.
     ///
-    /// Counting is where the relabelling symmetry is dealt with: a permutation
-    /// of the labels permutes this array and nothing else, so any reduction of
-    /// it that ignores the *order* of the entries is automatically invariant.
-    /// Both order parameters are such a reduction — one takes the maximum, the
-    /// other a sum of squares — which is why neither has to argue for its own
-    /// invariance separately.
-    ///
-    /// It is `pub(crate)` so [`potts_measure`](crate::models::potts::potts_measure)
-    /// can scan once and hand the counts to both reductions, rather than each
-    /// public method walking the lattice for itself. The contract checks live
-    /// here rather than in the callers because every path reaches them through
-    /// this one.
+    /// A relabelling permutes this array and nothing else, so any reduction
+    /// that ignores the *order* of the entries is automatically invariant —
+    /// both order parameters are such a reduction. It is `pub(crate)` so
+    /// [`potts_measure`](crate::models::potts::potts_measure) can scan once and
+    /// hand the counts to both; the contract checks live here because every
+    /// path reaches them through this one.
     ///
     /// # Panics
     ///
@@ -222,31 +162,16 @@ impl<const Q: usize> Potts<Q> {
             .sqrt()
     }
 
-    /// The order parameter `m = (Q * f_max - 1) / (Q - 1)`, where `f_max` is the
-    /// fraction of sites carrying the most common label.
+    /// The order parameter `m = (Q * f_max - 1) / (Q - 1)`, where `f_max` is
+    /// the fraction of sites carrying the most common label — zero at an equal
+    /// split, one when a single label holds every site.
     ///
-    /// The normalization is the conventional one, chosen so both ends come out
-    /// clean: in the disordered phase every label holds about `1/Q` of the
-    /// sites, so `f_max -> 1/Q` and `m -> 0`, while a fully ordered
-    /// configuration puts every site on one label and gives `m = 1`.
-    ///
-    /// It is built from the most populated label rather than from a signed sum
-    /// because the labels are unordered — there is no `+1` and `−1` to add up,
-    /// so [`Ising::magnetization`](crate::models::ising::Ising::magnetization)'s definition has nothing to carry over. What
-    /// does survive the relabelling symmetry is the *imbalance* between the
-    /// populations, and reading it off the largest population is what makes the
-    /// answer invariant: a permutation of the labels permutes the counts and
-    /// leaves their maximum where it was.
-    ///
-    /// The price is that this is unsigned and cannot be otherwise, so a
-    /// downstream reduction cannot recover both `<m>` and `<|m|>` from the
-    /// series the way it can from [`Ising::magnetization`](crate::models::ising::Ising::magnetization). This already *is*
-    /// the analogue of `<|m|>`.
-    ///
-    /// This is one of the two conventions in use, and
-    /// [`simplex_order_parameter`](Potts::simplex_order_parameter) is the other;
-    /// they agree at both ends and differ in between, so a comparison against a
-    /// published number has to know which one it is.
+    /// Unsigned and cannot be otherwise: the labels are unordered, so there is
+    /// no signed sum to take, and this already *is* the analogue of `<|m|>` —
+    /// a downstream reduction cannot recover a signed `<m>` from the series.
+    /// One of the two conventions in use;
+    /// [`simplex_order_parameter`](Potts::simplex_order_parameter) is the
+    /// other, and they differ away from the ends. See `docs/potts.md`.
     ///
     /// # Panics
     ///
@@ -255,28 +180,16 @@ impl<const Q: usize> Potts<Q> {
         Self::order_from_counts(&Self::label_counts(config), config.n_vars())
     }
 
-    /// The order parameter in its *vector* form:
-    /// `m = sqrt[(Q * sum_a f_a^2 - 1) / (Q - 1)]`, where `f_a` is the fraction
-    /// of sites carrying label `a`.
+    /// The order parameter in its *vector* form,
+    /// `m = sqrt[(Q * sum_a f_a^2 - 1) / (Q - 1)]`, where `f_a` is the
+    /// fraction of sites carrying label `a` — the length of the mean simplex
+    /// vector, and the convention most published Potts curves are.
     ///
-    /// The other convention in use, and the one most published Potts curves are.
-    /// It comes from a different construction: place the `Q` labels at the
-    /// vertices of a regular `Q-1` dimensional simplex, so that unit vectors
-    /// `e_a` satisfy `e_a . e_b = -1/(Q-1)` for `a != b` and sum to zero, and
-    /// take the length of the average `(1/N) sum_i e_{s_i}`. Expanding that
-    /// square collapses the vectors out entirely and leaves the populations,
-    /// which is why this costs the same scan
-    /// [`order_parameter`](Potts::order_parameter) does rather than any geometry.
-    ///
-    /// It agrees with the other convention at both ends — one at a uniform
-    /// configuration, zero at an equal split — and differs between them: half
-    /// the sites on one label and half on another gives `1/4` there and `1/2`
-    /// here. At `Q = 2` the simplex is an interval and the two coincide
-    /// identically, both reducing to `|M| / N` of the corresponding Ising field.
-    ///
-    /// This is the form whose `Q - 1` components make the Ising `3` in
+    /// Agrees with [`order_parameter`](Potts::order_parameter) at both ends
+    /// and differs in between. The simplex construction, and why its `Q - 1`
+    /// components make the Ising `3` in
     /// [`binder_cumulant`](crate::statistics::binder_cumulant) the wrong
-    /// normalization for Potts; `docs/potts.md` carries that argument.
+    /// normalization for Potts, are in `docs/potts.md`.
     ///
     /// # Panics
     ///
@@ -290,21 +203,14 @@ impl<const Q: usize> Potts<Q> {
     /// axis under periodic boundaries.
     ///
     /// Returns one row per axis, laid out exactly as [`Ising::correlator`](crate::models::ising::Ising::correlator)'s:
-    /// entry `μ`, index `r` covers displacements `r = 0..=L_μ/2`, the
-    /// non-redundant half that translation invariance leaves.
+    /// entry `μ`, index `r` covers displacements `r = 0..=L_μ/2`.
     ///
-    /// Unlike the Ising correlator this subtracts a floor, because the raw
-    /// agreement fraction does not decay to zero: two labels far enough apart to
-    /// be independent still agree with probability `1/Q`, so an uncorrelated
-    /// configuration gives `1/Q` at every separation rather than `0`. Taking
-    /// that off is what leaves a quantity that falls to zero in the disordered
-    /// phase the way `<s_i s_{i+r}>` does, and so what makes a correlation
-    /// length readable off the decay. The `r = 0` anchor is then `1 - 1/Q`
-    /// rather than Ising's `1`, since a site always agrees with itself.
-    ///
-    /// This is the raw per-config estimator only. The ensemble average and the
-    /// correlation-length fit are reductions over a chain of these arrays and
-    /// belong to statistics.
+    /// Unlike the Ising correlator this subtracts a floor: independent labels
+    /// still agree with probability `1/Q`, and taking that off is what makes
+    /// the disordered-phase decay reach zero and a correlation length readable.
+    /// The `r = 0` anchor is then `1 - 1/Q` rather than Ising's `1`. This is
+    /// the raw per-config estimator only; ensemble averages and fits belong to
+    /// statistics. See `docs/potts.md`.
     ///
     /// # Panics
     ///
@@ -348,11 +254,8 @@ impl<const Q: usize, const D: usize> Action<Q, D> for Potts<Q> {
             }
         }
 
-        // The offset term is `-sum_a h[a] * N_a`, so it needs the label
-        // populations and nothing about the geometry — the same counts the order
-        // parameters reduce. The symmetric model skips the scan outright rather
-        // than walking the lattice to multiply by zeros, which is worth the test
-        // because it is the default and what every exact result assumes.
+        // The offset term `-sum_a h[a] * N_a` needs only the label populations;
+        // the symmetric model — the default — skips the scan outright.
         let offset: f64 = if self.is_symmetric() {
             0.0
         } else {
@@ -381,17 +284,13 @@ impl<const Q: usize, const D: usize> Action<Q, D> for Potts<Q> {
             config.cell()
         );
 
-        // Only bonds touching `var` can change their agreement; every other bond
-        // reads two untouched labels and cancels. So
-        //
-        //     ΔE = -j * (agree_after - agree_before),
-        //
-        // where each term counts how many of the site's 2D neighbors carry the
-        // proposed or the current label. The two labels differ, so a neighbor
-        // contributes to at most one of the counts.
+        // Only bonds touching `var` change agreement, so
+        // ΔE = -j * (agree_after - agree_before), counting neighbors on the
+        // proposed and current labels. Once `Q > 2` the two counts are *not*
+        // complements: a neighbor may carry a third label and enter neither.
         let current = config.peek(var);
         if proposed == current {
-            return 0.0; // proposed state equals the current one
+            return 0.0;
         }
 
         // Integer accumulator, exact until the final scaling, as in `energy`.
@@ -401,9 +300,8 @@ impl<const Q: usize, const D: usize> Action<Q, D> for Potts<Q> {
             change += i64::from(s_j == proposed) - i64::from(s_j == current);
         }
 
-        // Only this site's own offset changes, and only by the difference
-        // between the two labels' entries — which is why a constant added to
-        // every entry is invisible to the chain.
+        // Only this site's own offset changes, by the difference between the
+        // two labels' entries — why a constant shift is invisible to the chain.
         let offset = self.h[proposed.index()] - self.h[current.index()];
 
         -self.j * change as f64 - offset
@@ -413,18 +311,10 @@ impl<const Q: usize, const D: usize> Action<Q, D> for Potts<Q> {
 /// The per-config measurement record for the Potts model, the counterpart of
 /// [`Sample`](crate::models::ising::Sample).
 ///
-/// It carries an order parameter where [`Sample`](crate::models::ising::Sample) carries a magnetization, and
-/// the difference is not a rename. Potts labels are unordered, so there is no
-/// signed sum to take: what the record holds is the population imbalance, which
-/// is already the analogue of `<|m|>` rather than the signed quantity both
-/// `<m²>` and `<|m|>` can be recovered from downstream.
-///
-/// Both order parameters are carried rather than one, because the literature
-/// uses both and they are not interchangeable away from the two ends. Neither is
-/// recoverable from the other, and a run compared against a published curve needs
-/// whichever that curve plotted — while the cost of having both is a second
-/// reduction over the same label counts, negligible beside the neighbor scan the
-/// energy already pays for.
+/// It carries an unsigned order parameter where [`Sample`](crate::models::ising::Sample)
+/// carries a signed magnetization — already the analogue of `<|m|>`, not a
+/// rename. Both conventions are carried because published curves use either
+/// and neither is recoverable from the other; see `docs/potts.md`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PottsSample {
     /// Total energy `H` of the configuration (from [`Action::energy`]).
@@ -435,23 +325,19 @@ pub struct PottsSample {
     /// [`Potts::order_parameter`]).
     pub order: f64,
     /// The order parameter in its vector form,
-    /// `m = sqrt[(Q · Σ_a f_a² − 1) / (Q − 1)]` — the length of the average over
-    /// the sites of unit vectors pointing at the vertices of a `Q − 1`
-    /// dimensional simplex (from [`Potts::simplex_order_parameter`]). Runs
-    /// between the same two limits, and sits above `order` in between.
+    /// `m = sqrt[(Q · Σ_a f_a² − 1) / (Q − 1)]` (from
+    /// [`Potts::simplex_order_parameter`]). Runs between the same two limits
+    /// as `order`, and sits above it in between.
     pub simplex_order: f64,
 }
 
 /// Measure one `config` of the Potts `model` on `lattice` into a
 /// [`PottsSample`].
 ///
-/// The primaries come from the seams the model exposes, as [`measure`](crate::models::ising::measure)'s do: `E`
-/// from the [`Action`] trait, the two order parameters from the same label
-/// counts. Both are reductions of one scan of the lattice, so this counts once
-/// and reduces twice rather than calling [`Potts::order_parameter`] and
-/// [`Potts::simplex_order_parameter`], which each count for themselves — the
-/// convenience those two offer a caller who wants only one is waste to a caller
-/// who wants both.
+/// `E` comes from the [`Action`] trait, as in [`measure`](crate::models::ising::measure);
+/// the two order parameters are reductions of one label scan, so this counts
+/// once and reduces twice rather than calling [`Potts::order_parameter`] and
+/// [`Potts::simplex_order_parameter`], which each count for themselves.
 pub fn potts_measure<const Q: usize, const D: usize>(
     model: &Potts<Q>,
     lattice: &Lattice<D>,
@@ -470,9 +356,8 @@ pub fn potts_measure<const Q: usize, const D: usize>(
 /// `C_r = ⟨delta(s_i, s_{i+r})⟩ − 1/Q` of a Potts `config` on `lattice`.
 ///
 /// Composes [`Potts::correlator`] exactly as [`correlator`](crate::models::ising::correlator) composes the Ising
-/// one. What differs is that these entries are already *connected*: two
-/// independent labels agree with probability `1/Q`, and the model takes that
-/// floor off, so nothing is left for a downstream subtraction to do.
+/// one; these entries are already *connected*, so nothing is left for a
+/// downstream subtraction to do.
 pub fn potts_correlator<const Q: usize, const D: usize>(
     model: &Potts<Q>,
     lattice: &Lattice<D>,
@@ -489,16 +374,10 @@ mod tests {
     use crate::models::deltas_match_from_scratch;
     use crate::models::ising::Ising;
 
-    /// The Potts counterpart, at three states rather than two.
-    ///
-    /// Three is the point of it: `Q = 2` would run the same arithmetic the Ising
-    /// sweep above already covers, while at three a site's neighbors can carry a
-    /// label that is neither the current nor the proposed one, so the `after`
-    /// and `before` counts stop being complements of each other. A delta written
-    /// as though they were would pass at two states and fail here.
-    ///
-    /// See [`ising_deltas_match_from_scratch_in_every_dimension`] for why the
-    /// shapes are shaped this way.
+    /// The Potts counterpart of the Ising sweep, at three states: with a third
+    /// label in play the `after` and `before` counts stop being complements,
+    /// so a delta written as though they were passes at two states and fails
+    /// here.
     #[test]
     fn potts_deltas_match_from_scratch_in_every_dimension() {
         fn probe<const D: usize>(shape: [usize; D]) {
@@ -515,19 +394,14 @@ mod tests {
         probe([2, 2, 2, 2, 3, 2, 2, 2, 2, 2]);
     }
 
-    /// A uniform Potts configuration is the ground state: every bond agrees, so
-    /// the energy is `-j` times the bond count, whichever label it settled on.
-    ///
-    /// Running it at each of the `Q` labels in turn is the cheapest form of the
-    /// relabelling symmetry — nothing may single out label `0`, which is the one
-    /// a cold start happens to pick.
+    /// A uniform configuration is the ground state at each of the `Q` labels
+    /// in turn — nothing may single out label `0`, the one a cold start picks.
     #[test]
     fn a_uniform_potts_configuration_has_every_bond_agreeing() {
         const Q: usize = 3;
         let lat = Lattice::new([4, 6, 4]);
         let action = Potts::symmetric(1.5);
-        // A periodic lattice has `D` forward bonds per site, which is exactly
-        // the link count.
+        // `D` forward bonds per site is exactly the link count.
         let n_bonds = lat.n_links() as f64;
 
         for label in 0..Q {
@@ -545,14 +419,9 @@ mod tests {
         }
     }
 
-    /// The Potts symmetry, which has no Ising analogue: relabelling every site
-    /// by one permutation of the `Q` states leaves the energy alone.
-    ///
-    /// This is the sharpest check that the energy compares labels rather than
-    /// reading them as numbers. A term that decoded an index into a value — the
-    /// way both other models do — would move under a permutation that reorders
-    /// those values, while the count of agreeing bonds cannot: a permutation is
-    /// a bijection, so `s_i == s_j` before and after are the same statement.
+    /// Relabelling every site by one permutation of the `Q` states moves
+    /// nothing measured — the sharpest check that the energy compares labels
+    /// rather than reading them as numbers.
     #[test]
     fn potts_energy_is_invariant_under_a_global_relabelling() {
         const Q: usize = 4;
@@ -565,8 +434,7 @@ mod tests {
         let simplex_before = action.simplex_order_parameter(&config);
         let correlator_before = action.correlator(&lat, &config);
 
-        // A three-cycle on the first three labels, leaving the fourth fixed, so
-        // the permutation is neither the identity nor a mere swap.
+        // A three-cycle: neither the identity nor a mere swap.
         let permutation = [1usize, 2, 0, 3];
         let mut relabelled = config.clone();
         for site in 0..config.n_vars() {
@@ -584,15 +452,10 @@ mod tests {
         assert_eq!(action.correlator(&lat, &relabelled), correlator_before);
     }
 
-    /// Potts at two states is Ising at half the coupling: the two price every
-    /// move identically.
-    ///
-    /// Reading the two labels as `±1` gives `delta = (1 + s_i s_j) / 2`, so a
-    /// `Potts` bond at coupling `2J` is a zero-field `Ising` bond at `J` plus the
-    /// constant `-J`. Constants cancel in a difference, so the two `energy_delta`
-    /// values agree exactly, and the whole-lattice energies differ by `-J` times
-    /// the bond count. Two independently written actions landing on the same
-    /// numbers is what makes this worth asserting rather than deriving.
+    /// Potts at coupling `2J` prices every move exactly like zero-field Ising
+    /// at `J`, and the whole-lattice energies differ by `-J` per bond — two
+    /// independently written actions landing on the same numbers. The map is
+    /// in `docs/potts.md`.
     #[test]
     fn potts_at_two_states_prices_moves_like_ising() {
         let lat = Lattice::new([4, 6]);
@@ -621,8 +484,7 @@ mod tests {
     }
 
     /// A uniform configuration agrees at every separation, so every correlator
-    /// entry is the full `1 - 1/Q` — the connected form's ceiling, and the value
-    /// its `r = 0` anchor takes on any configuration at all.
+    /// entry is the connected form's ceiling `1 - 1/Q`.
     #[test]
     fn the_potts_correlator_of_a_uniform_config_is_one_minus_one_over_q() {
         const Q: usize = 3;
@@ -639,13 +501,9 @@ mod tests {
         }
     }
 
-    /// Independent labels agree at the uncorrelated rate `1/Q`, which is exactly
-    /// what the connected form subtracts — so every entry past `r = 0` sits near
-    /// zero, while `r = 0` keeps its `1 - 1/Q` anchor.
-    ///
-    /// This is the property that makes the subtraction worth doing: without it
-    /// the correlator would tend to `1/Q` rather than to zero at large
-    /// separation, and no correlation length could be read off the decay.
+    /// Independent labels agree at the uncorrelated rate `1/Q`, which is what
+    /// the connected form subtracts — every entry past `r = 0` sits near zero,
+    /// while `r = 0` keeps its `1 - 1/Q` anchor.
     #[test]
     fn the_potts_correlator_of_independent_labels_is_near_zero() {
         const Q: usize = 3;
@@ -669,12 +527,8 @@ mod tests {
         }
     }
 
-    /// The order parameter runs from 0 to 1: an equal split among the `Q` labels
-    /// is the disordered floor, a single label the ordered ceiling.
-    ///
-    /// The floor is the reason for the `(Q f_max - 1) / (Q - 1)` normalization at
-    /// all — the raw most-populated fraction would report `1/Q` there, which is
-    /// a different number for every `Q` and no use as a scale.
+    /// The order parameter runs from 0 at an equal split to 1 on a single
+    /// label — what the `(Q f_max - 1) / (Q - 1)` normalization is for.
     #[test]
     fn the_order_parameter_spans_zero_to_one() {
         const Q: usize = 4;
@@ -699,15 +553,9 @@ mod tests {
         assert!((action.order_parameter(&partial) - 1.0 / 3.0).abs() < 1e-12);
     }
 
-    /// The two order parameters agree at both ends and differ in between.
-    ///
-    /// The ends are what the normalizations are chosen for, so agreeing there is
-    /// no evidence that the two are different quantities — the half-and-half
-    /// split is. It gives `1/4` under the most-populated reading, since one
-    /// label holds half the sites, and `1/2` under the vector one, since two
-    /// simplex vertices at sixty degrees average to half a unit vector. Anyone
-    /// comparing a run against a published number has to know which of these it
-    /// was, which is the whole reason both are kept.
+    /// The two order parameters agree at both ends and differ in between: the
+    /// half-and-half split gives `1/4` under the most-populated reading and
+    /// `1/2` under the vector one, which is the whole reason both are kept.
     #[test]
     fn the_two_order_parameters_agree_at_the_ends_and_differ_between_them() {
         const Q: usize = 3;
@@ -733,16 +581,9 @@ mod tests {
         assert!((action.simplex_order_parameter(&half) - 0.5).abs() < 1e-12);
     }
 
-    /// At two states the two conventions are the same function, and both are the
-    /// Ising magnitude.
-    ///
-    /// A `Q - 1` dimensional simplex is an interval at `Q = 2`, so the vector
-    /// construction has nowhere to point but along it and collapses onto the
-    /// population imbalance the other convention reads directly. Both then equal
-    /// `|M| / N` of the Ising field the same labels describe, which ties the two
-    /// new quantities to one that was already tested rather than only to each
-    /// other. Every configuration on the lattice is checked, since the identity
-    /// is exact rather than statistical.
+    /// At two states the simplex is an interval, so the two conventions are
+    /// the same function, and both equal `|M| / N` of the corresponding Ising
+    /// field — tying both to a quantity that was already tested.
     #[test]
     fn at_two_states_both_order_parameters_are_the_ising_magnitude() {
         let lat = Lattice::new([4, 4]);
@@ -760,13 +601,8 @@ mod tests {
         }
     }
 
-    /// The per-label offset does what its definition says: each site pays the
-    /// entry matching its own label, with no reference to its neighbors.
-    ///
-    /// Checked on a configuration whose label populations are fixed by
-    /// construction, so the expected energy is arithmetic rather than a
-    /// reference run: at `j = 0` the coupling term vanishes and the whole energy
-    /// is the offset sum, which the counts give exactly.
+    /// Each site pays the offset entry matching its own label: at `j = 0` the
+    /// whole energy is the offset sum, fixed by the populations.
     #[test]
     fn the_offsets_are_paid_once_per_site_carrying_the_label() {
         const Q: usize = 3;
@@ -784,14 +620,10 @@ mod tests {
         assert_eq!(action.energy(&lat, &config), expected);
     }
 
-    /// A constant added to every offset is invisible to the chain.
-    ///
-    /// The reason only differences carry content: shifting every entry by the
-    /// same amount changes the energy of *every* configuration by the same
-    /// constant, so it cancels out of every `energy_delta` and out of every
-    /// Boltzmann ratio the sampler forms. Both halves are asserted, since a
-    /// delta that quietly disagreed with the whole-lattice energy would break
-    /// the telescoping identity the sweeps rely on.
+    /// A constant added to every offset shifts every configuration's energy by
+    /// the same amount, so it cancels out of every `energy_delta` and
+    /// Boltzmann ratio — the reason only differences between entries carry
+    /// content.
     #[test]
     fn a_constant_added_to_every_offset_shifts_the_energy_and_nothing_else() {
         const Q: usize = 3;
@@ -809,8 +641,6 @@ mod tests {
             base.energy(&lat, &config) - sites
         );
 
-        // Every move is priced identically, which is what makes the two runs the
-        // same chain rather than merely the same distribution.
         for site in 0..config.n_vars() {
             for label in 0..Q {
                 let proposed = State::new(label).unwrap();
@@ -823,14 +653,8 @@ mod tests {
         }
     }
 
-    /// An offset breaks the relabelling symmetry, which is the whole point of
-    /// having one.
-    ///
-    /// The symmetric model's invariance is asserted in
-    /// [`potts_energy_is_invariant_under_a_global_relabelling`]; this is the
-    /// other side of it. Permuting the labels while leaving `h` alone now moves
-    /// the energy, because a site that was paying one entry starts paying
-    /// another.
+    /// An offset breaks the relabelling symmetry — the other side of
+    /// [`potts_energy_is_invariant_under_a_global_relabelling`].
     #[test]
     fn an_offset_breaks_the_relabelling_symmetry() {
         const Q: usize = 3;
@@ -857,12 +681,8 @@ mod tests {
         assert_ne!(action.energy(&lat, &relabelled), before);
     }
 
-    /// The offsets reproduce an Ising field at two states.
-    ///
-    /// `Potts` at coupling `2J` already matches zero-field `Ising` at `J`; this
-    /// extends that to the field. Ising's `-h * sum_i s_i` gives `+h` to an up
-    /// spin and `-h` to a down one, so `[H, -H]` is the same term written per
-    /// label, and the two actions must again price every move identically.
+    /// Offsets `[H, -H]` at coupling `2J` reproduce an Ising field of `H` at
+    /// `J`: the two actions must again price every move identically.
     #[test]
     fn the_offsets_reproduce_an_ising_field_at_two_states() {
         let lat = Lattice::new([4, 6]);
@@ -873,8 +693,7 @@ mod tests {
         let mut rng = crate::rng::RandRng::seed_from_u64(20260814);
         let config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
-        // Only the coupling term's constant separates the whole energies; the
-        // field terms are equal outright.
+        // Only the coupling term's constant separates the whole energies.
         let offset = -j * lat.n_links() as f64;
         assert_eq!(
             potts.energy(&lat, &config),
@@ -902,14 +721,9 @@ mod tests {
         Potts::symmetric(1.0).energy(&lat, &config);
     }
 
-    /// The state floor holds in release, unlike the cell-kind guards.
-    ///
-    /// Deliberately not gated on `debug_assertions`, for the reason
-    /// [`the_gauge_action_refuses_one_dimension_in_any_profile`] is not: `Q` is a
-    /// compile-time constant, so a real `assert!` folds away to nothing and there
-    /// is no reason to make it debug-only. At one state every bond agrees for
-    /// every configuration, so the chain would report a constant energy and an
-    /// order parameter divided by zero — numbers, not a failure.
+    /// The state floor holds in release, unlike the cell-kind guards: `Q` is a
+    /// compile-time constant, so a real `assert!` folds away to nothing and
+    /// there is no reason to make it debug-only.
     #[test]
     #[should_panic(expected = "at least two states")]
     fn the_potts_action_refuses_one_state_in_any_profile() {
@@ -920,9 +734,9 @@ mod tests {
 
     #[test]
     fn potts_measure_bundles_energy_and_the_order_parameter() {
-        // Uniform 4x6 at three states, j = 2: every one of the lattice's
-        // `D * N = 48` bonds agrees, so E = -2 * 48, and one label holding every
-        // site puts the order parameter at its ceiling.
+        // Uniform 4x6 at three states, j = 2: all 48 bonds agree, so
+        // E = -2 * 48, and one label holding every site puts both order
+        // parameters at their ceiling.
         let lat = Lattice::new([4, 6]);
         let model = Potts::<3>::symmetric(2.0);
         let config = Configuration::<3>::cold(&lat, Cell::Site);
@@ -933,15 +747,12 @@ mod tests {
         assert_eq!(sample.simplex_order, model.simplex_order_parameter(&config));
         assert_eq!(sample.energy, -96.0);
         assert_eq!(sample.order, 1.0);
-        // A uniform field is where the two conventions coincide.
         assert_eq!(sample.simplex_order, 1.0);
     }
 
     #[test]
     fn potts_measure_carries_both_order_parameter_conventions() {
-        // Half the sites on one label and half on another: the record must show
-        // the two conventions genuinely disagreeing, or carrying both would be
-        // storing one number twice.
+        // A half-and-half split makes the two conventions genuinely disagree.
         let lat = Lattice::new([4, 4]);
         let model = Potts::<3>::symmetric(1.0);
         let mut config = Configuration::<3>::cold(&lat, Cell::Site);
@@ -956,8 +767,7 @@ mod tests {
 
     #[test]
     fn potts_correlator_wraps_the_model_measurement() {
-        // A uniform field agrees at every separation, so every entry is the
-        // connected form's ceiling `1 - 1/Q`, including the `r = 0` anchor.
+        // A uniform field puts every entry at the ceiling `1 - 1/Q`.
         let lat = Lattice::new([4, 4]);
         let model = Potts::<3>::symmetric(1.0);
         let config = Configuration::<3>::cold(&lat, Cell::Site);

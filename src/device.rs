@@ -1,37 +1,22 @@
 //! Device plumbing shared by every GPU backend: acquiring a device, and driving
 //! a color-pass sweep in batches.
 //!
-//! What lives here is everything about running a checkerboard on a GPU that is
-//! *not* about a particular model. [`Gpu`] owns the device and queue.
-//! `DeviceSweeper` owns the loop: encode `colors` dispatches per sweep, run
-//! `sweeps_between` of them per sample, copy a whole batch back in one transfer,
-//! and hand out [`Configuration`]s until the batch drains.
-//!
-//! All three model backends —
+//! [`Gpu`] owns the device and queue. `DeviceSweeper` owns the loop: encode
+//! `colors` dispatches per sweep, run `sweeps_between` of them per sample, copy
+//! a whole batch back in one transfer, and hand out [`Configuration`]s until
+//! the batch drains. Each model backend —
 //! [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain),
-//! [`GpuGaugeChain`](crate::models::gauge::gpu::GpuGaugeChain), and
-//! [`GpuPottsChain`](crate::models::potts::gpu::GpuPottsChain) — are a constructor plus a
-//! `DeviceSweeper`. They differ in what a color *is* (site parity, or direction
-//! and base-site parity), how many there are, which shader prices a move, how
-//! many states a variable has, and which lattice grade the variables sit on;
-//! they do not differ in any of the batching. Keeping that in one place is what
-//! stops a fix to the read-back path landing in one backend and silently not the
-//! others.
+//! [`GpuGaugeChain`](crate::models::gauge::gpu::GpuGaugeChain),
+//! [`GpuPottsChain`](crate::models::potts::gpu::GpuPottsChain) — is a
+//! constructor plus a `DeviceSweeper`; the batching is deliberately identical
+//! across them.
 //!
-//! Neither the batching nor either kernel knows the lattice dimension. What the
-//! kernels would otherwise have to derive from it — a site's coordinate-sum
-//! parity — arrives instead as an uploaded table, since the host already holds
-//! one and the CPU schedules read it; the one number a kernel still needs, `D`
-//! itself, is passed as a WGSL `override` and resolved when the pipeline is
-//! built, so the compiled code sees a literal.
-//!
-//! The batching is the reason a device round-trip is cheap: the configuration
-//! stays in a device buffer and crosses the host boundary once per *batch*, not
-//! once per sample. `batch` trades the per-sample launch and transfer overhead
-//! against holding that many configurations at once.
-//!
-//! `wgpu`'s setup is async; the async calls are driven with `pollster::block_on`
-//! at construction so the public API stays synchronous.
+//! Neither the batching nor any kernel knows the lattice dimension: site parity
+//! arrives as an uploaded table, and `D` itself is a WGSL `override` resolved at
+//! pipeline build, so compiled kernels see literals. The configuration stays in
+//! a device buffer and crosses the host boundary once per *batch*, not per
+//! sample. `wgpu`'s async setup is driven with `pollster::block_on` at
+//! construction so the public API stays synchronous.
 
 use std::collections::VecDeque;
 
@@ -42,18 +27,13 @@ use crate::lattice::Lattice;
 use crate::state::State;
 
 /// An initialized GPU device and its command queue.
-///
-/// Owns the two handles every later step needs: the [`Device`](wgpu::Device) that
-/// allocates buffers and compiles shaders, and the [`Queue`](wgpu::Queue) that
-/// submits work.
 pub struct Gpu {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
 }
 
 impl Gpu {
-    /// Acquire a compute-capable device, or `None` if no adapter is available
-    /// (a headless machine, or one without a supported backend).
+    /// Acquire a compute-capable device, or `None` if no adapter is available.
     ///
     /// Blocks on `wgpu`'s async setup so callers stay synchronous. Requests the
     /// push-constant feature, which `DeviceSweeper` uses to pass the
@@ -63,9 +43,8 @@ impl Gpu {
     }
 
     async fn new_async() -> Option<Self> {
-        // Built from the environment so `WGPU_BACKEND` can pin the backend, which
-        // both aids debugging and gives the tests a way to simulate a machine
-        // with no adapter. Unset, it enables every backend, as the default does.
+        // From the environment so `WGPU_BACKEND` can pin the backend — for
+        // debugging, and so tests can simulate a machine with no adapter.
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -75,19 +54,12 @@ impl Gpu {
             })
             .await
             .ok()?;
-        // Everything the adapter offers, not `Limits::default()`. The defaults
-        // are the WebGPU baseline a browser guarantees — a 128 MiB storage
-        // binding among them — and asking for them on a desktop adapter caps the
-        // crate an order of magnitude below the hardware. A lattice run walks
-        // into that quickly, because the tables grow with the volume *and* with
-        // the dimension: a link's staple row is `6(D - 1)` entries wide, so a
-        // six-dimensional box of side eight already needs 188 MB for a table any
-        // real card holds without noticing. Requesting the adapter's own limits
-        // always succeeds, since they are by definition what it supports.
-        //
-        // The cost is the portability the defaults buy: a pipeline that fits
-        // here need not fit in a browser. That is a trade worth revisiting if a
-        // `wasm` target ever matters, and free until then.
+        // Everything the adapter offers, not `Limits::default()`: the defaults
+        // are the WebGPU browser baseline (a 128 MiB storage binding among
+        // them), which the lookup tables outgrow quickly since they scale with
+        // volume and dimension. Requesting the adapter's own limits always
+        // succeeds. The cost is browser portability — revisit if a `wasm`
+        // target ever matters.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("plaquette compute device"),
@@ -112,22 +84,13 @@ const WORKGROUP_SIZE: u32 = 64;
 /// `per_axis` workgroups per dispatch axis.
 ///
 /// A dispatch is capped at `max_compute_workgroups_per_dimension` *per axis* —
-/// 65535 on essentially every adapter, and unlike the memory limits it is an
-/// API-level ceiling rather than a conservative default, so requesting the
-/// adapter's limits does not move it. One row of workgroups therefore covers
-/// about 4.2 million threads, which a lattice reaches at side 161 in three
-/// dimensions but side 12 in six, since the volume grows as `L^D`.
-///
-/// Past that the launch becomes a rectangle and the shader folds the two axes
-/// back into one index (`linear_index` in the preamble). Rows are filled
-/// completely, so the mapping stays contiguous and the last row's leftover
-/// threads fall out on the kernel's own bounds check. Two axes raise the ceiling
-/// to roughly `65535^2` workgroups, which no lattice will reach before its
-/// buffers do.
-/// The cap is a parameter rather than read from the device here, so the
-/// arithmetic can be checked without one — and against a small cap, since the
-/// interesting behavior starts past `per_axis * WORKGROUP_SIZE` threads and no
-/// lattice small enough for a test reaches that at the real limit.
+/// an API-level ceiling (65535 on essentially every adapter) that requesting
+/// the adapter's limits does not move. Past one row the launch becomes a
+/// rectangle and the shader folds the two axes back into one index
+/// (`linear_index` in the preamble); rows are filled completely, so the mapping
+/// stays contiguous and the last row's leftover threads fall out on the
+/// kernel's own bounds check. The cap is a parameter so the arithmetic can be
+/// tested without a device.
 fn grid_for(per_axis: u32, threads: usize) -> (u32, u32) {
     let total = (threads as u64).div_ceil(u64::from(WORKGROUP_SIZE)).max(1);
     let width = total.min(u64::from(per_axis));
@@ -145,10 +108,7 @@ fn grid_for(per_axis: u32, threads: usize) -> (u32, u32) {
 /// The two limits differ — a buffer may be larger than any one binding of it —
 /// and both are checked, since every buffer here is bound whole. `what` names
 /// the table, because a wgpu validation failure names only a byte count and a
-/// binding index, and a caller reading that has no way back to a lattice. What
-/// each table's width is made of belongs to the backend that built it, not
-/// here, so the message says what to change and leaves the layout to the
-/// backend's own documentation.
+/// binding index, which a caller cannot turn back into a lattice.
 fn check_fits(device: &wgpu::Device, bytes: u64, what: &str) {
     let limits = device.limits();
     let binding = u64::from(limits.max_storage_buffer_binding_size);
@@ -166,11 +126,10 @@ fn check_fits(device: &wgpu::Device, bytes: u64, what: &str) {
 
 /// Roughly how many compute passes one command buffer may encode.
 ///
-/// The bound that matters is passes per submission, not sweeps: a sweep is
-/// `colors` passes, so a six-color gauge sweep fills a command buffer three
-/// times faster than a two-color Ising one. Deriving the sweep chunk from this
-/// is what keeps the two backends' submission sizes comparable without each
-/// picking its own unexplained constant.
+/// The budget is in passes, not sweeps: a sweep is `colors` passes, so a
+/// six-color gauge sweep fills a command buffer three times faster than a
+/// two-color Ising one. Deriving the sweep chunk from this keeps the backends'
+/// submission sizes comparable.
 const MAX_PASSES_PER_SUBMIT: usize = 512;
 
 /// The preamble every checkerboard shader is compiled with: the state encoding
@@ -179,8 +138,8 @@ const MAX_PASSES_PER_SUBMIT: usize = 512;
 ///
 /// Both `include_str!` paths resolve relative to the file that *invokes* the
 /// macro — each model's `gpu.rs` under `src/models/<name>/` — which is why the
-/// prelude climbs two directories back to the crate root and why each backend
-/// names its own `checkerboard.wgsl` bare.
+/// prelude climbs two directories and each backend names its own
+/// `checkerboard.wgsl` bare.
 macro_rules! shader_source {
     ($model:literal) => {
         concat!(
@@ -197,10 +156,6 @@ pub(crate) use shader_source;
 const PUSH_CONSTANT_BYTES: u32 = 8;
 
 /// Everything a model backend must decide before a sweep can run.
-///
-/// Grouped into one struct rather than passed loose because the list is long and
-/// positional: the alternative is a thirteen-argument constructor where `n_vars`
-/// and `threads` are both counts and nothing but their order says which is which.
 pub(crate) struct SweepSetup<'a> {
     /// Prefix for the device object labels, e.g. `"gauge checkerboard"`.
     pub label: &'a str,
@@ -213,14 +168,13 @@ pub(crate) struct SweepSetup<'a> {
     /// for a site kernel, staples for a link one.
     pub table: &'a [u32],
     /// Each site's coordinate-sum parity, one `u32` per site, from
-    /// [`Lattice::site_parity`](crate::lattice::Lattice::site_parity). Both
-    /// kernels test a thread's color against this rather than recomputing it,
-    /// which is what keeps them free of any per-axis arithmetic.
+    /// [`Lattice::site_parity`](crate::lattice::Lattice::site_parity). Kernels
+    /// test a thread's color against this rather than recomputing it, which
+    /// keeps them free of per-axis arithmetic.
     pub site_color: &'a [u32],
     /// The model's uniform block, already laid out for WGSL.
     pub params: &'a [u8],
-    /// The lattice dimension, supplied to the shader as the `D` override. Every
-    /// other dimension-dependent constant a kernel uses derives from it in WGSL.
+    /// The lattice dimension, supplied to the shader as the `D` override.
     pub dimension: u32,
     /// Which lattice cell the variables sit on, so a read-back configuration
     /// knows what its indices mean.
@@ -243,18 +197,12 @@ pub(crate) struct SweepSetup<'a> {
 /// Drives a color-pass sweep on the device and yields sampled configurations in
 /// batches.
 ///
-/// Everything model-specific — the shader, the lookup table, what a color means
-/// — is decided by the caller and arrives in a [`SweepSetup`]; this type knows
-/// only how many colors there are, how wide to dispatch, and how to get a batch
-/// back to the host. It deliberately does *not* keep the lattice: rebuilding a
-/// configuration needs a length and a cell kind, both of which it stores, and
-/// holding the geometry instead would pin a copy of the staple table — 75 MB on
-/// a 64³ gauge run — for the chain's whole lifetime.
-///
-/// `Q` is carried only so the read-back knows what a device word means: nothing
-/// in the batching reads a variable's value, and a kernel that needs the state
-/// count puts it in its own uniform block. It is a type parameter rather than a
-/// field because [`Configuration<Q>`] is what the sweeper hands out.
+/// Everything model-specific arrives in a [`SweepSetup`]. It deliberately does
+/// *not* keep the lattice: rebuilding a configuration needs only a length and a
+/// cell kind, and holding the geometry would pin a copy of the staple table —
+/// 75 MB on a 64³ gauge run — for the chain's whole lifetime. `Q` is carried
+/// only so the read-back knows what a device word means; nothing in the
+/// batching reads a variable's value.
 pub(crate) struct DeviceSweeper<const Q: usize> {
     gpu: Gpu,
     pipeline: wgpu::ComputePipeline,
@@ -283,11 +231,10 @@ impl<const Q: usize> DeviceSweeper<Q> {
     /// Upload the buffers, compile the shader, build the pipeline, and assemble
     /// a sweeper over the lot.
     ///
-    /// The bind group is the same four slots for every backend — the variables
-    /// read-write, the lookup table read-only, the uniform block, the color
-    /// table read-only — which is what lets one builder serve both. A backend
-    /// that needed a fifth would have outgrown this, and should say so by not
-    /// using it rather than by widening the layout for everyone.
+    /// The bind group is the same four slots for every backend — variables
+    /// read-write, lookup table read-only, uniform block, color table
+    /// read-only. A backend needing a fifth has outgrown this builder; don't
+    /// widen the layout for everyone.
     pub(crate) fn build(gpu: Gpu, setup: SweepSetup<'_>) -> Self {
         let SweepSetup {
             label,
@@ -306,10 +253,8 @@ impl<const Q: usize> DeviceSweeper<Q> {
         } = setup;
         let device = &gpu.device;
 
-        // Everything the device has to hold, checked before anything is created.
-        // A limit tripped inside `wgpu` surfaces as a validation failure naming a
-        // byte count and a binding index, which a caller cannot turn back into a
-        // lattice; these say which table it was and what to shrink.
+        // Size checks before anything is created, so a limit surfaces as a
+        // message naming the table rather than a wgpu validation failure.
         debug_assert_eq!(
             vars_init.len(),
             n_vars,
@@ -328,11 +273,11 @@ impl<const Q: usize> DeviceSweeper<Q> {
             &format!("{label} table ({} entries)", table.len()),
         );
 
-        // The batch is a performance knob rather than a physics one — the samples
-        // are identical however it is set — so a staging buffer that will not fit
-        // is answered by holding fewer samples per round trip rather than by
-        // refusing the run. One slot is the variable buffer's size, already
-        // checked above, so the clamp is all the staging buffer needs.
+        // The batch is a performance knob, not a physics one, so a staging
+        // buffer that will not fit is answered by holding fewer samples per
+        // round trip rather than by refusing the run. One slot is the variable
+        // buffer's size, already checked above, so the clamp is all the staging
+        // buffer needs.
         let batch =
             batch.min((device.limits().max_buffer_size / sample_bytes.max(1)).max(1) as usize);
 
@@ -389,9 +334,9 @@ impl<const Q: usize> DeviceSweeper<Q> {
             layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some("sweep"),
-            // The one place the lattice dimension reaches the device. Resolved
-            // here rather than compiled into the source, so a kernel's loop
-            // bounds are still constants by the time the shader is translated.
+            // The one place the lattice dimension reaches the device: the `D`
+            // override, resolved here so kernel loop bounds are still constants
+            // when the shader is translated.
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: &[("D", f64::from(dimension))],
                 ..Default::default()
@@ -461,10 +406,8 @@ impl<const Q: usize> DeviceSweeper<Q> {
         }
     }
 
-    /// How many sweeps fit in one command buffer under the pass budget, at least
-    /// one. The budget is in passes rather than sweeps because a sweep is
-    /// `colors` of them, so a six-color gauge sweep fills a command buffer three
-    /// times faster than a two-color Ising one.
+    /// How many sweeps fit in one command buffer under the pass budget, at
+    /// least one — see [`MAX_PASSES_PER_SUBMIT`].
     fn sweeps_per_submit(&self) -> usize {
         (MAX_PASSES_PER_SUBMIT / self.colors as usize).max(1)
     }
@@ -502,10 +445,9 @@ impl<const Q: usize> DeviceSweeper<Q> {
         let stride = (n * std::mem::size_of::<u32>()) as u64;
 
         // One transfer per batch, but not necessarily one submission: the same
-        // pass budget `advance` respects applies here, and a batch of 64 samples
-        // at a stride of 10 sweeps would otherwise encode several thousand passes
-        // into a single command buffer. Submissions stay ordered, so splitting
-        // one batch across several is invisible to the result.
+        // pass budget `advance` respects applies here. Submissions stay
+        // ordered, so splitting a batch across several is invisible to the
+        // result.
         let mut encoder = self.encoder("sample batch");
         let mut sweeps_encoded = 0;
         for k in 0..self.batch {
@@ -523,9 +465,8 @@ impl<const Q: usize> DeviceSweeper<Q> {
         }
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
 
-        // Map the batch back in one transfer and build the configurations inside
-        // the mapped scope, so the words are read once rather than copied into an
-        // owned buffer first.
+        // Build the configurations inside the mapped scope, so the words are
+        // read once rather than copied into an owned buffer first.
         let slice = self.staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
@@ -564,21 +505,16 @@ impl<const Q: usize> DeviceSweeper<Q> {
 /// How many samples a GPU run produces per device round-trip.
 ///
 /// A performance knob, not a physics one — the samples are identical regardless
-/// — so it is a default here rather than a config field, and it is a property of
-/// the device round-trip rather than of either model.
+/// — so it is a default here rather than a config field.
 pub(crate) const GPU_BATCH: usize = 64;
 
 /// Assert every extent is even, the precondition a parallel color pass carries.
 ///
 /// Under periodic boundaries an odd extent wraps a variable onto a same-color
 /// one, so a color stops being collision-free and detailed balance breaks
-/// silently. `what` names the variables for the message. A sequential CPU
-/// schedule has no such requirement — see `docs/metropolis.md`.
-///
-/// The config schemas check the same thing through
-/// [`check_updater`](crate::config::check_updater) so a bad shape is a load-time
-/// error; this is the guard for the constructors, which are reachable with no
-/// config at all.
+/// silently — see `docs/metropolis.md`. The config schemas check the same thing
+/// through [`check_updater`](crate::config::check_updater); this guards the
+/// constructors, which are reachable with no config at all.
 ///
 /// # Panics
 ///
@@ -593,10 +529,8 @@ pub(crate) fn assert_even_extents(shape: &[usize], what: &str) {
 /// A configuration's variables in the form the kernels read: one `u32` state
 /// index each, in lattice index order.
 ///
-/// All three backends upload their start this way, and it is one line each — but
-/// it is the line that says what a device word *is*, and `DeviceSweeper`'s
-/// read-back path reverses exactly this. Keeping the two halves of that
-/// encoding within sight of each other is the point.
+/// This line says what a device word *is*; `DeviceSweeper`'s read-back path
+/// reverses exactly this encoding.
 pub(crate) fn state_words<const Q: usize>(config: &Configuration<Q>) -> Vec<u32> {
     config
         .variables()
@@ -608,12 +542,10 @@ pub(crate) fn state_words<const Q: usize>(config: &Configuration<Q>) -> Vec<u32>
 /// Every site's neighbor row, flattened in site order — the table a site kernel
 /// prices a move against.
 ///
-/// Shared by the two site backends rather than written out twice, because the
-/// capacity hint is tied to
-/// [`neighbor_stride`](crate::lattice::Lattice::neighbor_stride) and the flat
-/// layout is a contract with the shader's `site * N_NEIGHBORS + d` indexing. A
-/// copy of this that drifted from the stride would over- or under-allocate
-/// silently. The gauge backend has its own, built from staples instead.
+/// The flat layout is a contract with the shader's `site * N_NEIGHBORS + d`
+/// indexing, with the stride from
+/// [`neighbor_stride`](crate::lattice::Lattice::neighbor_stride). The gauge
+/// backend has its own table, built from staples instead.
 pub(crate) fn site_neighbor_table<const D: usize>(lattice: &Lattice<D>) -> Vec<u32> {
     let mut table = Vec::with_capacity(lattice.n_sites() * Lattice::<D>::neighbor_stride());
     for site in 0..lattice.n_sites() {
@@ -624,9 +556,8 @@ pub(crate) fn site_neighbor_table<const D: usize>(lattice: &Lattice<D>) -> Vec<u
 
 /// Each site's checkerboard color, in the form the kernels read.
 ///
-/// Both backends upload this and neither derives it: the lattice already holds
-/// the parities, the CPU schedules read the same table, and a kernel recomputing
-/// coordinate arithmetic is what tied the shaders to a fixed dimension before.
+/// Uploaded rather than derived on the device: a kernel recomputing coordinate
+/// arithmetic is what tied the shaders to a fixed dimension before.
 pub(crate) fn site_colors<const D: usize>(lattice: &Lattice<D>) -> Vec<u32> {
     (0..lattice.n_sites())
         .map(|site| lattice.site_parity(site) as u32)
@@ -669,11 +600,10 @@ pub(crate) fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 
 /// A device for a GPU test, or `None` when this machine has no adapter.
 ///
-/// Skipping keeps the suite green on a machine without a GPU, but it would also
-/// hide a driver that failed to load where a device is expected, since a skipped
-/// test and a passing one look alike. Setting `PLAQUETTE_REQUIRE_GPU` — as CI
-/// does, alongside a software Vulkan driver — turns a missing adapter into a
-/// failure instead.
+/// Skipping keeps the suite green without a GPU but would also hide a driver
+/// that failed to load where one is expected. Setting `PLAQUETTE_REQUIRE_GPU` —
+/// as CI does, alongside a software Vulkan driver — turns a missing adapter
+/// into a failure instead.
 #[cfg(test)]
 pub(crate) fn require_gpu() -> Option<Gpu> {
     match Gpu::new() {

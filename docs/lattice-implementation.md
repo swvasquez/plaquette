@@ -64,9 +64,10 @@ never needs a name for the pair. We fuse them because a link then looks like a
 site to everything upstream: a gauge configuration is a `Configuration` of
 `n_links` variables, and the existing sampler, updater, and observables carry it
 unchanged. The cost is that the packing is an implementation detail masquerading
-as geometry, so it is kept private — `link_at(site, dir)` and `link_base(link)`
-do the arithmetic, the public `link_index` takes coordinates, and the parts come
-back separately through `link_site` and `link_direction`.
+as geometry, so the arithmetic is confined to a few accessors rather than done
+by callers. `link_index` takes coordinates, `site_link` takes a site index
+already in hand, the parts come back separately through `link_site` and
+`link_direction`, and `link_base` — which returns both at once — stays private.
 
 **L3. Plaquettes are packed `site * C(D,2) + pair`, pair fastest, with `pair`
 lexicographic in $(\mu, \nu)$.** In three dimensions that means the pairs
@@ -191,3 +192,44 @@ words per link in three dimensions, or 36 words per site, which at $64^3$ is
 roughly 75 MB of `usize`. Narrowing the indices to `u32` would halve it and is the
 obvious move if the GPU path wants these tables resident, but nothing forces it
 yet.
+
+## Loops
+
+Wilson and Polyakov measurements walk closed paths, and `Loop<D>` is the shape
+of such a path: a sequence of steps, each a direction and a `Sign`, with no base
+site. Consecutive steps join up by construction, so the only thing to validate
+is closure, and making the path a type moves that check to one place — it runs
+once when the shape is built, not at each site the shape is later walked from.
+The base site is excluded deliberately: one rectangle walked from every site in
+turn is a single translation class, and averaging over that class is what makes
+a Wilson loop measurable at all, so the shape must be the thing that survives
+translation. A consequence is that a loop is valid for the extents it was built
+against — walking it on a lattice of a different shape is meaningful only if it
+closes there too.
+
+A path counts as closed when its net displacement vanishes *modulo the
+extents*, not only when it literally retraces to its base. On a torus a path
+that winds a direction all the way round has also closed, and its link product
+is invariant like any other; ruling those out would rule out the Polyakov loop
+with them. The displacement rule also admits degenerate closed paths — the
+empty path, or a step retraced immediately — whose measurements are correct if
+uninformative, so they are accepted rather than special-cased away.
+
+Walking a loop from a base site crosses one link per step, and the rule for
+which one follows from links being named by their forward end (`L2`): a forward
+step crosses the link based at the site it leaves, a backward step the link
+based at the site it *arrives* at. Which way a link was crossed is not
+reported, because a $\mathbb{Z}_2$ variable is its own inverse and the sense
+cannot change the product; the `Loop` keeps the signs, so a model whose
+variables do not commute with their inverses could recover it without changing
+the walk.
+
+The one loop family built in rather than assembled by hand is the $r \times t$
+rectangle, because the confinement measurement needs exactly that shape and the
+walk only means what it should when the four sides come in order. Its
+constructor refuses two degeneracies that the general closure check would
+accept. Equal directions trace a line out and back, which closes but crosses
+each of its links twice and so measures nothing. And a side reaching the full
+extent puts the two opposite sides on the same links, which cancel — the shape
+stops being a rectangle while still looking like one — so winding, welcome in
+the general constructor, is refused here.

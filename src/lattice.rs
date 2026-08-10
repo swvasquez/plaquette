@@ -1,57 +1,14 @@
-//! Hypercubic-lattice geometry with periodic (toroidal) boundary conditions.
+//! Hypercubic-lattice geometry with periodic (toroidal) boundary conditions,
+//! generic over the spatial dimension `D`.
 //!
-//! Generic over the spatial dimension `D`. A `D`-dimensional lattice with
-//! per-direction extents `shape = [L_0, ..., L_{D-1}]` indexes its sites
-//! row-major (mixed-radix, lexicographic) with **direction 0 the
-//! fastest-varying**:
-//!
-//! ```text
-//! site = x_0 + L_0 * (x_1 + L_1 * (x_2 + ...))
-//! ```
-//!
-//! Every site has `2 * D` nearest neighbors — one forward (`+`) and one
-//! backward (`−`) along each direction. They are precomputed once at
-//! construction so the sampler hot path never re-derives geometry or takes a
-//! modulo per lookup. Unequal extents give an anisotropic lattice
-//! (e.g. `N_t × N_s^d`).
-//!
-//! Gauge models put their variables on the edges rather than the sites, so the
-//! lattice names three kinds of cell, each anchored at a base site and
-//! extending in the positive directions: the site itself, the `D` forward links
-//! leaving it, and the `C(D, 2)` unit squares (plaquettes) spanned by a pair of
-//! directions there. Each kind gets a count `n_*`, an `*_index` that packs a
-//! base position and however many directions that kind needs into a linear
-//! index, and accessors giving back those parts one at a time
-//! ([`link_site`](Lattice::link_site),
-//! [`link_direction`](Lattice::link_direction), and the plaquette pair).
-//!
-//! Two words are reserved. `coords` means lattice coordinates and never a
-//! packed site index; *direction* means μ and never the sense of a step, which
-//! is what [`Sign`] carries. Nothing returns a site and a direction fused into
-//! one value — the literature writes a link as `U_μ(n)` and never names that
-//! pair, and an earlier revision that did fuse them made `coords` ambiguous.
-//!
-//! Incidence between the kinds follows one rule: `a_bs(a)` gives the `b`-cells
-//! touching cell `a`, reading down the dimensions for the boundary
-//! ([`link_sites`](Lattice::link_sites),
-//! [`plaquette_links`](Lattice::plaquette_links)) and up for the cells that
-//! contain it ([`site_links`](Lattice::site_links),
-//! [`link_plaquettes`](Lattice::link_plaquettes)). All of these are cheap
-//! enough for an inner loop, so which read a stored table and which recompute
-//! is an implementation detail callers need not track; the sole exception is
-//! `link_plaquettes`, which allocates and sorts to guarantee its order and so
-//! belongs outside a hot path.
-//!
-//! The one exception to the naming rule is
-//! [`link_staples`](Lattice::link_staples), which is not incidence but a
-//! composition of it: the links a flip must multiply, precomputed because an
-//! updater rederiving them per proposal would spend more time on geometry than
-//! on the flip.
+//! Sites, links, and plaquettes each pack into a linear index, incidence
+//! accessors follow the `a_bs(a)` naming rule, and staples are precomputed per
+//! link. The packing orders, reserved vocabulary, and incidence contracts are
+//! the labeled requirements `L0`–`L7` in `docs/lattice-implementation.md`,
+//! which is the reference for this module.
 
 /// The sign of a step along a direction: `Plus` is `+μ`, `Minus` is `−μ`.
-///
-/// The literature reserves *direction* for μ itself, so the sign gets its own
-/// name rather than competing for that word.
+/// Named apart from *direction* per `L0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sign {
     /// A step along `+μ`.
@@ -72,17 +29,13 @@ pub struct Lattice<const D: usize> {
     shape: [usize; D],
     /// Flattened neighbor table, `n_sites * 2 * D` entries, stride `2 * D`.
     neighbors: Vec<usize>,
-    /// Flattened staple table, stride `6 * (D - 1)` per link: for each of the
-    /// `2 * (D - 1)` plaquettes containing a link, the three other links of
-    /// that plaquette, in consecutive groups of three.
+    /// Flattened staple table, stride `6 * (D - 1)` per link, in groups of
+    /// three per containing plaquette.
     staples: Vec<usize>,
     /// Coordinate-sum parity per site, `0` or `1` — the checkerboard color.
-    ///
-    /// A table rather than a computation because the checkerboard schedules ask
-    /// for it twice per variable update, and deriving it needs
-    /// [`site_coords`](Lattice::site_coords), whose divisions by runtime extents
-    /// measured at roughly a third of a whole CPU sweep. One byte per site is
-    /// nothing beside the neighbor table already here.
+    /// A table because the checkerboard schedules read it twice per variable
+    /// update, and computing it via [`site_coords`](Lattice::site_coords)
+    /// measured at roughly a third of a whole CPU sweep.
     parities: Vec<u8>,
     // TODO: `dir_strides` is recomputed on every `site_index`, `site_coords`,
     // and `site_shift` call; cache it here if any of them lands in a hot loop.
@@ -92,15 +45,13 @@ pub struct Lattice<const D: usize> {
 
 impl<const D: usize> Lattice<D> {
     /// Build a `D`-dimensional lattice with the given per-direction extents and
-    /// precompute its neighbor table.
+    /// precompute its tables.
     ///
     /// # Panics
     ///
     /// Panics if `D == 0`, if any extent is zero, or if the shape names more
-    /// sites or table entries than a `usize` can address. That last one is
-    /// otherwise silent: a wrapped length is *small*, so the allocation
-    /// succeeds and the lattice comes out empty with every other invariant
-    /// intact.
+    /// sites or table entries than a `usize` can address (see `table_len` for
+    /// why that last one must be caught here).
     pub fn new(shape: [usize; D]) -> Self {
         assert!(D > 0, "lattice dimension must be positive");
         assert!(
@@ -119,10 +70,8 @@ impl<const D: usize> Lattice<D> {
             });
         let stride = Self::neighbor_stride();
 
-        // Mixed-radix place values: dir_stride[μ] is the linear-index step of a
-        // one-unit move along direction μ (dir_stride[0] == 1). Each is a
-        // partial product of the extents, so all of them fit once `n_sites`
-        // does.
+        // Mixed-radix place values (L1); each is a partial product of the
+        // extents, so all of them fit once `n_sites` does.
         let mut dir_stride = [1usize; D];
         for mu in 1..D {
             dir_stride[mu] = dir_stride[mu - 1] * shape[mu - 1];
@@ -130,8 +79,7 @@ impl<const D: usize> Lattice<D> {
 
         let mut neighbors =
             vec![0usize; Self::table_len(n_sites, stride, &shape, "neighbor table")];
-        // Filled in the same pass, since decomposing the site index is most of
-        // the cost of either table and this loop already does it.
+        // Filled in the same pass, which already decomposes the site index.
         let mut parities = vec![0u8; n_sites];
         for site in 0..n_sites {
             let mut coord_sum = 0usize;
@@ -150,9 +98,8 @@ impl<const D: usize> Lattice<D> {
             parities[site] = (coord_sum % 2) as u8;
         }
 
-        // The staple table is derived from the plaquette enumeration, which
-        // reads the neighbor table through `&self`, so build the lattice first
-        // and fill the table in afterwards.
+        // The staple builder reads the neighbor table through `&self`, so
+        // build the lattice first and fill the table in afterwards.
         let mut lattice = Lattice {
             shape,
             neighbors,
@@ -166,19 +113,11 @@ impl<const D: usize> Lattice<D> {
     /// A table of `count` rows `width` entries wide, or a panic naming the
     /// lattice if that length does not fit in a `usize`.
     ///
-    /// Sizing a table is the one arithmetic here where overflow does not
-    /// announce itself. A wrapped length is *small*, so the allocation succeeds
-    /// and the lattice comes out quietly empty — every extent positive, every
-    /// assertion satisfied, and nothing to simulate. Release builds turn off the
-    /// overflow checks that catch it in debug, so this is the only thing
-    /// standing between an absurd shape and a run that reports `NaN`. The
-    /// standard library carves out the same category for capacity computations,
-    /// for the same reason.
-    ///
-    /// It is a panic rather than an error because it is the same kind of fault
-    /// as a zero extent: a shape nobody could run, caught at the one door
-    /// geometry comes through. A shape that fits here but not in memory still
-    /// fails at the allocation, which is a real signal and already loud.
+    /// The overflow this guards is silent in release builds: a wrapped length
+    /// is *small*, so the allocation succeeds and the lattice comes out quietly
+    /// empty with every other invariant intact. A panic rather than an error
+    /// because it is the same kind of fault as a zero extent: a shape nobody
+    /// could run, caught at the one door geometry comes through.
     fn table_len(count: usize, width: usize, shape: &[usize; D], what: &str) -> usize {
         count.checked_mul(width).unwrap_or_else(|| {
             panic!(
@@ -191,22 +130,15 @@ impl<const D: usize> Lattice<D> {
 
     /// Invert the plaquette enumeration into the per-link staple table.
     ///
-    /// Walking the plaquettes in index order and, for each of a plaquette's
-    /// four links, recording the other three keeps the table consistent with
-    /// [`plaquette_links`](Lattice::plaquette_links) by construction: a group
-    /// is exactly some plaquette minus the link it hangs off. Groups land in
-    /// increasing plaquette index because that is the order of the outer loop,
-    /// which is what [`link_plaquettes`](Lattice::link_plaquettes) has to
-    /// match.
+    /// Walking plaquettes in index order keeps the table consistent with
+    /// [`plaquette_links`](Lattice::plaquette_links) by construction and makes
+    /// groups land in increasing plaquette index (`L6`).
     fn build_staples(&self) -> Vec<usize> {
         let stride = Self::staple_stride();
-        // The widest table the lattice builds, and so the first to overflow: a
-        // link's row is `6(D - 1)` entries against a site's `2D`.
         let n_links = Self::table_len(self.n_sites(), D, &self.shape, "link index space");
         let mut staples =
             vec![0usize; Self::table_len(n_links, stride, &self.shape, "staple table")];
-        // How many groups each link has taken so far, i.e. where the next one
-        // goes within its row.
+        // Next free group slot within each link's row.
         let mut filled = vec![0usize; n_links];
 
         for plaquette in 0..self.n_plaquettes() {
@@ -236,17 +168,9 @@ impl<const D: usize> Lattice<D> {
     }
 }
 
-/// Counting and naming the cells. A cell of any kind is a base position plus an
-/// orientation — none for a site, one direction for a link, an unordered pair
-/// of directions for a plaquette — and each kind packs that into a linear index
-/// the same way, orientation fastest, so a site's cells of a given kind are
-/// contiguous.
-///
-/// Every `*_index` takes coordinates, and the parts come back separately rather
-/// than as a tuple mixing a site with a direction. The packed forms that skip
-/// the coordinate round trip (`site_link`, `link_base`, and their plaquette
-/// counterparts) stay private until something outside proves it needs them. All
-/// of this is arithmetic on `shape`; none of it reads a table.
+/// Counting and naming the cells, per the packings `L1`–`L3` in
+/// `docs/lattice-implementation.md`. All of this is arithmetic on `shape`;
+/// none of it reads a table.
 impl<const D: usize> Lattice<D> {
     /// Total number of sites, i.e. the product of the extents.
     pub fn n_sites(&self) -> usize {
@@ -294,13 +218,8 @@ impl<const D: usize> Lattice<D> {
     }
 
     /// The site's checkerboard color: the parity of its coordinate sum, `0` or
-    /// `1`.
-    ///
-    /// Two sites of the same color are never nearest neighbors on an even
-    /// lattice, because a step along any axis changes one coordinate by one and
-    /// so flips the parity. Read from a table built at construction, because the
-    /// checkerboard schedules ask for it twice per variable update and computing
-    /// it costs a division per axis.
+    /// `1`. Two sites of the same color are never nearest neighbors — but only
+    /// when every extent is even, since an odd wrap joins same-parity sites.
     pub fn site_parity(&self, site: usize) -> usize {
         self.parities[site] as usize
     }
@@ -310,12 +229,8 @@ impl<const D: usize> Lattice<D> {
         self.link_base(link).0
     }
 
-    /// The direction `link` runs along.
-    ///
-    /// There is no accessor returning the site and direction together: the
-    /// literature never names that pair, writing the link as `U_μ(n)` and
-    /// leaving the two parts separate, and fusing them here is what made
-    /// `coords` ambiguous in an earlier revision.
+    /// The direction `link` runs along. There is deliberately no accessor
+    /// returning the site and direction together (`L0`).
     pub fn link_direction(&self, link: usize) -> usize {
         self.link_base(link).1
     }
@@ -337,44 +252,31 @@ impl<const D: usize> Lattice<D> {
         [mu, nu]
     }
 
-    /// The link leaving `site` along `dir`, with the base site already packed.
-    ///
-    /// Packed `site * D + dir`, direction fastest, so a site's `D` links are
-    /// contiguous just like its neighbor row. [`link_index`](Lattice::link_index)
-    /// takes coordinates, which is the right interface for naming a link in a
-    /// formula but the wrong one for a sweep that already holds a site index —
-    /// going through coordinates and back costs a divide per axis each way to
-    /// recover a number that is one multiply-add. So this is the form the
-    /// incidence accessors, the table builder, and any schedule visiting one
-    /// link per site per direction use.
+    /// The link leaving `site` along `dir`, packed `site * D + dir` (`L2`):
+    /// the form for a caller that already holds a site index, where
+    /// [`link_index`](Lattice::link_index)'s coordinate round trip would cost
+    /// a divide per axis.
     pub fn site_link(&self, site: usize, dir: usize) -> usize {
         debug_assert!(site < self.n_sites(), "site out of range");
         debug_assert!(dir < D, "direction out of range");
         site * D + dir
     }
 
-    /// Split a link index into its base site and direction; the shared helper
-    /// behind [`link_site`](Lattice::link_site) and
-    /// [`link_direction`](Lattice::link_direction).
+    /// Split a link index into its base site and direction.
     fn link_base(&self, link: usize) -> (usize, usize) {
         debug_assert!(link < self.n_links(), "link out of range");
         (link / D, link % D)
     }
 
-    /// The plaquette at `site` spanning `(mu, nu)`, with the base site already
-    /// packed.
-    ///
-    /// Packed `site * C(D, 2) + pair`, pair fastest, with `pair` the ordinal of
-    /// `(μ, ν)` in lexicographic order — `(0,1), (0,2), (1,2)` in three
-    /// dimensions.
+    /// The plaquette at `site` spanning `(mu, nu)`, packed
+    /// `site * C(D, 2) + pair` with `pair` lexicographic (`L3`).
     fn plaquette_at(&self, site: usize, mu: usize, nu: usize) -> usize {
         debug_assert!(site < self.n_sites(), "site out of range");
         debug_assert!(mu < nu && nu < D, "direction pair must satisfy mu < nu < D");
         site * Self::n_dir_pairs() + Self::pair_index(mu, nu)
     }
 
-    /// Split a plaquette index into its base site and direction pair in one
-    /// step.
+    /// Split a plaquette index into its base site and direction pair.
     fn plaquette_base(&self, plaquette: usize) -> (usize, usize, usize) {
         debug_assert!(plaquette < self.n_plaquettes(), "plaquette out of range");
         let n_pairs = Self::n_dir_pairs();
@@ -382,18 +284,14 @@ impl<const D: usize> Lattice<D> {
         (plaquette / n_pairs, mu, nu)
     }
 
-    /// Number of unordered direction pairs `(μ, ν)` with `μ < ν`, i.e. the
-    /// number of lattice planes, and hence of plaquettes anchored at each site.
+    /// Number of unordered direction pairs `(μ, ν)` with `μ < ν`, i.e. of
+    /// plaquettes anchored at each site.
     const fn n_dir_pairs() -> usize {
         D * D.saturating_sub(1) / 2
     }
 
     /// The direction pair `(μ, ν)`, `μ < ν`, at ordinal `pair` in lexicographic
-    /// order.
-    ///
-    /// Pairs are grouped by their first direction: `μ = 0` accounts for the
-    /// first `D - 1` ordinals, `μ = 1` the next `D - 2`, and so on, so walking
-    /// those group sizes locates the pair without a table.
+    /// order, found by walking the group sizes `D - 1, D - 2, ...` (see `L3`).
     const fn dir_pair(pair: usize) -> (usize, usize) {
         debug_assert!(pair < Self::n_dir_pairs(), "direction pair out of range");
         let mut rest = pair;
@@ -408,12 +306,8 @@ impl<const D: usize> Lattice<D> {
         }
     }
 
-    /// The ordinal of `(mu, nu)`, `mu < nu`, in the same lexicographic order;
-    /// the inverse of [`dir_pair`](Lattice::dir_pair).
-    ///
-    /// The pairs with a first direction below `mu` number
-    /// `(D - 1) + ... + (D - mu) = mu * (D - 1) - mu * (mu - 1) / 2`, and
-    /// `nu - mu - 1` more come before `(mu, nu)` within its own group.
+    /// The ordinal of `(mu, nu)`, `mu < nu`; the inverse of `dir_pair`. The
+    /// formula is derived in `L3` of `docs/lattice-implementation.md`.
     const fn pair_index(mu: usize, nu: usize) -> usize {
         mu * (D - 1) - mu * mu.saturating_sub(1) / 2 + (nu - mu - 1)
     }
@@ -455,12 +349,7 @@ impl<const D: usize> Lattice<D> {
     }
 
     /// The site reached from `site` by `delta` steps along `dir`, wrapping
-    /// periodically.
-    ///
-    /// The general-`delta` companion to
-    /// [`site_neighbor`](Lattice::site_neighbor): `site_shift(site, μ, 1)` is
-    /// the forward neighbor and `site_shift(site, μ, 0)` is `site` itself.
-    /// `delta` may exceed the extent along `dir`; it is reduced modulo it.
+    /// periodically; `delta` may exceed the extent and is reduced modulo it.
     pub fn site_shift(&self, site: usize, dir: usize, delta: usize) -> usize {
         debug_assert!(site < self.n_sites(), "site out of range");
         debug_assert!(dir < D, "direction out of range");
@@ -472,31 +361,19 @@ impl<const D: usize> Lattice<D> {
     }
 }
 
-/// Incidence between the cell kinds. `a_bs(a)` is the set of `b`-cells touching
-/// the `a`-cell `a`: going down a dimension gives its boundary, going up gives
-/// the cells it bounds. A fixed-size answer comes back as an array, since `D`
-/// is a const parameter and array lengths cannot depend on it. The two whose
-/// size grows with `D` differ: [`site_links`](Lattice::site_links) yields its
-/// links one at a time, because a gauge move walks them once per site per sweep
-/// and an allocation that often would outweigh the work, while
-/// [`link_plaquettes`](Lattice::link_plaquettes) collects, because its ordering
-/// guarantee needs a sort and nothing on the energy path calls it.
+/// Incidence between the cell kinds: `a_bs(a)` is the set of `b`-cells touching
+/// the `a`-cell `a`. Why [`site_links`](Lattice::site_links) iterates while
+/// [`link_plaquettes`](Lattice::link_plaquettes) collects is explained in the
+/// Storage section of `docs/lattice-implementation.md`.
 impl<const D: usize> Lattice<D> {
     /// The `2 * D` links touching `site`: for each direction the forward link
     /// leaving it and the backward link arriving at it, ordered `+0, −0, +1,
     /// ...` to match [`site_neighbors`](Lattice::site_neighbors). On an
     /// extent-1 direction the two coincide and the link is yielded twice.
-    ///
-    /// The caller that asks most often is a gauge transformation — flip every
-    /// link touching a site — which runs once per site per sweep and only walks
-    /// the result, so the links are computed one at a time rather than
-    /// collected. Being a map over `0..2 * D`, the iterator still knows its
-    /// length.
     pub fn site_links(&self, site: usize) -> impl ExactSizeIterator<Item = usize> + '_ {
         debug_assert!(site < self.n_sites(), "site out of range");
-        // Column `i` of the neighbor row: direction `i / 2`, forward when `i`
-        // is even. The forward link is based here, the backward one at the
-        // neighbor it arrives from.
+        // The forward link is based here, the backward one at the neighbor it
+        // arrives from.
         (0..2 * D).map(move |i| {
             let dir = i / 2;
             if i % 2 == 0 {
@@ -515,17 +392,12 @@ impl<const D: usize> Lattice<D> {
 
     /// The `2 * (D - 1)` plaquettes containing `link`, in increasing index
     /// order — the same order as the groups of
-    /// [`link_staples`](Lattice::link_staples), so the two can be zipped.
+    /// [`link_staples`](Lattice::link_staples), so the two can be zipped
+    /// (`L6`). Allocates and sorts, so it belongs outside a hot path.
     ///
-    /// For a link `(s, μ)` and each other direction `ν`, one plaquette is
-    /// anchored at `s` itself and one a step back along `ν`. They do not arrive
-    /// in index order, so the answer is collected and sorted; that ordering
-    /// guarantee is the whole reason this one allocates where
-    /// [`site_links`](Lattice::site_links) does not.
-    ///
-    /// On an extent-1 direction the two coincide and the same plaquette appears
-    /// twice, which still lines up with the staple groups, since those are
-    /// counted by slot rather than by distinct plaquette.
+    /// On an extent-1 direction the same plaquette appears twice, which still
+    /// lines up with the staple groups, since those are counted by slot rather
+    /// than by distinct plaquette.
     pub fn link_plaquettes(&self, link: usize) -> Vec<usize> {
         let (site, dir) = self.link_base(link);
         let mut plaquettes = Vec::with_capacity(Self::plaquettes_per_link());
@@ -543,12 +415,8 @@ impl<const D: usize> Lattice<D> {
         plaquettes
     }
 
-    /// The four links bounding `plaquette`, in the fixed order `[(s, μ), (s +
-    /// μ̂, ν), (s + ν̂, μ), (s, ν)]`.
-    ///
-    /// Derived on demand from the neighbor table rather than stored: it is read
-    /// once per plaquette when the staple table is built and thereafter only by
-    /// whole-lattice sweeps, never per proposed flip.
+    /// The four links bounding `plaquette`, in the fixed loop order `[(s, μ),
+    /// (s + μ̂, ν), (s + ν̂, μ), (s, ν)]` (`L4`).
     pub fn plaquette_links(&self, plaquette: usize) -> [usize; 4] {
         let (site, mu, nu) = self.plaquette_base(plaquette);
         let site_mu = self.site_neighbor(site, mu, Sign::Plus);
@@ -564,13 +432,8 @@ impl<const D: usize> Lattice<D> {
     /// The staples of `link`: for each of the `2 * (D - 1)` plaquettes
     /// containing it, that plaquette's three other links, flattened into `6 *
     /// (D - 1)` entries. Chunk it by three to recover the groups, which come in
-    /// increasing plaquette index.
-    ///
-    /// This is not incidence but a composition of it — link to plaquettes to
-    /// their links, minus the link itself. The product of a plaquette's four
-    /// link variables equals the variable on `link` times the product over the
-    /// matching staple, which is what lets a single-link flip read its energy
-    /// change from this table alone.
+    /// increasing plaquette index (`L6`); a single-link flip reads its energy
+    /// change from this table alone (`L7`).
     pub fn link_staples(&self, link: usize) -> &[usize] {
         debug_assert!(link < self.n_links(), "link out of range");
         let stride = Self::staple_stride();
@@ -589,11 +452,8 @@ impl<const D: usize> Lattice<D> {
     }
 
     /// Entries per site in the neighbor table: one forward and one backward
-    /// along each direction.
-    ///
-    /// Named for the same reason [`staple_stride`](Lattice::staple_stride) is.
-    /// It is the row width of a table other layers upload and index, so it wants
-    /// one owner rather than a `2 * D` written wherever a row is walked.
+    /// along each direction. Named because other layers upload and index rows
+    /// of this width.
     pub(crate) const fn neighbor_stride() -> usize {
         2 * D
     }
@@ -602,16 +462,8 @@ impl<const D: usize> Lattice<D> {
     ///
     /// A forward step crosses the link based at the site it leaves; a backward
     /// step crosses the link based at the site it *arrives* at, since links are
-    /// named by their forward end. Which way a link was crossed is not reported:
-    /// a `Z2` variable is its own inverse, so the sense of the step cannot
-    /// change the product it feeds. The [`Loop`] keeps that information, so a
-    /// model whose variables do not commute with their inverses could recover it
-    /// without changing this.
-    ///
-    /// The links come one at a time rather than collected, because the caller
-    /// that asks most often is a Wilson loop sweeping one shape across every
-    /// site of the lattice, and a vector per base site would cost more than the
-    /// walk.
+    /// named by their forward end. Which way a link was crossed is not reported
+    /// (see the Loops section of `docs/lattice-implementation.md`).
     pub fn loop_links<'a>(
         &'a self,
         base: usize,
@@ -634,27 +486,10 @@ impl<const D: usize> Lattice<D> {
     }
 }
 
-/// A closed path on the lattice, named by the steps that trace it rather than by
-/// the cells it crosses.
-///
-/// Each step is a direction and a [`Sign`], so consecutive steps join up by
-/// construction and the path can never have a gap in it. What does have to be
-/// checked is that it comes back to where it started: only a closed path has a
-/// gauge-invariant link product, and an open one measures nothing. Making that a
-/// type rather than a bare slice of steps is what moves the check to one place —
-/// it runs once when the shape is built, not once at each site the shape is
-/// later walked from.
-///
-/// The base site is deliberately not part of the shape. One rectangle walked
-/// from every site in turn is a single translation class, and averaging over
-/// that class is what makes a Wilson loop measurable at all, so the shape has to
-/// be the thing that survives translation.
-///
-/// A path counts as closed when its net displacement vanishes *modulo the
-/// extents*, not only when it literally retraces to its base site. On a torus a
-/// path that winds a direction all the way round has also closed, and its
-/// product is invariant like any other; ruling those out would rule out the
-/// Polyakov loop with them.
+/// A closed path on the lattice: steps of direction and [`Sign`], with no base
+/// site, closed when the net displacement vanishes modulo the extents (so
+/// winding paths count). The Loops section of `docs/lattice-implementation.md`
+/// explains both choices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loop<const D: usize> {
     /// The steps in traversal order, each a direction and the sense of the move
@@ -666,16 +501,12 @@ impl<const D: usize> Loop<D> {
     /// Build the loop traced by `steps`, or `None` if some direction is out of
     /// range or the path does not close.
     ///
-    /// The lattice is borrowed only to be measured, since its extents are what
-    /// decide when a winding path has closed, and is not kept afterwards. A loop
-    /// is therefore valid for the extents it was built against: walking it on a
-    /// lattice of different shape is meaningful only if it closes there too,
-    /// which for a non-winding path it does.
+    /// The lattice is borrowed only to be measured, not kept, so a loop is
+    /// valid for the extents it was built against: walking it on a lattice of
+    /// different shape is meaningful only if it closes there too.
     pub fn new(lattice: &Lattice<D>, steps: &[(usize, Sign)]) -> Option<Self> {
         let shape = lattice.shape();
 
-        // Net displacement, one component per direction: `+μ` adds one to
-        // component μ and `−μ` subtracts one.
         let mut net = [0isize; D];
         for &(dir, sign) in steps {
             if dir >= D {
@@ -695,20 +526,9 @@ impl<const D: usize> Loop<D> {
 
     /// The rectangle running `r` steps along `mu` and `t` along `nu` before
     /// retracing both, or `None` if the two directions are not distinct, one is
-    /// out of range, or a side is long enough to wrap.
-    ///
-    /// This is the one loop family the confinement measurement needs, and it is
-    /// a constructor rather than something a caller assembles because the walk
-    /// only means what it should when the four sides are in this order. The two
-    /// directions have to differ: `mu == nu` traces a line out and back, which
-    /// closes and would be accepted by [`new`](Loop::new), but crosses each of
-    /// its links twice and so measures nothing.
-    ///
-    /// A side reaching the extent is refused rather than wrapped. Winding is
-    /// what a Polyakov loop is for and is welcome in [`new`](Loop::new), but a
-    /// rectangle that wraps has its two opposite sides land on the same links,
-    /// which cancel; the shape stops being a rectangle while still looking like
-    /// one.
+    /// out of range, or a side is long enough to wrap. Both refusals are
+    /// degeneracies [`new`](Loop::new) would accept; the Loops section of
+    /// `docs/lattice-implementation.md` explains why they are refused here.
     pub fn rectangle(
         lattice: &Lattice<D>,
         mu: usize,
@@ -759,11 +579,9 @@ mod tests {
         assert_eq!(lat.neighbors.len(), 64);
     }
 
-    /// The parity table agrees with the definition it caches. Built alongside
-    /// the neighbor table for speed, it would otherwise be free to drift from
-    /// the coordinate sum it is supposed to be — including on odd extents, where
-    /// the wrap puts same-parity sites next to each other and the table must
-    /// still report the honest value.
+    /// The parity table agrees with the coordinate sum it caches, including on
+    /// odd extents, where the wrap puts same-parity sites next to each other
+    /// and the table must still report the honest value.
     #[test]
     fn parity_table_matches_the_coordinate_sum() {
         for lat in [Lattice::new([4, 6, 2]), Lattice::new([3, 5, 3])] {
@@ -982,17 +800,15 @@ mod tests {
         assert_eq!(lat.site_neighbor(4, 1, Sign::Minus), 1);
     }
 
-    // A `debug_assert!` is compiled out in release, so a test asserting on its
-    // message only means anything in debug. Gating it is what keeps
-    // `cargo test --release` honest rather than red for a reason that is not a
-    // defect. See the note on check tiers in `model.rs`.
+    // Gated because a `debug_assert!` is compiled out in release, and the test
+    // would go red there for a reason that is not a defect. See the note on
+    // check tiers in `model.rs`.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "direction out of range")]
     fn out_of_range_direction_is_caught_not_folded_into_the_next_row() {
-        // Without the check this returns site 1's forward neighbor: the index
-        // 0 * 2D + 2 * 2 lands in the next site's row rather than out of
-        // bounds, so nothing else would notice.
+        // Without the check this lands in the next site's row and returns a
+        // plausible site index, so nothing else would notice.
         let lat = Lattice::new([4, 4]);
         lat.site_neighbor(0, 2, Sign::Plus);
     }
@@ -1135,11 +951,8 @@ mod tests {
 
     #[test]
     fn degenerate_paths_close() {
-        // Both are closed by the displacement rule and neither is useful: an
-        // empty path crosses nothing, and a step retraced immediately crosses
-        // the same link twice, whose product is 1 whatever the field is. The
-        // rule admits them rather than growing a special case, since the
-        // measurement they give is correct if uninformative.
+        // The displacement rule admits the empty path and an immediate retrace
+        // rather than special-casing them; see the Loops section of the doc.
         let lat = Lattice::new([4, 4]);
         assert!(Loop::new(&lat, &[]).is_some());
         assert!(Loop::new(&lat, &[(0, Sign::Plus), (0, Sign::Minus)]).is_some());
@@ -1164,8 +977,7 @@ mod tests {
 
     #[test]
     fn a_rectangle_needs_two_distinct_directions() {
-        // `mu == nu` traces a line out and back. It closes, so `new` would take
-        // it, but it crosses each link twice and measures nothing.
+        // `mu == nu` closes, so `new` would take it, but it measures nothing.
         let lat = Lattice::new([8, 8]);
         assert!(Loop::rectangle(&lat, 0, 2, 0, 3).is_none());
         assert!(Loop::rectangle(&lat, 0, 2, 5, 3).is_none());
@@ -1173,9 +985,8 @@ mod tests {
 
     #[test]
     fn a_rectangle_reaching_the_extent_is_refused() {
-        // At the full extent the two opposite sides land on the same links and
-        // cancel, so what is left is no longer a rectangle. Winding is fine in
-        // general — `new` allows it — but not here.
+        // At the full extent the opposite sides land on the same links and
+        // cancel, so the shape is no longer a rectangle.
         let lat = Lattice::new([4, 8]);
         assert!(Loop::rectangle(&lat, 0, 3, 1, 7).is_some());
         assert!(Loop::rectangle(&lat, 0, 4, 1, 1).is_none());
@@ -1184,11 +995,8 @@ mod tests {
 
     #[test]
     fn walking_a_unit_square_reproduces_the_plaquette() {
-        // The sharpest check available on the walk: the smallest closed path in
-        // the (μ, ν) plane must cross exactly the links the lattice already
-        // names as that plaquette's, in the same order — `plaquette_links`
-        // returns `[(s, μ), (s + μ̂, ν), (s + ν̂, μ), (s, ν)]`, which is this
-        // walk. Any error in how a backward step picks its link shows up here.
+        // The unit square must cross exactly `plaquette_links` in the L4 order;
+        // any error in how a backward step picks its link shows up here.
         let lat = Lattice::new([2, 3, 4]);
         for (mu, nu) in [(0usize, 1usize), (0, 2), (1, 2)] {
             let square = [
@@ -1208,10 +1016,8 @@ mod tests {
 
     #[test]
     fn walking_a_loop_returns_to_its_base_site() {
-        // Every site the path visits is left as often as it is entered, so each
+        // A closed walk leaves every site as often as it enters, so each
         // endpoint of the links crossed is touched an even number of times.
-        // That is the same condition the plaquette test checks, and for `Z2` it
-        // is exactly what makes the link product gauge invariant.
         let lat = Lattice::new([4, 4, 4]);
         let staircase = [
             (0, Sign::Plus),
@@ -1290,12 +1096,9 @@ mod tests {
 
     // --- Dimension sweep ---------------------------------------------------
     //
-    // The tests above pin hand-computed answers in one or two dimensions each,
-    // which is what makes them readable. These check the same machinery as
-    // *properties* instead, over a ladder of dimensions, so a mistake that only
-    // shows up once a lattice has more axes than anyone wrote a case for still
-    // fails. Every shape below is deliberately lopsided: a cubic one hides a
-    // transposed stride, since every axis then carries the same place value.
+    // The same machinery as properties over a ladder of dimensions. Every
+    // shape below is deliberately lopsided: a cubic one hides a transposed
+    // stride, since every axis then carries the same place value.
 
     /// Counts follow from the shape and the dimension alone.
     fn counts_follow_the_shape<const D: usize>(shape: [usize; D]) {
@@ -1359,13 +1162,8 @@ mod tests {
         }
     }
 
-    /// The invariant every consumer of an incidence row depends on: a cell's row
-    /// lists distinct cells.
-    ///
-    /// Stated over *links* rather than neighbors, because that is where it bites.
-    /// A site's `2D` incident links must be `2D` different links, and a
-    /// plaquette's four sides four different links. Both hold at every extent of
-    /// two or more, which is what the shapes below use.
+    /// A cell's incidence row lists distinct cells — which holds only at
+    /// extents of two or more, all the shapes below use.
     fn incidence_rows_list_distinct_cells<const D: usize>(shape: [usize; D]) {
         let lat = Lattice::new(shape);
         for site in 0..lat.n_sites() {
@@ -1392,10 +1190,8 @@ mod tests {
     fn incidence_agrees_in_both_directions<const D: usize>(shape: [usize; D]) {
         let lat = Lattice::new(shape);
 
-        // Links against the sites they join, and sites against the links
-        // touching them. `site_links` reads up from a site to the `2 * D` links
-        // containing it; `link_sites` reads back down to the two endpoints, one
-        // of which must be the site we came from.
+        // Up from a site to its links, back down to the endpoints, one of
+        // which must be the site we came from.
         for site in 0..lat.n_sites() {
             let links: Vec<usize> = lat.site_links(site).collect();
             assert_eq!(links.len(), 2 * D, "{shape:?}");
@@ -1494,46 +1290,31 @@ mod tests {
         unit_squares_close_in_every_plane(shape);
     }
 
-    /// A shape too large to count is refused rather than wrapped.
-    ///
-    /// The failure this guards is silent in release builds, where overflow
-    /// checks are off: `[4096; 6]` is `2^72`, an exact multiple of `2^64`, so
-    /// the product wraps to *zero* and the lattice comes out empty with every
-    /// other invariant intact. The run then samples nothing and reports `NaN`.
-    /// Debug builds panic on the multiplication by themselves, which is why this
-    /// asserts on the message rather than merely on panicking.
+    /// A shape too large to count is refused rather than wrapped: `[4096; 6]`
+    /// is `2^72`, whose product wraps to *zero* in release builds, giving a
+    /// silently empty lattice. Debug builds panic on the multiplication by
+    /// themselves, which is why this asserts on the message.
     #[test]
     #[should_panic(expected = "more sites than a usize can count")]
     fn a_shape_too_large_to_count_is_refused() {
         Lattice::new([4096; 6]);
     }
 
-    /// The same guard on the table lengths rather than the site count.
-    ///
-    /// A shape can be countable and still name a table that is not, because a
-    /// row is wider than a site: `2D` entries for a neighbor and `6(D - 1)` per
-    /// link for a staple. Here `2^61` sites count fine and the neighbor table's
-    /// `2^61 x 14` does not.
-    ///
-    /// The staple check in `build_staples` carries the same guard and cannot be
-    /// reached in practice, since the staple row is only `3(D - 1)` times the
-    /// neighbor row — so any shape overflowing it has already overflowed the
-    /// neighbor table, or failed to allocate one. It stays because the two
-    /// tables are sized in different functions and a reader of either should not
-    /// have to check the other.
+    /// The same guard on the table lengths: `2^61` sites count fine, the
+    /// neighbor table's `2^61 x 14` does not. The staple-table guard in
+    /// `build_staples` cannot be reached in practice — the neighbor table
+    /// always overflows or fails to allocate first — but stays because the two
+    /// tables are sized in different functions and a reader of either should
+    /// not have to check the other.
     #[test]
     #[should_panic(expected = "the neighbor table for shape")]
     fn a_table_too_large_to_address_is_refused() {
         Lattice::new([2usize.pow(55), 2, 2, 2, 2, 2, 2]);
     }
 
-    /// The geometry holds as a set of properties at every dimension up to ten.
-    ///
-    /// Ten is a guess at the most anyone would plausibly run rather than a bound
-    /// the library states — `Lattice<12>` compiles. What makes the range worth
-    /// covering is that the counts the tables are built from grow with `D`, some
-    /// of them quadratically: at ten dimensions a site has twenty neighbors, a
-    /// link sits in eighteen plaquettes, and each site anchors forty-five.
+    /// The geometry holds as a set of properties at every dimension up to ten —
+    /// a guess at the most anyone would plausibly run, not a bound the library
+    /// states; `Lattice<12>` compiles.
     #[test]
     fn geometry_holds_in_every_dimension() {
         geometry_sweep([6]);

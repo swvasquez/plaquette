@@ -1,54 +1,20 @@
 //! Updater: the rule that advances the Markov chain one sweep at a time.
 //!
-//! Where the [`Action`] says what a configuration *costs*, the updater says how
-//! the chain *moves*, so that the configurations visited over a long run are
-//! Boltzmann-distributed. It is the seam the driver depends on: a chain calls
-//! [`sweep`](Updater::sweep) without naming an algorithm, so heat-bath, cluster,
-//! or checkerboard moves can replace Metropolis without touching it.
-//!
-//! [`sweep`](Updater::sweep) is the trait's whole obligation, because it is the
-//! one thing every updater shares: each advances the chain by one sweep, whatever
-//! happens inside. What differs between algorithms is the *schedule* — which
-//! sites to update, in what order — and that lives in each updater's `sweep`. The
-//! single-site accept/reject kernel `step` is a plain module function that the
-//! schedules which have one call into; a cluster update would write a `sweep`
-//! that never mentions it.
-//!
-//! [`Metropolis`] is the single-variable update, for any `Q` and any `D`. Its
-//! sweep visits `N = n_vars` uniformly-random sites; each `step` proposes a
-//! different state, prices the move with [`Action::energy_delta`], and accepts
-//! with `min(1, e^{-β ΔE})`. The uniform pick is what makes the proposal
-//! symmetric and so lets acceptance drop the Hastings ratio; pricing by local
-//! delta rather than absolute energy is what cancels the partition function.
-//! Uphill moves surviving with probability `e^{-β ΔE} > 0` is mandatory, not an
-//! optimization — it is what lets the chain climb out of local minima.
-//!
-//! [`SiteCheckerboard`] keeps that accept/reject rule and changes only the order the
-//! sites are visited in: it colors each site by coordinate-sum parity and updates
-//! one color fully before the other, so no two sites updated together are
-//! neighbors. On CPU that is just Metropolis in a fixed order, sampling the same
-//! distribution; its purpose is to be the sequential form of a parallel (GPU)
-//! sweep, where a whole color updates at once. See `docs/metropolis.md` for why
-//! the reordering samples the same distribution and when the coloring's
-//! independence holds.
-//!
-//! [`LinkCheckerboard`] is the same idea for a gauge model, where the variables
-//! sit on links and the unit of interaction is the plaquette rather than the
-//! bond. Base-site parity alone cannot separate the four links of a plaquette,
-//! since two of them share a base site, so the coloring splits by direction
-//! first and by parity second — `2D` colors and a `2D`-pass sweep instead of
-//! two. It is a distinct type rather than a mode of [`SiteCheckerboard`] because
-//! only the name is shared: the color rule, what a collision means, and the pass
-//! count all differ, so one `sweep` covering both would be two unrelated bodies
-//! behind a branch. `docs/metropolis.md` carries the argument for the rule.
+//! Where the [`Action`] says what a configuration costs, the updater says how
+//! the chain moves. It is the seam the driver depends on: a chain calls
+//! [`sweep`](Updater::sweep) without naming an algorithm. What differs between
+//! algorithms is the *schedule* — which variables to update, in what order —
+//! and that lives in each updater's `sweep`; the single-variable accept/reject
+//! kernel `step` is a plain module function the schedules that have one call
+//! into. The algorithm itself — the acceptance rule, why the proposal must be
+//! symmetric, and why the checkerboard reorderings still sample the Boltzmann
+//! distribution — is derived in `docs/metropolis.md`.
 //!
 //! The updater holds no chain state: the [`Configuration`] *is* the current
 //! state, mutated in place, and `β` is passed per call so one updater serves a
-//! whole temperature scan. It keeps no running energy either, since the
-//! configuration already determines its own and measurements are infrequent
-//! enough for a driver to recompute [`Action::energy`] at sample points.
-//! [`sweep`](Updater::sweep) still returns the net realized ΔE so a driver can
-//! accumulate it if profiling ever justifies it.
+//! whole temperature scan. It keeps no running energy either;
+//! [`sweep`](Updater::sweep) returns the net realized ΔE, and re-anchoring
+//! against a from-scratch [`Action::energy`] stays the driver's job.
 
 use crate::action::Action;
 use crate::configuration::{Cell, Configuration};
@@ -59,24 +25,12 @@ use crate::state::State;
 /// The rule that advances the Markov chain by one sweep.
 ///
 /// Generic over the field's state count `Q` and the lattice dimension `D`, so
-/// the driver can name the seam without naming a specific algorithm — the peer
-/// of [`Action`] on the sampling side.
-///
-/// [`sweep`](Updater::sweep) is the only requirement: it is what the chain calls
-/// and the one obligation every algorithm shares. How a sweep is scheduled — and
-/// whether it is built from single-site updates at all — is each updater's own
-/// business.
+/// the driver can name the seam without naming a specific algorithm.
 pub trait Updater<const Q: usize, const D: usize> {
-    /// One **sweep**: advance `config` in place by one sweep's worth of updates,
-    /// returning the net realized `ΔE` summed over them. `beta` is passed per
-    /// call so one updater serves a whole temperature scan.
-    ///
-    /// A sweep is the conventional unit of Monte Carlo time, sized to the lattice
-    /// so autocorrelation is measured in sweeps rather than raw steps. What one
-    /// sweep *does* is the algorithm's own choice: [`Metropolis`] attempts
-    /// `n_vars` single-site updates at random sites; [`SiteCheckerboard`] attempts
-    /// one per site in color order; an HMC trajectory would be a single
-    /// whole-lattice move.
+    /// Advance `config` in place by one sweep — the conventional unit of Monte
+    /// Carlo time, sized to the lattice — returning the net realized `ΔE`
+    /// summed over its updates. What one sweep does is the algorithm's own
+    /// choice.
     ///
     /// The returned sum telescopes to `H(after) − H(before)` for this sweep
     /// alone. It is not a running energy — re-anchoring against a from-scratch
@@ -91,23 +45,14 @@ pub trait Updater<const Q: usize, const D: usize> {
     ) -> f64;
 }
 
-/// The single-variable Metropolis update at a **given** variable: propose a
-/// change, price it with [`Action::energy_delta`], and accept with
-/// `min(1, e^{-β ΔE})`, returning the realized `ΔE` (`0.0` on rejection, leaving
-/// `config` unchanged).
+/// The shared single-variable Metropolis kernel, at a variable the schedule
+/// hands in: propose a different state, price it with
+/// [`Action::energy_delta`], and accept with `min(1, e^{-β ΔE})`, returning the
+/// realized `ΔE` (`0.0` on rejection, leaving `config` unchanged).
 ///
-/// This is the shared single-variable kernel, with the *variable handed in*
-/// rather than chosen here — selecting it is the schedule's job, not the
-/// kernel's. `var` is a bare index into the configuration, so it names a site on
-/// a site field and a link on a link field; [`Action::energy_delta`] is likewise
-/// grade-neutral, which is what lets [`LinkCheckerboard`] reuse this unchanged.
-/// [`Metropolis`] (random order), [`SiteCheckerboard`] (parity order), and
-/// [`LinkCheckerboard`] (direction-and-parity order) all drive their sweeps by
-/// calling it, and differ only in which variables they pass and in what order.
-///
-/// It is generic over `Q` because nothing in it reads a variable's value: the
-/// state count enters only through `propose`, and the accept/reject arithmetic
-/// is the same whether the proposal flipped a spin or relabelled a Potts site.
+/// `var` is a bare index into the configuration, so it names a site on a site
+/// field and a link on a link field; that grade-neutrality is what lets
+/// [`LinkCheckerboard`] reuse this unchanged.
 fn step<const Q: usize, const D: usize>(
     config: &mut Configuration<Q>,
     lattice: &Lattice<D>,
@@ -119,9 +64,8 @@ fn step<const Q: usize, const D: usize>(
     let proposed = propose(config.peek(var), rng);
     let delta = action.energy_delta(lattice, config, var, proposed);
 
-    // Accept with min(1, e^{-β ΔE}). The `ΔE ≤ 0` short-circuit keeps downhill
-    // moves without a draw and, by keeping the argument to `exp` non-positive,
-    // also prevents overflow.
+    // The `ΔE ≤ 0` short-circuit keeps downhill moves without a draw and, by
+    // keeping the argument to `exp` non-positive, prevents overflow.
     if delta <= 0.0 || rng.next_f64() < (-beta * delta).exp() {
         config.poke(var, proposed);
         delta
@@ -136,9 +80,7 @@ fn step<const Q: usize, const D: usize>(
 pub struct Metropolis;
 
 impl<const Q: usize, const D: usize> Updater<Q, D> for Metropolis {
-    /// `N = n_vars` single-site `step`s at uniformly-random sites. Drawing the
-    /// site here — rather than inside `step` — is what makes the kernel reusable
-    /// by schedules that choose sites differently, like [`SiteCheckerboard`].
+    /// `n_vars` single-site `step`s at uniformly-random sites.
     fn sweep(
         &self,
         config: &mut Configuration<Q>,
@@ -160,29 +102,19 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for Metropolis {
 /// stateless unit struct, implementing [`Updater`] for any `Q` in any dimension.
 ///
 /// A sweep updates every site of one color, then every site of the other, where
-/// a site's color is the parity of its coordinate sum. The accept/reject rule is
-/// identical to [`Metropolis`] — only the order differs — so on CPU it samples
-/// the same distribution. Its purpose is to be the sequential reference for a
-/// parallel sweep: within one color no two sites are neighbors, so a whole color
-/// can be updated at once (on a GPU) without any site seeing another change.
-///
-/// The coloring argument reads only the adjacency, never a variable's value, so
-/// it carries from Ising to Potts unchanged: what has to hold is that the
-/// interaction is nearest-neighbor on a bipartite lattice, and the number of
-/// states does not enter it.
-///
-/// That non-adjacency holds only when every extent is even; on an odd extent the
-/// periodic wrap puts two same-color sites next to each other. This matters only
-/// for a *parallel* sweep — here, updating sequentially, any site order is a
+/// a site's color is the parity of its coordinate sum. On CPU that is just
+/// [`Metropolis`] in a fixed order; its purpose is to be the sequential
+/// reference for a parallel (GPU) sweep, where a whole color updates at once.
+/// That parallel independence needs every extent even — an odd extent wraps two
+/// same-color sites next to each other — but run sequentially any order is a
 /// valid Metropolis schedule, so the CPU version is correct on any lattice.
+/// See `docs/metropolis.md` for the argument.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SiteCheckerboard;
 
 impl<const Q: usize, const D: usize> Updater<Q, D> for SiteCheckerboard {
-    /// Two color passes: every site of color 0, then every site of color 1, each
-    /// a single-site `step`. Together they attempt one update per site, so a
-    /// checkerboard sweep does the same `n_vars` updates a [`Metropolis`] sweep
-    /// does — only the order differs.
+    /// Two color passes, together attempting one `step` per site — the same
+    /// `n_vars` updates a [`Metropolis`] sweep does, in a fixed order.
     fn sweep(
         &self,
         config: &mut Configuration<Q>,
@@ -207,35 +139,26 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for SiteCheckerboard {
 /// gauge model: a stateless unit struct, implementing [`Updater`] for any `Q` in
 /// any dimension.
 ///
-/// A link is a base site and a direction, and a sweep colors it by the pair
-/// `(direction, parity of the base site's coordinate sum)` — `2D` colors, each
-/// updated fully before the next. Splitting by direction is what base-site parity
-/// alone cannot do: the four links of a plaquette include two that share a base
-/// site, so a rule reading only the site would color them alike. Fixing the
-/// direction freezes every link of another direction, and a plaquette then holds
-/// exactly two links of the pass's direction, whose base sites differ by one step
-/// and so carry opposite parity.
+/// A sweep colors each link by the pair `(direction, parity of the base site's
+/// coordinate sum)` — `2D` colors, each updated fully before the next — so
+/// that no two links of one color share a plaquette. Its purpose is to be the
+/// sequential reference for a parallel sweep, where a whole color updates at
+/// once. That independence needs every extent even; run sequentially any link
+/// order is a valid Metropolis schedule, so the CPU version is correct on any
+/// lattice. See `docs/metropolis.md` for why base-site parity alone cannot
+/// separate a plaquette's links and for the full argument.
 ///
-/// The accept/reject rule is [`Metropolis`]'s, so on CPU this samples the same
-/// distribution and differs only in autocorrelation. Its purpose is to be the
-/// sequential reference for a parallel sweep: within one color no two links share
-/// a plaquette, so a whole color could be updated at once without any link seeing
-/// another change.
-///
-/// That independence holds only when every extent is even; on an odd extent the
-/// periodic wrap puts two links of a shared plaquette back in the same color.
-/// This matters only for a *parallel* sweep — here, updating sequentially, any
-/// link order is a valid Metropolis schedule, so the CPU version is correct on
-/// any lattice. See `docs/metropolis.md` for the full argument.
+/// It is a distinct type rather than a mode of [`SiteCheckerboard`] because
+/// only the name is shared: the color rule, what a collision means, and the
+/// pass count all differ.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkCheckerboard;
 
 impl LinkCheckerboard {
     /// Colors in one sweep: a direction paired with a base-site parity.
     ///
-    /// Unlike the site coloring's two, this grows with the dimension, and the
-    /// number is shared rather than derived twice — `GpuGaugeChain` turns it
-    /// into dispatches per sweep and has to agree with the order
+    /// Shared rather than derived twice — `GpuGaugeChain` turns it into
+    /// dispatches per sweep and has to agree with the order
     /// [`sweep`](LinkCheckerboard::sweep) walks, since the CPU schedule is the
     /// reference the device kernel is checked against.
     pub(crate) const fn colors<const D: usize>() -> usize {
@@ -244,11 +167,8 @@ impl LinkCheckerboard {
 }
 
 impl<const Q: usize, const D: usize> Updater<Q, D> for LinkCheckerboard {
-    /// `2D` color passes: for each direction in turn, every link of that
-    /// direction based on an even site, then every one based on an odd site, each
-    /// a single-variable `step`. Together they attempt one update per link, so a
-    /// sweep does the same `n_vars` updates a [`Metropolis`] sweep does — only
-    /// the order differs.
+    /// `2D` color passes — each direction in turn, even base sites then odd —
+    /// together attempting one `step` per link.
     ///
     /// # Panics
     ///
@@ -271,13 +191,11 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for LinkCheckerboard {
         let mut net = 0.0;
         for dir in 0..D {
             for color in [0, 1] {
-                // Iterate over *sites*, not links, and address the one link each
-                // site owns in this direction. Scanning every link and skipping
-                // those of another direction would walk `D * n_sites` entries
-                // per pass to perform `n_sites` updates. The visiting order is
-                // the same either way, since the packing is monotonic in the base
-                // site at fixed direction — `link_colors_are_visited_in_link_order`
-                // pins that — and it is the mapping the GPU kernel launches one
+                // Iterate over *sites* and address the one link each owns in
+                // this direction, rather than scanning all `D * n_sites` links
+                // and skipping other directions. The visiting order is the same
+                // either way — `link_colors_are_visited_in_link_order` pins
+                // that — and it is the mapping the GPU kernel launches one
                 // thread per.
                 for site in 0..lattice.n_sites() {
                     if lattice.site_parity(site) == color {
@@ -294,14 +212,9 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for LinkCheckerboard {
 /// A runtime choice among the built-in updaters, so an updater named in a config
 /// file can be selected without the caller committing to a type at compile time.
 ///
-/// The types are fixed at compile time, but which one a run uses is a value read
-/// from a file — so the two have to meet at a single type. `AnyUpdater` is that
-/// type: it implements [`Updater`] by forwarding `sweep` to whichever updater it
-/// wraps, which is what lets [`IsingSampler`](crate::models::ising::sampler::IsingSampler) hold one field
-/// and [`Chain`](crate::chain::Chain) stay generic while the algorithm is chosen
-/// at runtime. Its variants mirror
-/// [`UpdaterKind`](crate::config::UpdaterKind) — a closed set, which is what
-/// makes the choice recordable.
+/// Implements [`Updater`] by forwarding `sweep` to whichever updater it wraps.
+/// Its variants mirror [`UpdaterKind`](crate::config::UpdaterKind) — a closed
+/// set, which is what makes the choice recordable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnyUpdater {
     /// The random-site schedule, [`Metropolis`].
@@ -313,8 +226,6 @@ pub enum AnyUpdater {
 }
 
 impl<const Q: usize, const D: usize> Updater<Q, D> for AnyUpdater {
-    /// Forward to the wrapped updater's sweep. The match is the whole cost of
-    /// runtime dispatch — one branch per algorithm, resolved once per sweep.
     fn sweep(
         &self,
         config: &mut Configuration<Q>,
@@ -332,20 +243,15 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for AnyUpdater {
 }
 
 /// Propose a state other than `current`, drawn uniformly from the `Q - 1` that
-/// are not it.
-///
-/// The one `Q`-specific piece of the update, isolated so the accept/reject core
-/// never sees a state count. Drawing uniformly among the alternatives is what
-/// keeps the proposal *symmetric* — every other state is offered with the same
-/// probability `1/(Q - 1)`, from and to any state alike — which is the
-/// assumption the Metropolis acceptance rule rests on when it drops the Hastings
-/// ratio. The draw is mapped onto the alternatives by skipping past `current`,
-/// so the map is a bijection and no state is offered twice or not at all.
+/// are not it — the *symmetric* proposal the acceptance rule rests on when it
+/// drops the Hastings ratio (see `docs/metropolis.md`). The draw is mapped onto
+/// the alternatives by skipping past `current`, a bijection, so no state is
+/// offered twice or not at all.
 ///
 /// `Q = 2` takes the deterministic flip rather than the general path, and not
-/// only to save a draw: at two states the alternative is already determined, so
-/// consuming randomness for it would shift every existing two-state chain onto a
-/// different stream while sampling exactly the same distribution.
+/// only to save a draw: consuming randomness for a determined outcome would
+/// shift every existing two-state chain onto a different stream while sampling
+/// exactly the same distribution.
 fn propose<const Q: usize>(current: State<Q>, rng: &mut impl Rng) -> State<Q> {
     debug_assert!(Q >= 2, "a proposal needs a state to move to");
     let index = if Q == 2 {
@@ -365,10 +271,8 @@ mod tests {
     use crate::models::potts::Potts;
     use crate::rng::RandRng;
 
-    /// A scripted [`Rng`] handing back preset answers, so a test can pin whether
-    /// an accept draw passes (and, for a random-site schedule, which site is
-    /// visited). The consumption counters double as an assertion target for how
-    /// many draws were made.
+    /// A scripted [`Rng`] handing back preset answers; the consumption counters
+    /// double as an assertion target for how many draws were made.
     struct ScriptedRng {
         sites: Vec<usize>,
         uniforms: Vec<f64>,
@@ -402,10 +306,8 @@ mod tests {
         }
     }
 
-    /// At two states the proposal is the flip and consumes nothing. The draw is
-    /// what the general path spends to pick among alternatives, and with one
-    /// alternative there is nothing to pick — spending it anyway would move
-    /// every existing two-state chain onto a different stream.
+    /// At two states the proposal is the flip and consumes no randomness, so
+    /// existing two-state chains keep their streams.
     #[test]
     fn the_two_state_proposal_is_the_flip_and_draws_nothing() {
         let mut rng = ScriptedRng::new(vec![], vec![]);
@@ -418,9 +320,8 @@ mod tests {
     }
 
     /// Above two states the proposal never hands the current state back and
-    /// reaches every alternative about equally often — the bijection the
-    /// skip-past-the-current-index construction gives, and the symmetry the
-    /// acceptance rule assumes when it drops the Hastings ratio.
+    /// reaches every alternative about equally often — the symmetry the
+    /// acceptance rule assumes.
     #[test]
     fn the_general_proposal_covers_every_other_state_uniformly() {
         const Q: usize = 4;
@@ -450,15 +351,15 @@ mod tests {
         }
     }
 
-    /// A downhill flip is accepted with no accept/reject draw, mutates the
-    /// config, and returns a realized ΔE equal to the from-scratch difference.
+    /// A downhill flip is accepted with no accept/reject draw and returns a
+    /// realized ΔE equal to the from-scratch difference.
     #[test]
     fn accepts_a_downhill_flip_without_drawing() {
         let lat = Lattice::new([4, 4]);
         let action = Ising::new(1.0, 0.0);
 
-        // One spin flipped against an otherwise-aligned background: flipping it
-        // back to the aligned state lowers the energy.
+        // One spin flipped against an aligned background, so flipping it back
+        // is downhill.
         let mut config = Configuration::<2>::cold(&lat, Cell::Site);
         let site = 5;
         config.poke(site, State::new(1).unwrap());
@@ -480,8 +381,7 @@ mod tests {
         );
     }
 
-    /// An uphill flip whose draw falls above the Boltzmann factor is rejected:
-    /// the config is untouched and the realized ΔE is 0.0.
+    /// An uphill flip whose draw falls above the Boltzmann factor is rejected.
     #[test]
     fn rejects_an_uphill_flip_above_the_boltzmann_factor() {
         let lat = Lattice::new([4, 4]);
@@ -520,9 +420,8 @@ mod tests {
         assert_eq!(realized, action.energy(&lat, &config) - before);
     }
 
-    /// A Metropolis sweep is exactly `N = n_vars` steps: on the ground state
-    /// every flip is uphill, so each step draws one accept uniform, and rejecting
-    /// all of them leaves the config untouched with a net ΔE of 0.0.
+    /// A Metropolis sweep attempts exactly `n_vars` steps, each drawing one
+    /// accept uniform on the all-uphill ground state.
     #[test]
     fn metropolis_sweep_runs_n_vars_steps() {
         let lat = Lattice::new([4, 4]);
@@ -544,9 +443,9 @@ mod tests {
         );
     }
 
-    /// The net ΔE a Metropolis sweep returns equals `H(after) − H(before)`. This
-    /// holds for *any* accept/reject pattern, so a real seeded RNG is fine;
-    /// integer-valued couplings and sums make the comparison bit-exact.
+    /// The net ΔE a Metropolis sweep returns equals `H(after) − H(before)` for
+    /// any accept/reject pattern; integer-valued couplings and sums make the
+    /// comparison bit-exact.
     #[test]
     fn metropolis_sweep_net_delta_equals_energy_change() {
         let lat = Lattice::new([4, 4]);
@@ -560,10 +459,8 @@ mod tests {
         assert_eq!(net, action.energy(&lat, &config) - before);
     }
 
-    /// A checkerboard sweep attempts one update per site: on the ground state
-    /// every flip is uphill, so each of the `n_vars` attempts draws exactly one
-    /// accept uniform. The random-site generator is never touched — the schedule
-    /// is deterministic — and rejecting all leaves the config untouched.
+    /// A checkerboard sweep attempts one update per site and never touches the
+    /// random-site generator — the schedule is deterministic.
     #[test]
     fn site_checkerboard_sweep_attempts_every_site_once() {
         let lat = Lattice::new([4, 4]);
@@ -586,9 +483,8 @@ mod tests {
         assert_eq!(rng.site_i, 0, "checkerboard picks no random sites");
     }
 
-    /// The net ΔE a checkerboard sweep returns equals `H(after) − H(before)`, the
-    /// same telescoping identity as the Metropolis sweep — the schedule differs
-    /// but the accounting does not.
+    /// A checkerboard sweep satisfies the same telescoping identity as the
+    /// Metropolis sweep.
     #[test]
     fn site_checkerboard_sweep_net_delta_equals_energy_change() {
         let lat = Lattice::new([4, 4]);
@@ -602,16 +498,10 @@ mod tests {
         assert_eq!(net, action.energy(&lat, &config) - before);
     }
 
-    /// Both site schedules run a model with more than two states, and still
-    /// account for what they did: the net ΔE a sweep returns is the from-scratch
-    /// energy change.
-    ///
-    /// Nothing below `Q = 3` exercises the drawn proposal at all, since the
-    /// two-state path takes the deterministic flip and never touches the
-    /// generator. This is what says the drawn candidate is in range, that the
-    /// action can price a move to it, and that the telescoping identity survives
-    /// the generalization. The coupling is integer-valued and the agreement
-    /// counts are integers, so the comparison is bit-exact.
+    /// Both site schedules run a three-state model and still account exactly.
+    /// Nothing below `Q = 3` exercises the drawn proposal at all — the
+    /// two-state path never touches the generator — so this is what says the
+    /// drawn candidate is in range and the action can price a move to it.
     #[test]
     fn the_site_schedules_run_a_three_state_model() {
         let lat = Lattice::new([4, 6]);
@@ -637,9 +527,8 @@ mod tests {
         }
     }
 
-    /// The two colors partition the lattice: every site is exactly one color, and
-    /// on an even lattice no site shares a color with any of its neighbors — the
-    /// property a parallel sweep relies on.
+    /// On an even lattice no site shares a color with any of its neighbors —
+    /// the property a parallel sweep relies on.
     #[test]
     fn site_colors_separate_neighbors() {
         let lat = Lattice::new([4, 4]);
@@ -652,7 +541,7 @@ mod tests {
     }
 
     /// A link's color under [`LinkCheckerboard`]: its direction paired with its
-    /// base site's parity, the `2D`-valued rule the sweep's pass order walks.
+    /// base site's parity.
     fn link_color<const D: usize>(lattice: &Lattice<D>, link: usize) -> (usize, usize) {
         (
             lattice.link_direction(link),
@@ -660,11 +549,8 @@ mod tests {
         )
     }
 
-    /// The link coloring is collision-free: no two links of the same color ever
-    /// share a plaquette. This is the property a parallel gauge sweep would rely
-    /// on, and the reason base-site parity alone is not enough — within a
-    /// plaquette, two links do share a base site, and only the direction half of
-    /// the pair separates them.
+    /// No two links of the same color ever share a plaquette — the property a
+    /// parallel gauge sweep would rely on.
     #[test]
     fn link_colors_separate_plaquette_partners() {
         let lat = Lattice::new([4, 4, 4]);
@@ -684,22 +570,13 @@ mod tests {
         }
     }
 
-    /// The link coloring stays collision-free at every dimension.
+    /// The link coloring stays collision-free at every dimension, where a link
+    /// gains plaquette partners linearly while the colors grow as `2D`. Every
+    /// extent is even, which the periodic wrap requires.
     ///
-    /// This is the property a parallel pass rests on, and it grows with `D` in a
-    /// way the fixed-dimension test above cannot show: a link gains plaquette
-    /// partners linearly while the coloring's own `2D` colors grow alongside. A
-    /// coloring that stopped separating partners in higher dimensions would
-    /// break detailed balance on the GPU silently — every measured quantity
-    /// would still look reasonable.
-    ///
-    /// Only the link half is here. The site coloring is `Lattice::site_parity`
-    /// rather than anything this module owns, and
-    /// `lattice::parity_alternates_between_neighbors_in_every_dimension` already
-    /// sweeps it over a superset of these shapes.
-    ///
-    /// Every extent is even, which the wrap requires: an odd one puts a variable
-    /// next to a same-colored copy of itself across the boundary.
+    /// Only the link half is here: the site coloring is `Lattice::site_parity`,
+    /// and `lattice::parity_alternates_between_neighbors_in_every_dimension`
+    /// already sweeps it over a superset of these shapes.
     #[test]
     fn the_link_coloring_stays_collision_free_in_every_dimension() {
         fn links<const D: usize>(shape: [usize; D]) {
@@ -728,13 +605,10 @@ mod tests {
         links([2, 4, 2, 2, 4, 2]);
     }
 
-    /// A link pass covers every link exactly once, at every dimension.
-    ///
-    /// The counterpart of the collision-free property: a coloring that separated
-    /// partners but skipped or double-counted variables would also break the
-    /// chain, and the two failures are independent. Only the link pass is worth
-    /// asserting — the site pass partitions the sites by a two-valued function,
-    /// so reproducing the whole range is arithmetic rather than a property of
+    /// A link pass covers every link exactly once, at every dimension — the
+    /// counterpart of the collision-free property, and an independent failure
+    /// mode. The site pass is not asserted: it partitions the sites by a
+    /// two-valued function, so coverage is arithmetic rather than a property of
     /// the schedule.
     #[test]
     fn a_link_pass_covers_every_link_once() {
@@ -763,10 +637,8 @@ mod tests {
     }
 
     /// The sweep's site-major iteration visits exactly the links a link-major
-    /// scan would, in the same order — the property that lets it address one
-    /// link per site instead of scanning every link and discarding those of
-    /// another direction. Both orders are valid schedules, but pinning them
-    /// equal is what makes that an optimization rather than a change.
+    /// scan would, in the same order — pinning them equal is what makes the
+    /// site-major walk an optimization rather than a schedule change.
     #[test]
     fn link_colors_are_visited_in_link_order() {
         let lat = Lattice::new([4, 6, 4]);
@@ -792,10 +664,8 @@ mod tests {
         }
     }
 
-    /// A link checkerboard sweep attempts one update per link: on the ground
-    /// state every flip is uphill, so each of the `n_vars` attempts draws exactly
-    /// one accept uniform. The random-variable generator is never touched — the
-    /// schedule is deterministic — and rejecting all leaves the config untouched.
+    /// A link checkerboard sweep attempts one update per link and never touches
+    /// the random-variable generator — the schedule is deterministic.
     #[test]
     fn link_checkerboard_sweep_attempts_every_link_once() {
         let lat = Lattice::new([4, 4, 4]);
@@ -821,9 +691,8 @@ mod tests {
         );
     }
 
-    /// The net ΔE a link checkerboard sweep returns equals `H(after) − H(before)`
-    /// — the same telescoping identity the site schedules satisfy, on a link
-    /// field.
+    /// The link checkerboard sweep satisfies the same telescoping identity as
+    /// the site schedules, on a link field.
     #[test]
     fn link_checkerboard_sweep_net_delta_equals_energy_change() {
         let lat = Lattice::new([4, 4, 4]);
@@ -838,9 +707,8 @@ mod tests {
     }
 
     /// An odd extent is no obstacle to the sequential schedule: the coloring's
-    /// independence fails there — the periodic wrap puts two links of a shared
-    /// plaquette in one color — but updating in sequence makes any order a valid
-    /// Metropolis schedule, so the sweep still runs and still accounts correctly.
+    /// independence fails there, but any sequential order is a valid Metropolis
+    /// schedule, so the sweep still runs and still accounts correctly.
     #[test]
     fn link_checkerboard_runs_on_odd_extents() {
         let lat = Lattice::new([3, 5, 3]);
@@ -854,9 +722,7 @@ mod tests {
         assert_eq!(net, action.energy(&lat, &config) - before);
     }
 
-    /// A site field is rejected rather than silently misread: the schedule treats
-    /// every index as a link, so running it on sites would color by a direction
-    /// the variables do not have.
+    /// A site field is rejected rather than silently misread as links.
     #[test]
     #[should_panic(expected = "must be a link field")]
     fn link_checkerboard_rejects_a_site_field() {
