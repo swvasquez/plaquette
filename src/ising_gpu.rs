@@ -19,7 +19,10 @@
 //! reference.
 
 use crate::configuration::{Cell, Configuration};
-use crate::device::{DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors};
+use crate::device::{
+    DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors,
+    site_neighbor_table, state_words,
+};
 use crate::lattice::Lattice;
 
 /// Color passes per sweep: the two coordinate-sum parities. A site's color does
@@ -61,7 +64,7 @@ struct Params {
 /// holds only device buffers and counts — so `D` is a parameter of the
 /// constructor rather than of the chain.
 pub struct GpuIsingChain {
-    sweeper: DeviceSweeper,
+    sweeper: DeviceSweeper<2>,
 }
 
 impl GpuIsingChain {
@@ -111,11 +114,8 @@ impl GpuIsingChain {
 
         let n_sites = lattice.n_sites();
 
-        let spins: Vec<u32> = start.variables().iter().map(|s| s.index() as u32).collect();
-        let mut neighbors: Vec<u32> = Vec::with_capacity(n_sites * Lattice::<D>::neighbor_stride());
-        for site in 0..n_sites {
-            neighbors.extend(lattice.site_neighbors(site).iter().map(|&nb| nb as u32));
-        }
+        let spins = state_words(start);
+        let neighbors = site_neighbor_table(lattice);
         let site_color = site_colors(lattice);
         let params = Params {
             n_sites: n_sites as u32,

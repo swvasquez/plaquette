@@ -21,7 +21,9 @@
 //! is the one a plaquette interaction needs.
 
 use crate::configuration::{Cell, Configuration};
-use crate::device::{DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors};
+use crate::device::{
+    DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors, state_words,
+};
 use crate::lattice::Lattice;
 use crate::model::Z2Gauge;
 use crate::updater::LinkCheckerboard;
@@ -56,7 +58,7 @@ struct Params {
 /// read once in [`new`](GpuGaugeChain::new) to build the tables, and what
 /// survives is device buffers and counts.
 pub struct GpuGaugeChain {
-    sweeper: DeviceSweeper,
+    sweeper: DeviceSweeper<2>,
 }
 
 impl GpuGaugeChain {
@@ -116,7 +118,7 @@ impl GpuGaugeChain {
         let n_sites = lattice.n_sites();
         let n_links = lattice.n_links();
 
-        let links: Vec<u32> = start.variables().iter().map(|s| s.index() as u32).collect();
+        let links = state_words(start);
         // The staple table verbatim: for each link, the `2 * (D - 1)` groups of
         // three link indices it is priced against, already flat and already in
         // group order, so the shader reads it with the same arithmetic

@@ -334,6 +334,22 @@ pub fn susceptibility(magnetizations: &[f64], beta: f64, n_sites: f64) -> Derive
 /// reduced to `|M|`. Its integrands are the raw moments `m²` and `m⁴`, so those
 /// are the features directly (no centering — a ratio of two similar-magnitude
 /// positives is well-conditioned), and the blocks are sized by the slower of them.
+///
+/// The `3` is a convention rather than a universal constant, and what it is
+/// calibrated to matters once the series comes from somewhere other than
+/// [`Ising`](crate::model::Ising). A *signed* order parameter symmetric about
+/// zero and near-Gaussian in the disordered phase satisfies `⟨m⁴⟩ = 3⟨m²⟩²`,
+/// which is what puts `U_4` at exactly `0` there, while sharp ordering gives
+/// `⟨m⁴⟩ = ⟨m²⟩²` and so `2/3` at the other end. A
+/// [`Potts`](crate::model::Potts) series arrives through
+/// [`order_parameter`](crate::model::Potts::order_parameter), which is
+/// non-negative by construction and does not average to zero on a finite
+/// lattice: its ordered limit is still `2/3`, but its disordered value is a
+/// size-dependent number rather than the Ising anchor. That does not stop the
+/// cumulant doing its job — locating `beta_c` by where curves for different `L`
+/// cross needs only a dimensionless ratio of moments, not particular endpoints —
+/// but those endpoints should not be read as though they were Ising's. See
+/// `docs/potts.md`.
 pub fn binder_cumulant(magnetizations: &[f64]) -> Derived {
     let m_squared: Vec<f64> = magnetizations.iter().map(|m| m * m).collect();
     let m_fourth: Vec<f64> = m_squared.iter().map(|s| s * s).collect();

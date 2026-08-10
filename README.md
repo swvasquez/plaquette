@@ -15,12 +15,14 @@ cargo build
 
 ## Models
 
-`plaquette` currently implements two models:
+`plaquette` currently implements three models:
 
 | Model    | Dimension | Implementation     | Device   |
 | -------- | --------- | ------------------ | -------- |
 | Ising    | D ≥ 1     | Metropolis         | CPU      |
 | Ising    | D ≥ 1     | Site checkerboard  | CPU, GPU |
+| Potts    | D ≥ 1     | Metropolis         | CPU      |
+| Potts    | D ≥ 1     | Site checkerboard  | CPU, GPU |
 | Z2 gauge | D ≥ 2     | Metropolis         | CPU      |
 | Z2 gauge | D ≥ 2     | Link checkerboard  | CPU, GPU |
 
@@ -39,11 +41,21 @@ To run the Ising model, call
 cargo run --example ising -- examples/ising/run.toml
 ```
 
-Similarly, run the Z2 gauge model via
+Similarly, run the q-state Potts model via
+
+```bash
+cargo run --example potts -- examples/potts/potts.toml
+```
+
+and the Z2 gauge model via
 
 ```bash
 cargo run --example gauge -- examples/gauge/gauge.toml
 ```
+
+The Potts example fixes the number of states in its own source rather than in the
+config file, since it is a compile-time constant; `const Q` in
+`examples/potts/potts.rs` names it.
 
 ## Documentation
 

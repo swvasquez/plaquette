@@ -1,0 +1,51 @@
+# A single q-state Potts run. Edit and re-run — no recompile needed:
+#
+#     cargo run --example potts -- examples/potts/potts.toml
+#
+# Two run parameters are NOT here, because both are compile-time constants: the
+# number of states `q` and the lattice dimension. Both are named by `const Q` and
+# `const D` in examples/potts/potts.rs, and changing either means editing that
+# file and rebuilding. The shape's length must match `const D`; nothing here
+# mentions `q` at all, so the `description` below is the only record of which one
+# this file was written for.
+#
+# Note that this comment does not survive a round-trip: serde carries data, not
+# formatting. Anything that must travel with the run's provenance record goes in
+# the `description` field below.
+#
+# Unknown keys are rejected, so a typo here fails at load rather than being
+# silently ignored.
+
+# Physics.
+shape = [16, 16]  # lattice extents; length must match `const D` in examples/potts/potts.rs
+j = 1.0           # nearest-neighbor coupling; agreeing neighbors lower the energy
+beta = 1.0        # inverse temperature; beta_c = ln(1 + sqrt(q)) ~ 1.0050 at q = 3
+
+# Optional per-label energy offsets, one entry per label — omit for the symmetric
+# model, which is what the critical coupling above is quoted for. Only the
+# differences between entries matter, so the usual choice offsets one label and
+# leaves the rest at zero. The list must be exactly `const Q` long, and that is
+# checked when the run is built rather than when the file is parsed, since
+# nothing here says what Q is.
+#
+# h = [0.1, 0.0, 0.0]
+
+# Driver controls. The gap is wider than the Ising example's, because a local
+# update decorrelates slowly this close to a continuous transition — raise the
+# lattice size and the printed n_eff collapses, which is the critical slowing
+# down that cluster algorithms exist to escape (see docs/potts.md).
+updater = "metropolis"  # update algorithm; optional, defaults to "metropolis"
+thermalize = 1000       # warmup sweeps, discarded
+sweeps_between = 10     # decorrelation sweeps between samples
+n_samples = 1000        # samples to record
+
+# Reproducibility: this seed alone replays the whole run, start config included.
+seed = 20260809
+
+# Start configuration: "cold" (every site on one label) or "hot" (random labels).
+start = "hot"
+
+# What to measure is NOT specified here: a run produces configurations, and any
+# observable can be computed from them afterwards. See the example source.
+
+description = "q = 3 on 16x16, just below the exact critical coupling"

@@ -7,23 +7,31 @@
 //! [`Sample`] of observables that [`reduce`] aggregates into estimates with
 //! error bars.
 //!
-//! Two models run today, each by Metropolis or by a checkerboard sweep, and each
-//! checkerboard on either the CPU or the GPU. The two colorings differ because
-//! the variables do: the Ising model colors a *site* by the parity of its
-//! coordinate sum, while the Z2 gauge model colors a *link* by its direction as
-//! well as its base site's parity, so that no two links updated together share a
-//! plaquette. Each has a sampler — [`IsingSampler`] and [`GaugeSampler`] — that
-//! builds a thermalized chain from a run configuration parsed from TOML, which
-//! is how the examples under `examples/` are driven.
+//! Three models run today, each by Metropolis or by a checkerboard sweep, and
+//! each checkerboard on either the CPU or the GPU. The two colorings differ
+//! because the variables do: the Ising and Potts models color a *site* by the
+//! parity of its coordinate sum, while the Z2 gauge model colors a *link* by its
+//! direction as well as its base site's parity, so that no two links updated
+//! together share a plaquette. Each has a sampler — [`IsingSampler`],
+//! [`GaugeSampler`], [`PottsSampler`] — that builds a thermalized chain from a
+//! run configuration parsed from TOML, which is how the examples under
+//! `examples/` are driven.
 //!
 //! Every layer is generic over the lattice dimension `D`, which each model needs
-//! enough of to have the cell its energy scores: Ising sums over links and needs
-//! one, the gauge action sums over plaquettes and needs two. `D` is a
-//! compile-time parameter throughout, so a driver names the dimension it is
-//! built for and a config file's `shape` has to agree; `check_dimension` reports
-//! a file that does not. Nothing dispatches over the dimension at runtime,
-//! which keeps the set of instantiations a program pays for down to the one it
-//! actually runs.
+//! enough of to have the cell its energy scores: Ising and Potts sum over
+//! nearest-neighbor bonds and need one, the gauge action sums over plaquettes
+//! and needs two. The state count `Q` is generic the same way, and
+//! [`Potts`](model::Potts) is the model that exercises it — its labels stand for
+//! nothing, so the energy compares them instead of decoding them into values,
+//! while the other two are pinned at the two states `±1` names.
+//!
+//! Both are compile-time parameters throughout, so a driver names the pair it is
+//! built for rather than reading either from a file. A config file's `shape`
+//! still has to agree with the dimension, and `check_dimension` reports one that
+//! does not; nothing in a file names the state count at all. Dispatching over
+//! either at runtime would mean instantiating the whole stack once per
+//! combination, and with two parameters that is a grid rather than a list —
+//! fixing both at compile time is also what the lattice-gauge codes do.
 //!
 //! The algorithms and the physics they rest on are written up under `docs/`.
 
@@ -43,6 +51,9 @@ pub mod ising_sampler;
 pub mod lattice;
 pub mod model;
 pub mod observables;
+pub mod potts_config;
+pub mod potts_gpu;
+pub mod potts_sampler;
 pub mod rng;
 pub mod state;
 pub mod statistics;
@@ -61,9 +72,12 @@ pub use ising_sampler::{AnyIsingChain, IsingSampler};
 pub use lattice::{Lattice, Loop, Sign};
 pub use model::{Action, AnyAction};
 pub use observables::{
-    Correlator, GaugeSample, Sample, WilsonRectangles, correlator, gauge_measure, measure,
-    polyakov_loop, wilson_rectangles,
+    Correlator, GaugeSample, PottsSample, Sample, WilsonRectangles, correlator, gauge_measure,
+    measure, polyakov_loop, potts_correlator, potts_measure, wilson_rectangles,
 };
+pub use potts_config::PottsRunConfig;
+pub use potts_gpu::GpuPottsChain;
+pub use potts_sampler::{AnyPottsChain, PottsSampler};
 pub use rng::{RandRng, Rng};
 pub use state::State;
 pub use statistics::{

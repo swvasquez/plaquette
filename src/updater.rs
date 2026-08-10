@@ -14,9 +14,9 @@
 //! schedules which have one call into; a cluster update would write a `sweep`
 //! that never mentions it.
 //!
-//! [`Metropolis`] is the single-spin-flip update, the `Q = 2` case for any `D`.
-//! Its sweep visits `N = n_vars` uniformly-random sites; each `step` proposes
-//! the flipped state, prices the move with [`Action::energy_delta`], and accepts
+//! [`Metropolis`] is the single-variable update, for any `Q` and any `D`. Its
+//! sweep visits `N = n_vars` uniformly-random sites; each `step` proposes a
+//! different state, prices the move with [`Action::energy_delta`], and accepts
 //! with `min(1, e^{-β ΔE})`. The uniform pick is what makes the proposal
 //! symmetric and so lets acceptance drop the Hastings ratio; pricing by local
 //! delta rather than absolute energy is what cancels the partition function.
@@ -91,8 +91,8 @@ pub trait Updater<const Q: usize, const D: usize> {
     ) -> f64;
 }
 
-/// The single-variable-flip Metropolis update at a **given** variable: propose
-/// the flip, price it with [`Action::energy_delta`], and accept with
+/// The single-variable Metropolis update at a **given** variable: propose a
+/// change, price it with [`Action::energy_delta`], and accept with
 /// `min(1, e^{-β ΔE})`, returning the realized `ΔE` (`0.0` on rejection, leaving
 /// `config` unchanged).
 ///
@@ -104,10 +104,14 @@ pub trait Updater<const Q: usize, const D: usize> {
 /// [`Metropolis`] (random order), [`SiteCheckerboard`] (parity order), and
 /// [`LinkCheckerboard`] (direction-and-parity order) all drive their sweeps by
 /// calling it, and differ only in which variables they pass and in what order.
-fn step<const D: usize>(
-    config: &mut Configuration<2>,
+///
+/// It is generic over `Q` because nothing in it reads a variable's value: the
+/// state count enters only through `propose`, and the accept/reject arithmetic
+/// is the same whether the proposal flipped a spin or relabelled a Potts site.
+fn step<const Q: usize, const D: usize>(
+    config: &mut Configuration<Q>,
     lattice: &Lattice<D>,
-    action: &impl Action<2, D>,
+    action: &impl Action<Q, D>,
     var: usize,
     beta: f64,
     rng: &mut impl Rng,
@@ -126,20 +130,20 @@ fn step<const D: usize>(
     }
 }
 
-/// The single-spin-flip Metropolis update with a **random-site** schedule: a
-/// stateless unit struct, implementing [`Updater`] for `Q = 2` in any dimension.
+/// The single-variable Metropolis update with a **random-site** schedule: a
+/// stateless unit struct, implementing [`Updater`] for any `Q` in any dimension.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Metropolis;
 
-impl<const D: usize> Updater<2, D> for Metropolis {
+impl<const Q: usize, const D: usize> Updater<Q, D> for Metropolis {
     /// `N = n_vars` single-site `step`s at uniformly-random sites. Drawing the
     /// site here — rather than inside `step` — is what makes the kernel reusable
     /// by schedules that choose sites differently, like [`SiteCheckerboard`].
     fn sweep(
         &self,
-        config: &mut Configuration<2>,
+        config: &mut Configuration<Q>,
         lattice: &Lattice<D>,
-        action: &impl Action<2, D>,
+        action: &impl Action<Q, D>,
         beta: f64,
         rng: &mut impl Rng,
     ) -> f64 {
@@ -152,8 +156,8 @@ impl<const D: usize> Updater<2, D> for Metropolis {
     }
 }
 
-/// The single-spin-flip Metropolis update with a **checkerboard** schedule: a
-/// stateless unit struct, implementing [`Updater`] for `Q = 2` in any dimension.
+/// The single-variable Metropolis update with a **checkerboard** schedule: a
+/// stateless unit struct, implementing [`Updater`] for any `Q` in any dimension.
 ///
 /// A sweep updates every site of one color, then every site of the other, where
 /// a site's color is the parity of its coordinate sum. The accept/reject rule is
@@ -162,6 +166,11 @@ impl<const D: usize> Updater<2, D> for Metropolis {
 /// parallel sweep: within one color no two sites are neighbors, so a whole color
 /// can be updated at once (on a GPU) without any site seeing another change.
 ///
+/// The coloring argument reads only the adjacency, never a variable's value, so
+/// it carries from Ising to Potts unchanged: what has to hold is that the
+/// interaction is nearest-neighbor on a bipartite lattice, and the number of
+/// states does not enter it.
+///
 /// That non-adjacency holds only when every extent is even; on an odd extent the
 /// periodic wrap puts two same-color sites next to each other. This matters only
 /// for a *parallel* sweep — here, updating sequentially, any site order is a
@@ -169,16 +178,16 @@ impl<const D: usize> Updater<2, D> for Metropolis {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SiteCheckerboard;
 
-impl<const D: usize> Updater<2, D> for SiteCheckerboard {
+impl<const Q: usize, const D: usize> Updater<Q, D> for SiteCheckerboard {
     /// Two color passes: every site of color 0, then every site of color 1, each
     /// a single-site `step`. Together they attempt one update per site, so a
     /// checkerboard sweep does the same `n_vars` updates a [`Metropolis`] sweep
     /// does — only the order differs.
     fn sweep(
         &self,
-        config: &mut Configuration<2>,
+        config: &mut Configuration<Q>,
         lattice: &Lattice<D>,
-        action: &impl Action<2, D>,
+        action: &impl Action<Q, D>,
         beta: f64,
         rng: &mut impl Rng,
     ) -> f64 {
@@ -194,8 +203,8 @@ impl<const D: usize> Updater<2, D> for SiteCheckerboard {
     }
 }
 
-/// The single-link-flip Metropolis update with a **checkerboard** schedule for a
-/// gauge model: a stateless unit struct, implementing [`Updater`] for `Q = 2` in
+/// The single-link Metropolis update with a **checkerboard** schedule for a
+/// gauge model: a stateless unit struct, implementing [`Updater`] for any `Q` in
 /// any dimension.
 ///
 /// A link is a base site and a direction, and a sweep colors it by the pair
@@ -234,7 +243,7 @@ impl LinkCheckerboard {
     }
 }
 
-impl<const D: usize> Updater<2, D> for LinkCheckerboard {
+impl<const Q: usize, const D: usize> Updater<Q, D> for LinkCheckerboard {
     /// `2D` color passes: for each direction in turn, every link of that
     /// direction based on an even site, then every one based on an odd site, each
     /// a single-variable `step`. Together they attempt one update per link, so a
@@ -247,9 +256,9 @@ impl<const D: usize> Updater<2, D> for LinkCheckerboard {
     /// variable's index as a link.
     fn sweep(
         &self,
-        config: &mut Configuration<2>,
+        config: &mut Configuration<Q>,
         lattice: &Lattice<D>,
-        action: &impl Action<2, D>,
+        action: &impl Action<Q, D>,
         beta: f64,
         rng: &mut impl Rng,
     ) -> f64 {
@@ -303,14 +312,14 @@ pub enum AnyUpdater {
     LinkCheckerboard(LinkCheckerboard),
 }
 
-impl<const D: usize> Updater<2, D> for AnyUpdater {
+impl<const Q: usize, const D: usize> Updater<Q, D> for AnyUpdater {
     /// Forward to the wrapped updater's sweep. The match is the whole cost of
     /// runtime dispatch — one branch per algorithm, resolved once per sweep.
     fn sweep(
         &self,
-        config: &mut Configuration<2>,
+        config: &mut Configuration<Q>,
         lattice: &Lattice<D>,
-        action: &impl Action<2, D>,
+        action: &impl Action<Q, D>,
         beta: f64,
         rng: &mut impl Rng,
     ) -> f64 {
@@ -322,20 +331,36 @@ impl<const D: usize> Updater<2, D> for AnyUpdater {
     }
 }
 
-/// Propose the single-site flip `0 ↔ 1`.
+/// Propose a state other than `current`, drawn uniformly from the `Q - 1` that
+/// are not it.
 ///
-/// The one `Q`-specific piece of the update, isolated so a general-`Q` proposal
-/// can replace it without touching the accept/reject core. The deterministic
-/// two-state flip does not use `rng`, but a general-`Q` proposal would draw its
-/// candidate from it, so it stays in the signature.
-fn propose(current: State<2>, _rng: &mut impl Rng) -> State<2> {
-    State::new(1 - current.index()).expect("1 - index is 0 or 1, always < Q")
+/// The one `Q`-specific piece of the update, isolated so the accept/reject core
+/// never sees a state count. Drawing uniformly among the alternatives is what
+/// keeps the proposal *symmetric* — every other state is offered with the same
+/// probability `1/(Q - 1)`, from and to any state alike — which is the
+/// assumption the Metropolis acceptance rule rests on when it drops the Hastings
+/// ratio. The draw is mapped onto the alternatives by skipping past `current`,
+/// so the map is a bijection and no state is offered twice or not at all.
+///
+/// `Q = 2` takes the deterministic flip rather than the general path, and not
+/// only to save a draw: at two states the alternative is already determined, so
+/// consuming randomness for it would shift every existing two-state chain onto a
+/// different stream while sampling exactly the same distribution.
+fn propose<const Q: usize>(current: State<Q>, rng: &mut impl Rng) -> State<Q> {
+    debug_assert!(Q >= 2, "a proposal needs a state to move to");
+    let index = if Q == 2 {
+        1 - current.index()
+    } else {
+        let draw = rng.next_below(Q - 1);
+        draw + usize::from(draw >= current.index())
+    };
+    State::new(index).expect("skipping past the current index stays below Q")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Ising, Z2Gauge};
+    use crate::model::{Ising, Potts, Z2Gauge};
     use crate::rng::RandRng;
 
     /// A scripted [`Rng`] handing back preset answers, so a test can pin whether
@@ -372,6 +397,54 @@ mod tests {
             assert!(v < n, "scripted site {v} out of range for n = {n}");
             self.site_i += 1;
             v
+        }
+    }
+
+    /// At two states the proposal is the flip and consumes nothing. The draw is
+    /// what the general path spends to pick among alternatives, and with one
+    /// alternative there is nothing to pick — spending it anyway would move
+    /// every existing two-state chain onto a different stream.
+    #[test]
+    fn the_two_state_proposal_is_the_flip_and_draws_nothing() {
+        let mut rng = ScriptedRng::new(vec![], vec![]);
+        for index in [0usize, 1] {
+            let current = State::<2>::new(index).unwrap();
+            assert_eq!(propose(current, &mut rng).index(), 1 - index);
+        }
+        assert_eq!(rng.site_i, 0, "the two-state proposal draws no index");
+        assert_eq!(rng.unif_i, 0, "the two-state proposal draws no uniform");
+    }
+
+    /// Above two states the proposal never hands the current state back and
+    /// reaches every alternative about equally often — the bijection the
+    /// skip-past-the-current-index construction gives, and the symmetry the
+    /// acceptance rule assumes when it drops the Hastings ratio.
+    #[test]
+    fn the_general_proposal_covers_every_other_state_uniformly() {
+        const Q: usize = 4;
+        const DRAWS: usize = 4_000;
+
+        let mut rng = RandRng::seed_from_u64(2026);
+        for index in 0..Q {
+            let current = State::<Q>::new(index).unwrap();
+            let mut seen = [0usize; Q];
+            for _ in 0..DRAWS {
+                seen[propose(current, &mut rng).index()] += 1;
+            }
+
+            assert_eq!(seen[index], 0, "state {index} was proposed back to itself");
+            for (other, &count) in seen.iter().enumerate() {
+                // Three alternatives share 4000 draws, so each expects about
+                // 1333 with a standard deviation near 30; this window is wide
+                // enough to be seed-robust and narrow enough that a proposal
+                // favoring or skipping a state could not pass it.
+                if other != index {
+                    assert!(
+                        (1_150..1_520).contains(&count),
+                        "state {index} -> {other}: {count} of {DRAWS}"
+                    );
+                }
+            }
         }
     }
 
@@ -525,6 +598,41 @@ mod tests {
         let net = SiteCheckerboard.sweep(&mut config, &lat, &action, 0.6, &mut rng);
 
         assert_eq!(net, action.energy(&lat, &config) - before);
+    }
+
+    /// Both site schedules run a model with more than two states, and still
+    /// account for what they did: the net ΔE a sweep returns is the from-scratch
+    /// energy change.
+    ///
+    /// Nothing below `Q = 3` exercises the drawn proposal at all, since the
+    /// two-state path takes the deterministic flip and never touches the
+    /// generator. This is what says the drawn candidate is in range, that the
+    /// action can price a move to it, and that the telescoping identity survives
+    /// the generalization. The coupling is integer-valued and the agreement
+    /// counts are integers, so the comparison is bit-exact.
+    #[test]
+    fn the_site_schedules_run_a_three_state_model() {
+        let lat = Lattice::new([4, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+
+        for (label, updater) in [
+            ("metropolis", AnyUpdater::Metropolis(Metropolis)),
+            (
+                "site checkerboard",
+                AnyUpdater::SiteCheckerboard(SiteCheckerboard),
+            ),
+        ] {
+            let mut rng = RandRng::seed_from_u64(5);
+            let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
+            let before = action.energy(&lat, &config);
+            let net = updater.sweep(&mut config, &lat, &action, 0.6, &mut rng);
+
+            assert_eq!(net, action.energy(&lat, &config) - before, "{label}");
+            assert_ne!(
+                net, 0.0,
+                "{label}: a hot three-state field should accept something"
+            );
+        }
     }
 
     /// The two colors partition the lattice: every site is exactly one color, and

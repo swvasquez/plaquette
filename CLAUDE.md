@@ -133,16 +133,45 @@ as Markdown under `plans/` at the repo root:
 - Update the existing file as work progresses rather than starting a new one.
 - `plans/` is git-ignored and stays local — never commit it, and recreate it if
   absent (its absence in a fresh clone is not an error).
-- `plans/` is git-ignored and stays local — never commit it, and recreate it if
-  absent (its absence in a fresh clone is not an error).
 
 Only write a plan when I ask to plan first, or the task is large enough to
 warrant one.
 
 ### Formatting
 
-- Default plans and written documents to Markdown.
-- Math is LaTeX: `$...$` inline and `$$...$$` display in documents. In
-  conversation only `$$...$$` renders, and only with the delimiters on their own
-  lines — inline `$...$` and mid-sentence `$$...$$` both fail. Restructure the
-  sentence so the expression stands alone, or spell the quantity out in words.
+Default plans and written documents to Markdown.
+
+### Math in a chat response
+
+Inline `$...$` does not render in conversation. Nor does `$$...$$` placed
+mid-sentence. Either one reaches me as raw LaTeX, so treat inline math in a chat
+response as unavailable rather than as a fallback — check every `$` in a reply
+before sending it, however small the expression.
+
+Exactly two things work in a chat response:
+
+1. A display block with both delimiters alone on their own lines, nothing else
+   sharing either line.
+2. Plain words and plain Unicode: "two-thirds", "q ≤ 4", "the fourth moment over
+   three times the square of the second".
+
+Prefer the second. Reach for a display block only when the expression is
+load-bearing enough to interrupt the paragraph for, and then restructure the
+sentence so the expression can stand alone instead of forcing a symbol inline:
+
+```markdown
+The energy cumulant is what separates the two cases:
+
+$$
+V_L = 1 - \frac{\langle E^4 \rangle}{3 \langle E^2 \rangle^2}.
+$$
+
+It tends to two-thirds at a continuous transition and dips below it at a
+first-order one.
+```
+
+Written documents are the opposite case. Files under `docs/` and `plans/` render
+both forms, so use `$...$` inline and `$$...$$` for display there as normal,
+subject to the guidance in `.claude/rules/docs.md`. The rule above is about the
+chat channel alone, and the difference between the two is the thing that keeps
+getting lost.

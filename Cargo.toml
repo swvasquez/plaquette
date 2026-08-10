@@ -53,6 +53,10 @@ name = "bench"
 path = "examples/ising/bench.rs"
 
 [[example]]
+name = "potts"
+path = "examples/potts/potts.rs"
+
+[[example]]
 name = "gauge"
 path = "examples/gauge/gauge.rs"
 

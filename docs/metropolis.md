@@ -123,6 +123,19 @@ bit-for-bit needs a random source keyed by each site's coordinates rather than a
 stream advanced in visiting order. Run sequentially neither applies, so the CPU
 checkerboard is correct on any lattice.
 
+Nothing in that argument mentions how many values a site can take. What it uses
+is that the interaction is nearest-neighbor and that the lattice is bipartite, so
+that a two-coloring exists in which no site interacts with another of its own
+color; the acceptance step then leaves $P$ invariant whatever a single move does
+to one site. The schedule therefore carries from Ising to the $q$-state Potts
+model unchanged, and `SiteCheckerboard` implements it once for any $q$ rather
+than once per model. What does generalize is the *proposal*. At two states the
+alternative is determined and the move is a flip; at $q$ states there are $q-1$
+alternatives, so the proposal draws one uniformly among them. That keeps it
+symmetric — every other label is offered with probability $1/(q-1)$ from any
+label — which is the condition the acceptance rule needs to drop the proposal
+probabilities above, and it reduces to the flip at $q = 2$.
+
 ## Checkerboard on links
 
 A gauge model poses the same problem and needs a different coloring. Its variables

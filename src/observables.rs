@@ -5,16 +5,25 @@
 //! There is deliberately no `Observable` trait — the swappable seam is already
 //! the driver's injected measurement closure.
 //!
-//! A record holds only the *primaries*, and holds them signed: energy and
-//! magnetization for [`Ising`], energy and the plaquette sum for [`Z2Gauge`],
-//! which has no magnetization to hold. Absolute values, densities, and moments
-//! are ensemble reductions rather than functions of one config, so they belong
-//! to [`statistics`](crate::statistics), which recovers both `<m²>` and `<|m|>`
-//! from the signed `M` series kept here.
+//! A record holds only the *primaries*: energy and magnetization for [`Ising`],
+//! energy and the plaquette sum for [`Z2Gauge`], which has no magnetization to
+//! hold, energy and two order parameters for [`Potts`], whose two conventions
+//! are not interchangeable and neither recoverable from the other. Absolute
+//! values,
+//! densities, and moments are ensemble reductions rather than functions of one
+//! config, so they belong to [`statistics`](crate::statistics), which recovers
+//! both `<m²>` and `<|m|>` from the signed `M` series kept here.
+//!
+//! Where a quantity has a sign it is kept, which is what leaves that recovery
+//! possible. [`PottsSample`] is the exception and cannot be otherwise: its
+//! labels are unordered, so its order parameter has no sign to keep and already
+//! stands in the place `<|m|>` does.
 //!
 //! Each model gets its own record and its own composing function rather than one
-//! generic pair, because the two do not measure the same quantities and a record
-//! wide enough for both would carry a hole for whichever model is running.
+//! generic set, because the three do not measure the same quantities and a record
+//! wide enough for all of them would carry a hole for whichever model is running.
+//! [`Correlator`] is the one record shared across models, because there the shape
+//! and the reading of it genuinely are the same.
 //!
 //! A new observable goes here or on the model depending on whether it needs the
 //! model's decode from a state index to a physical value. Structural ones
@@ -24,7 +33,7 @@
 
 use crate::configuration::Configuration;
 use crate::lattice::Lattice;
-use crate::model::{Action, Ising, Z2Gauge};
+use crate::model::{Action, Ising, Potts, Z2Gauge};
 
 /// The per-config measurement record: the primary quantities of one
 /// [`Configuration`], both kept *signed*. A plain value bundle — reduction
@@ -53,17 +62,24 @@ pub fn measure<const D: usize>(
     }
 }
 
-/// The per-config two-point correlator `C_r = (1/N) Σ_i s_i · s_{i+r}`, measured
-/// along each lattice axis under periodic boundaries.
+/// The per-config two-point correlator, one row per lattice axis, measured under
+/// periodic boundaries.
 ///
 /// `per_axis[μ][r]` is `C_r` for displacement `r = 0..=L_μ/2` along axis `μ`.
+/// What one entry *means* comes from the model that filled it — `<s_i s_{i+r}>`
+/// for [`Ising`] (see [`correlator`]), the connected agreement
+/// `<delta(s_i, s_{i+r})> − 1/Q` for [`Potts`] (see [`potts_correlator`]) — and
+/// one record serves both because how it is laid out and read is identical: a
+/// row per axis, indexed by displacement, storing only the non-redundant half
+/// since `C_r = C_{L_μ − r}` by translation invariance. A second type would
+/// differ in nothing but its name.
+///
 /// This is a *separate* observable from [`Sample`] rather than a field of it: it
 /// costs `O(N · L)` and is non-`Copy`, so keeping it out means runs that don't
 /// want it don't pay for it.
 ///
-/// The raw per-config estimator only — no connected subtraction, no ensemble
-/// average, no correlation-length fit. See [`Ising::correlator`] for the stored
-/// half.
+/// The raw per-config estimator only — no ensemble average and no
+/// correlation-length fit; both are reductions over a chain of these.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Correlator<const D: usize> {
     /// One row per axis: `per_axis[μ][r]` = `C_r` along axis `μ`,
@@ -71,14 +87,90 @@ pub struct Correlator<const D: usize> {
     pub per_axis: [Vec<f64>; D],
 }
 
-/// Measure the per-config two-point [`Correlator`] of `config` on `lattice`.
+/// Measure the per-config two-point [`Correlator`] `C_r = (1/N) Σ_i s_i · s_{i+r}`
+/// of an Ising `config` on `lattice`.
 ///
 /// Composes [`Ising::correlator`] the same way [`measure`] composes energy and
 /// magnetization: the model owns the computation, this layer owns the record.
+/// The entries are raw rather than connected — the `− ⟨s⟩²` subtraction is a
+/// function of the ensemble mean and so belongs downstream.
 pub fn correlator<const D: usize>(
     model: &Ising,
     lattice: &Lattice<D>,
     config: &Configuration<2>,
+) -> Correlator<D> {
+    Correlator {
+        per_axis: model.correlator(lattice, config),
+    }
+}
+
+/// The per-config measurement record for the Potts model, the counterpart of
+/// [`Sample`].
+///
+/// It carries an order parameter where [`Sample`] carries a magnetization, and
+/// the difference is not a rename. Potts labels are unordered, so there is no
+/// signed sum to take: what the record holds is the population imbalance, which
+/// is already the analogue of `<|m|>` rather than the signed quantity both
+/// `<m²>` and `<|m|>` can be recovered from downstream.
+///
+/// Both order parameters are carried rather than one, because the literature
+/// uses both and they are not interchangeable away from the two ends. Neither is
+/// recoverable from the other, and a run compared against a published curve needs
+/// whichever that curve plotted — while the cost of having both is a second
+/// reduction over the same label counts, negligible beside the neighbor scan the
+/// energy already pays for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PottsSample {
+    /// Total energy `H` of the configuration (from [`Action::energy`]).
+    pub energy: f64,
+    /// The order parameter in its most-populated-label form,
+    /// `m = (Q · f_max − 1) / (Q − 1)`, running from `0` in the disordered phase
+    /// to `1` when every site carries one label (from
+    /// [`Potts::order_parameter`]).
+    pub order: f64,
+    /// The order parameter in its vector form,
+    /// `m = sqrt[(Q · Σ_a f_a² − 1) / (Q − 1)]` — the length of the average over
+    /// the sites of unit vectors pointing at the vertices of a `Q − 1`
+    /// dimensional simplex (from [`Potts::simplex_order_parameter`]). Runs
+    /// between the same two limits, and sits above `order` in between.
+    pub simplex_order: f64,
+}
+
+/// Measure one `config` of the Potts `model` on `lattice` into a
+/// [`PottsSample`].
+///
+/// The primaries come from the seams the model exposes, as [`measure`]'s do: `E`
+/// from the [`Action`] trait, the two order parameters from the same label
+/// counts. Both are reductions of one scan of the lattice, so this counts once
+/// and reduces twice rather than calling [`Potts::order_parameter`] and
+/// [`Potts::simplex_order_parameter`], which each count for themselves — the
+/// convenience those two offer a caller who wants only one is waste to a caller
+/// who wants both.
+pub fn potts_measure<const Q: usize, const D: usize>(
+    model: &Potts<Q>,
+    lattice: &Lattice<D>,
+    config: &Configuration<Q>,
+) -> PottsSample {
+    let counts = Potts::<Q>::label_counts(config);
+    let n_vars = config.n_vars();
+    PottsSample {
+        energy: model.energy(lattice, config),
+        order: Potts::<Q>::order_from_counts(&counts, n_vars),
+        simplex_order: Potts::<Q>::simplex_from_counts(&counts, n_vars),
+    }
+}
+
+/// Measure the per-config two-point [`Correlator`]
+/// `C_r = ⟨delta(s_i, s_{i+r})⟩ − 1/Q` of a Potts `config` on `lattice`.
+///
+/// Composes [`Potts::correlator`] exactly as [`correlator`] composes the Ising
+/// one. What differs is that these entries are already *connected*: two
+/// independent labels agree with probability `1/Q`, and the model takes that
+/// floor off, so nothing is left for a downstream subtraction to do.
+pub fn potts_correlator<const Q: usize, const D: usize>(
+    model: &Potts<Q>,
+    lattice: &Lattice<D>,
+    config: &Configuration<Q>,
 ) -> Correlator<D> {
     Correlator {
         per_axis: model.correlator(lattice, config),
@@ -216,6 +308,58 @@ mod tests {
 
         let sample = measure(&model, &lat, &config);
         assert_eq!(sample.magnetization, -8.0);
+    }
+
+    #[test]
+    fn potts_measure_bundles_energy_and_the_order_parameter() {
+        // Uniform 4x6 at three states, j = 2: every one of the lattice's
+        // `D * N = 48` bonds agrees, so E = -2 * 48, and one label holding every
+        // site puts the order parameter at its ceiling.
+        let lat = Lattice::new([4, 6]);
+        let model = Potts::<3>::symmetric(2.0);
+        let config = Configuration::<3>::cold(&lat, Cell::Site);
+
+        let sample = potts_measure(&model, &lat, &config);
+        assert_eq!(sample.energy, model.energy(&lat, &config));
+        assert_eq!(sample.order, model.order_parameter(&config));
+        assert_eq!(sample.simplex_order, model.simplex_order_parameter(&config));
+        assert_eq!(sample.energy, -96.0);
+        assert_eq!(sample.order, 1.0);
+        // A uniform field is where the two conventions coincide.
+        assert_eq!(sample.simplex_order, 1.0);
+    }
+
+    #[test]
+    fn potts_measure_carries_both_order_parameter_conventions() {
+        // Half the sites on one label and half on another: the record must show
+        // the two conventions genuinely disagreeing, or carrying both would be
+        // storing one number twice.
+        let lat = Lattice::new([4, 4]);
+        let model = Potts::<3>::symmetric(1.0);
+        let mut config = Configuration::<3>::cold(&lat, Cell::Site);
+        for site in 0..8 {
+            config.poke(site, State::new(1).unwrap());
+        }
+
+        let sample = potts_measure(&model, &lat, &config);
+        assert!((sample.order - 0.25).abs() < 1e-12);
+        assert!((sample.simplex_order - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn potts_correlator_wraps_the_model_measurement() {
+        // A uniform field agrees at every separation, so every entry is the
+        // connected form's ceiling `1 - 1/Q`, including the `r = 0` anchor.
+        let lat = Lattice::new([4, 4]);
+        let model = Potts::<3>::symmetric(1.0);
+        let config = Configuration::<3>::cold(&lat, Cell::Site);
+
+        let c = potts_correlator(&model, &lat, &config);
+        assert_eq!(c.per_axis, model.correlator(&lat, &config));
+        assert_eq!(c.per_axis[0].len(), 3); // r = 0..=L/2 on axis 0 (L = 4)
+        for row in &c.per_axis {
+            assert!(row.iter().all(|&v| (v - 2.0 / 3.0).abs() < 1e-12));
+        }
     }
 
     #[test]

@@ -7,14 +7,16 @@
 //! `sweeps_between` of them per sample, copy a whole batch back in one transfer,
 //! and hand out [`Configuration`]s until the batch drains.
 //!
-//! Both model backends —
-//! [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain) and
-//! [`GpuGaugeChain`](crate::gauge_gpu::GpuGaugeChain) — are a constructor plus a
+//! All three model backends —
+//! [`GpuIsingChain`](crate::ising_gpu::GpuIsingChain),
+//! [`GpuGaugeChain`](crate::gauge_gpu::GpuGaugeChain), and
+//! [`GpuPottsChain`](crate::potts_gpu::GpuPottsChain) — are a constructor plus a
 //! `DeviceSweeper`. They differ in what a color *is* (site parity, or direction
-//! and base-site parity), how many there are, which shader prices a flip, and
-//! which lattice grade the variables sit on; they do not differ in any of the
-//! batching. Keeping that in one place is what stops a fix to the read-back path
-//! landing in one backend and silently not the other.
+//! and base-site parity), how many there are, which shader prices a move, how
+//! many states a variable has, and which lattice grade the variables sit on;
+//! they do not differ in any of the batching. Keeping that in one place is what
+//! stops a fix to the read-back path landing in one backend and silently not the
+//! others.
 //!
 //! Neither the batching nor either kernel knows the lattice dimension. What the
 //! kernels would otherwise have to derive from it — a site's coordinate-sum
@@ -200,9 +202,9 @@ pub(crate) struct SweepSetup<'a> {
     /// WGSL source, which must expose a `sweep` entry point taking the
     /// `(sweep, color)` push constants.
     pub shader: &'a str,
-    /// Initial variables, one `u32` (0 or 1) each, in lattice index order.
+    /// Initial variables, one `u32` state index each, in lattice index order.
     pub vars_init: &'a [u32],
-    /// The read-only lookup table the shader prices a flip against — neighbors
+    /// The read-only lookup table the shader prices a move against — neighbors
     /// for a site kernel, staples for a link one.
     pub table: &'a [u32],
     /// Each site's coordinate-sum parity, one `u32` per site, from
@@ -243,11 +245,16 @@ pub(crate) struct SweepSetup<'a> {
 /// configuration needs a length and a cell kind, both of which it stores, and
 /// holding the geometry instead would pin a copy of the staple table — 75 MB on
 /// a 64³ gauge run — for the chain's whole lifetime.
-pub(crate) struct DeviceSweeper {
+///
+/// `Q` is carried only so the read-back knows what a device word means: nothing
+/// in the batching reads a variable's value, and a kernel that needs the state
+/// count puts it in its own uniform block. It is a type parameter rather than a
+/// field because [`Configuration<Q>`] is what the sweeper hands out.
+pub(crate) struct DeviceSweeper<const Q: usize> {
     gpu: Gpu,
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
-    /// The evolving configuration, one `u32` (0 or 1) per variable.
+    /// The evolving configuration, one `u32` state index per variable.
     vars: wgpu::Buffer,
     /// Read-back target: `batch` configurations, filled per run and mapped once.
     staging: wgpu::Buffer,
@@ -264,10 +271,10 @@ pub(crate) struct DeviceSweeper {
     /// Global sweep counter — the RNG key, so every sweep draws differently.
     sweeps_done: u32,
     /// Host-side buffer of the current batch; `next` drains it, refilling on empty.
-    buffer: VecDeque<Configuration<2>>,
+    buffer: VecDeque<Configuration<Q>>,
 }
 
-impl DeviceSweeper {
+impl<const Q: usize> DeviceSweeper<Q> {
     /// Upload the buffers, compile the shader, build the pipeline, and assemble
     /// a sweeper over the lot.
     ///
@@ -529,7 +536,7 @@ impl DeviceSweeper {
             for chunk in words.chunks_exact(n).take(self.batch) {
                 let variables = chunk
                     .iter()
-                    .map(|&v| State::new(v as usize).expect("a GPU variable is always 0 or 1"))
+                    .map(|&v| State::new(v as usize).expect("a kernel writes only states in 0..Q"))
                     .collect();
                 self.buffer
                     .push_back(Configuration::from_variables(self.cell, variables));
@@ -541,7 +548,7 @@ impl DeviceSweeper {
     /// Yield the next sampled configuration, running a fresh batch on the device
     /// when the host-side buffer drains. Always `Some`: the chain is open-ended,
     /// so callers bound it with `.take(n)`.
-    pub(crate) fn next_sample(&mut self) -> Option<Configuration<2>> {
+    pub(crate) fn next_sample(&mut self) -> Option<Configuration<Q>> {
         if self.buffer.is_empty() {
             self.run_batch();
         }
@@ -576,6 +583,38 @@ pub(crate) fn assert_even_extents(shape: &[usize], what: &str) {
         shape.iter().all(|l| l.is_multiple_of(2)),
         "the parallel {what} checkerboard needs even lattice extents, got {shape:?}"
     );
+}
+
+/// A configuration's variables in the form the kernels read: one `u32` state
+/// index each, in lattice index order.
+///
+/// All three backends upload their start this way, and it is one line each — but
+/// it is the line that says what a device word *is*, and `DeviceSweeper`'s
+/// read-back path reverses exactly this. Keeping the two halves of that
+/// encoding within sight of each other is the point.
+pub(crate) fn state_words<const Q: usize>(config: &Configuration<Q>) -> Vec<u32> {
+    config
+        .variables()
+        .iter()
+        .map(|s| s.index() as u32)
+        .collect()
+}
+
+/// Every site's neighbor row, flattened in site order — the table a site kernel
+/// prices a move against.
+///
+/// Shared by the two site backends rather than written out twice, because the
+/// capacity hint is tied to
+/// [`neighbor_stride`](crate::lattice::Lattice::neighbor_stride) and the flat
+/// layout is a contract with the shader's `site * N_NEIGHBORS + d` indexing. A
+/// copy of this that drifted from the stride would over- or under-allocate
+/// silently. The gauge backend has its own, built from staples instead.
+pub(crate) fn site_neighbor_table<const D: usize>(lattice: &Lattice<D>) -> Vec<u32> {
+    let mut table = Vec::with_capacity(lattice.n_sites() * Lattice::<D>::neighbor_stride());
+    for site in 0..lattice.n_sites() {
+        table.extend(lattice.site_neighbors(site).iter().map(|&nb| nb as u32));
+    }
+    table
 }
 
 /// Each site's checkerboard color, in the form the kernels read.
