@@ -1,0 +1,97 @@
+# Kit for running Claude Code against this repository in a Docker Sandboxes
+# microVM. It gives the agent a Linux toolchain matching rust-toolchain.toml and
+# a software Vulkan driver, so the full gate — fmt, clippy, test, doc — runs
+# inside the sandbox and exercises the same GPU path as CI.
+
+# The loader forks the grammar on schemaVersion: without it the file is decoded
+# as v1, whose struct has no `permissions` or `setup`, and loading fails.
+schemaVersion: "2"
+kind: mixin
+name: plaquette
+
+# Open egress, so the agent can reach crates.io and read documentation freely.
+# The LAN is closed by the --deny-network ranges `just sbx-up` passes at
+# creation, not here: a kit declares CIDR rules without applying them, so writing
+# them in this file would read as protection while doing nothing. Deny always
+# beats allow, so those ranges hold against this wildcard.
+permissions:
+  network:
+    allow:
+      - "**"
+
+environment:
+  variables:
+    # Outside the mounted repository, so a Linux build never lands in the host's
+    # ./target beside the macOS artifacts. Set as runtime variables rather than
+    # exported from a login shell, so they hold for every process the agent
+    # spawns and not only interactive ones — a cargo run that missed
+    # CARGO_TARGET_DIR would silently write into the mount.
+    CARGO_HOME: /opt/cargo
+    RUSTUP_HOME: /opt/rustup
+    CARGO_TARGET_DIR: /opt/target
+    # Mesa exposes both Vulkan (lavapipe) and GL (llvmpipe), so the backend is
+    # pinned rather than left to adapter order, matching .github/workflows/ci.yml.
+    WGPU_BACKEND: vulkan
+    # Without this, a driver that failed to load leaves the GPU tests skipping
+    # and the run looking green. See `require_gpu` in src/device.rs.
+    PLAQUETTE_REQUIRE_GPU: "1"
+    # The suite segfaults inside the software driver when the harness runs its
+    # threads in parallel, and passes serially; a larger RUST_MIN_STACK does not
+    # help, so it is the concurrency rather than stack depth. Whether the fault
+    # is in creating devices at once or tearing them down is not established.
+    # The whole suite still runs in about thirty seconds. lavapipe is a known
+    # shaky substrate for wgpu test suites — the wgpu tracker carries both hangs
+    # and exit-time segfaults on it. Not a property of the crate: CI runs the
+    # same tests in parallel on lavapipe and passes, so that path stays covered.
+    RUST_TEST_THREADS: "1"
+
+setup:
+  install:
+    # Mesa's lavapipe is a software Vulkan implementation, so the GPU backends
+    # run in a microVM with no graphics hardware. The loader is named explicitly
+    # rather than relied on as a transitive dependency of the driver package.
+    #
+    # gcc and libc6-dev are here because rustc drives linking through `cc`, so
+    # every build needs them however pure the dependency tree is — the agent
+    # image carries no C toolchain, and --no-install-recommends means gcc does
+    # not drag in libc6-dev on its own.
+    - command: >-
+        apt-get update &&
+        apt-get install -y --no-install-recommends
+        gcc libc6-dev libvulkan1 mesa-vulkan-drivers
+    # --default-toolchain none installs the proxies and no compiler; the command
+    # below then pulls the channel and components rust-toolchain.toml names. The
+    # version stays declared in one place, so the sandbox cannot drift from a
+    # local checkout or from CI. The proxies are linked into /usr/local/bin
+    # rather than added to PATH, which the runtime owns.
+    - command: |
+        set -eu
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain none
+        ln -sf /opt/cargo/bin/* /usr/local/bin/
+    # WORKSPACE_DIR is the variable the runtime exports; `:?` fails loudly rather
+    # than installing a default toolchain from the wrong directory. Installed as
+    # root while the agent runs as `agent`, so the three directories have to be
+    # handed over or cargo cannot write its registry or its build output.
+    - command: |
+        set -eu
+        cd "${WORKSPACE_DIR:?workspace directory not set}"
+        rustup toolchain install
+        mkdir -p "$CARGO_TARGET_DIR"
+        chown -R agent:agent "$CARGO_HOME" "$RUSTUP_HOME" "$CARGO_TARGET_DIR"
+  startup:
+    # The repository is bind-mounted, so a directory inside it is storage on the
+    # host and outlives the sandbox — session history and the stored login
+    # survive a rebuild. Written at startup rather than set in
+    # environment.variables because the workspace path is only known at runtime,
+    # and read back from /etc/sandbox-persistent.sh, which every login shell in
+    # the sandbox sources.
+    - command:
+        - sh
+        - -c
+        - >-
+          mkdir -p "$WORKSPACE_DIR/.sbx/claude" &&
+          chown agent:agent "$WORKSPACE_DIR/.sbx/claude" &&
+          echo "export CLAUDE_CONFIG_DIR=$WORKSPACE_DIR/.sbx/claude"
+          > /etc/sandbox-persistent.sh
+      user: "0"
