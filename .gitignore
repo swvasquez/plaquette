@@ -1,5 +1,8 @@
 /target
 
+# Local working scripts and one-off files; never committed.
+/scratch
+
 # The sandbox writes its Claude Code configuration, session history and OAuth
 # credentials into .sbx/, so the directory is ignored by default and the kit is
 # named back in. Ignoring the contents rather than the directory itself is what
