@@ -8,7 +8,7 @@
 //! warmed-up state. A bare [`Chain`] yields pre-equilibrium configurations; this
 //! has already thermalized before it gives you anything.
 //!
-//! It also owns the **backend choice**. The run's [`UpdaterKind`] picks between
+//! It also owns the **backend choice**. The run's [`BackendKind`] picks between
 //! the CPU chain and the GPU chain, and the sampler holds whichever the config
 //! asked for. [`samples`](PottsSampler::samples) returns an [`AnyPottsChain`]
 //! over it — a thin front yielding [`Configuration`]s the same way regardless of
@@ -47,23 +47,21 @@
 //! these sitting side by side, not an abstraction guessed at from two.
 
 use crate::chain::Chain;
-use crate::config::UpdaterKind;
+use crate::config::{BackendKind, UpdaterRule, effective_schedule};
 use crate::configuration::Configuration;
-use crate::device::{GPU_BATCH, Gpu, Kernel};
+use crate::device::{GPU_BATCH, Gpu, GpuChain};
 use crate::gpu_cluster::GpuClusterChain;
 use crate::lattice::Lattice;
 use crate::models::potts::Potts;
-use crate::models::potts::gpu::GpuPottsChain;
+use crate::models::potts::gpu::gpu_chain;
 use crate::models::potts::run_config::PottsRunConfig;
 use crate::rng::RandRng;
-use crate::updater::{
-    AnyUpdater, HeatBath, Metropolis, SiteCheckerboard, SiteCheckerboardHeatBath, SwendsenWang,
-};
+use crate::updater::{AnyUpdater, ClusterUpdate, LocalUpdate};
 
 /// The evolving state a [`PottsSampler`] streams from, one variant per backend.
 ///
 /// The CPU variant holds the loose pieces a transient [`Chain`] borrows each
-/// call; the GPU variant owns a persistent [`GpuPottsChain`]. This is where the
+/// call; the GPU variant owns a persistent [`GpuChain`]. This is where the
 /// two backends' opposite ownership models are reconciled behind one type.
 enum Engine<const Q: usize> {
     Cpu {
@@ -74,7 +72,7 @@ enum Engine<const Q: usize> {
     },
     /// Boxed because the device chain is far larger than the CPU variant, and an
     /// enum is sized by its largest one.
-    Gpu(Box<GpuPottsChain<Q>>),
+    Gpu(Box<GpuChain<Q>>),
     /// The device cluster chain, boxed for the same reason. A separate variant
     /// rather than a mode of `Gpu`, because the two device backends are separate
     /// types — one drives a fixed number of dispatches per sweep and the other
@@ -87,18 +85,18 @@ enum Engine<const Q: usize> {
 /// Both variants yield the same item, so a consumer bounds it with `.take(n)`
 /// and measures each config without knowing which backend produced it. The CPU
 /// variant is a transient [`Chain`] borrowing the sampler; the GPU variant a
-/// mutable borrow of the sampler's persistent [`GpuPottsChain`].
+/// mutable borrow of the sampler's persistent [`GpuChain`].
 ///
 /// Only the CPU variant carries the dimension. The device chain reads the
 /// lattice once when it is built and keeps buffers afterwards, so `D` never
-/// reaches [`GpuPottsChain`]'s type — the parameter here is the borrowed
+/// reaches [`GpuChain`]'s type — the parameter here is the borrowed
 /// [`Chain`]'s alone. `Q` reaches both, since it is part of what the yielded
 /// configuration is.
 pub enum AnyPottsChain<'a, const Q: usize, const D: usize> {
     /// A transient chain borrowing the sampler's state for the length of the run.
     Cpu(Chain<'a, Q, D, Potts<Q>, AnyUpdater, RandRng>),
     /// A mutable borrow of the sampler's persistent device chain.
-    Gpu(&'a mut GpuPottsChain<Q>),
+    Gpu(&'a mut GpuChain<Q>),
     /// A mutable borrow of the sampler's persistent device *cluster* chain.
     GpuCluster(&'a mut GpuClusterChain<Q>),
 }
@@ -120,7 +118,7 @@ impl<const Q: usize, const D: usize> Iterator for AnyPottsChain<'_, Q, D> {
 ///
 /// Generic over the state count and the dimension, both named by the driver in
 /// its own source — see the module docs. The backend is chosen from the config's
-/// [`UpdaterKind`] and held in a private per-backend `Engine`, so neither the
+/// [`BackendKind`] and held in a private per-backend `Engine`, so neither the
 /// CPU nor the GPU type leaks into the streaming interface.
 pub struct PottsSampler<const Q: usize, const D: usize> {
     lattice: Lattice<D>,
@@ -155,19 +153,13 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
         let (lattice, model, mut rng, mut state, beta) = config.build::<Q, D>();
         let sweeps_between = config.sweeps_between;
 
-        // A `match` over the device kinds rather than a chain of `if let`s: there
-        // are two of them now, and they build different types.
-        let engine = match config.updater {
-            // The two device checkerboard kinds share everything but the kernel
-            // a thread runs, so they share an arm rather than repeating the
-            // construction.
-            kind
-            @ (UpdaterKind::GpuSiteCheckerboard | UpdaterKind::GpuSiteCheckerboardHeatBath) => {
-                let kernel = match kind {
-                    UpdaterKind::GpuSiteCheckerboardHeatBath => Kernel::HeatBath,
-                    _ => Kernel::Metropolis,
-                };
-                let mut chain = GpuPottsChain::new(
+        // A `match` over `(backend, rule)`: the schedule never picks the
+        // engine — on the GPU it is pinned to the checkerboard by `validate`,
+        // and on the CPU it is a parameter of the one `LocalUpdate`.
+        let engine = match (config.backend, config.updater) {
+            (BackendKind::Gpu, rule @ (UpdaterRule::Metropolis | UpdaterRule::HeatBath)) => {
+                let kernel = rule.kernel().expect("a local rule has a kernel");
+                let mut chain = gpu_chain(
                     require_adapter(),
                     &lattice,
                     &model,
@@ -181,7 +173,7 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
                 chain.advance(config.thermalize);
                 Engine::Gpu(Box::new(chain))
             }
-            UpdaterKind::GpuSwendsenWang => {
+            (BackendKind::Gpu, UpdaterRule::SwendsenWang) => {
                 let mut chain = GpuClusterChain::new(
                     require_adapter(),
                     &lattice,
@@ -194,18 +186,13 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
                 chain.advance(config.thermalize);
                 Engine::GpuCluster(Box::new(chain))
             }
-            on_cpu => {
-                let updater = match on_cpu {
-                    UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
-                    UpdaterKind::HeatBath => AnyUpdater::HeatBath(HeatBath),
-                    UpdaterKind::SiteCheckerboard => AnyUpdater::SiteCheckerboard(SiteCheckerboard),
-                    UpdaterKind::SiteCheckerboardHeatBath => {
-                        AnyUpdater::SiteCheckerboardHeatBath(SiteCheckerboardHeatBath)
-                    }
-                    UpdaterKind::SwendsenWang => {
-                        AnyUpdater::SwendsenWang(SwendsenWang::for_model(&model))
-                    }
-                    other => unreachable!("rejected by PottsRunConfig::validate: {other:?}"),
+            (BackendKind::Cpu, rule) => {
+                let updater = match rule.kernel() {
+                    Some(kernel) => AnyUpdater::Local(LocalUpdate::new(
+                        kernel,
+                        effective_schedule(config.schedule).into(),
+                    )),
+                    None => AnyUpdater::Cluster(ClusterUpdate::swendsen_wang(&model)),
                 };
                 // Warm up a transient chain over the loose pieces, then stow them.
                 Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
@@ -295,7 +282,7 @@ fn require_adapter() -> Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Start;
+    use crate::config::{ScheduleKind, Start};
     use crate::configuration::Cell;
     use crate::models::potts::potts_measure;
     use crate::models::potts::run_config::{POTTS_D, POTTS_Q};
@@ -306,7 +293,9 @@ mod tests {
             j: 1.0,
             h: Vec::new(),
             beta: 1.5,
-            updater: UpdaterKind::Metropolis,
+            updater: UpdaterRule::Metropolis,
+            schedule: None,
+            backend: BackendKind::Cpu,
             thermalize: 50,
             sweeps_between: 2,
             n_samples: 10,
@@ -328,12 +317,12 @@ mod tests {
         assert!(configs.iter().all(|c| c.cell() == Cell::Site));
     }
 
-    /// A checkerboard-configured run streams too: the `UpdaterKind` from the
+    /// A checkerboard-configured run streams too: the schedule field from the
     /// config selects the CPU site checkerboard, driven like any other updater.
     #[test]
-    fn streams_with_the_checkerboard_updater() {
+    fn streams_with_the_checkerboard_schedule() {
         let mut run = config();
-        run.updater = UpdaterKind::SiteCheckerboard;
+        run.schedule = Some(ScheduleKind::Checkerboard);
 
         let mut sampler = PottsSampler::<POTTS_Q, POTTS_D>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
@@ -345,12 +334,13 @@ mod tests {
     /// A GPU-configured run streams through the same interface. Skips when no
     /// GPU adapter is available, so the suite stays green on a headless runner.
     #[test]
-    fn streams_with_the_gpu_checkerboard() {
+    fn streams_with_the_gpu_backend() {
         if crate::device::require_gpu().is_none() {
             return;
         }
         let mut run = config();
-        run.updater = UpdaterKind::GpuSiteCheckerboard;
+        run.schedule = Some(ScheduleKind::Checkerboard);
+        run.backend = BackendKind::Gpu;
 
         let mut sampler = PottsSampler::<POTTS_Q, POTTS_D>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
@@ -363,7 +353,7 @@ mod tests {
     #[test]
     fn streams_with_the_cluster_updater() {
         let mut run = config();
-        run.updater = UpdaterKind::SwendsenWang;
+        run.updater = UpdaterRule::SwendsenWang;
 
         let mut sampler = PottsSampler::<POTTS_Q, POTTS_D>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
@@ -383,7 +373,8 @@ mod tests {
             return;
         }
         let mut run = config();
-        run.updater = UpdaterKind::GpuSwendsenWang;
+        run.updater = UpdaterRule::SwendsenWang;
+        run.backend = BackendKind::Gpu;
         run.shape = vec![9, 7];
 
         let mut sampler = PottsSampler::<POTTS_Q, POTTS_D>::new(&run);
@@ -450,7 +441,7 @@ mod tests {
     fn matches_a_hand_driven_chain() {
         let run = config();
         let (lattice, model, mut rng, mut state, beta) = run.build::<POTTS_Q, POTTS_D>();
-        let updater = AnyUpdater::Metropolis(Metropolis);
+        let updater = AnyUpdater::Local(LocalUpdate::default());
         Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
             .advance(run.thermalize);
         let expected: Vec<_> = Chain::new(
@@ -505,9 +496,9 @@ mod tests {
     /// identical seeds put them on different streams.
     #[test]
     fn the_checkerboard_matches_the_metropolis_distribution() {
-        fn mean_order(kind: UpdaterKind) -> f64 {
+        fn mean_order(schedule: Option<ScheduleKind>) -> f64 {
             let mut run = config();
-            run.updater = kind;
+            run.schedule = schedule;
             run.beta = 1.1; // ordered, but not saturated: beta_c ~ 1.005
             run.shape = vec![16, 16];
             run.thermalize = 500;
@@ -524,8 +515,8 @@ mod tests {
                 / n as f64
         }
 
-        let metropolis = mean_order(UpdaterKind::Metropolis);
-        let checkerboard = mean_order(UpdaterKind::SiteCheckerboard);
+        let metropolis = mean_order(None);
+        let checkerboard = mean_order(Some(ScheduleKind::Checkerboard));
 
         assert!(
             (metropolis - checkerboard).abs() < 0.03,

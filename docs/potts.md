@@ -301,8 +301,9 @@ file rather than a second account of it.
 
 Which updater to reach for follows from where the run sits. Away from the
 transition a local update decorrelates in a sweep or two and there is nothing to
-escape, so `metropolis` or `site_checkerboard` is the simpler choice and the GPU
-checkerboard is the fastest of the three on a large box. Close to $\beta_c$ the
+escape, so `metropolis` — under the random or the checkerboard schedule — is
+the simpler choice, and the GPU checkerboard is the fastest of the three on a
+large box. Close to $\beta_c$ the
 comparison inverts entirely: the local correlation time grows as $L^2$ and the
 cluster one as roughly $L^{1/2}$, so by the sizes at which a critical
 measurement is worth making, the local updates are not slower but unusable. The

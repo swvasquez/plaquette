@@ -1,7 +1,7 @@
 // Shared preamble for every cluster kernel: the buffers a Swendsen-Wang sweep
 // works over, and the three stages that are pure graph work.
 //
-// Compiled after `checkerboard_prelude.wgsl`, whose `linear_index`, `lowbias32`
+// Compiled after `wgsl/rng.wgsl`, whose `linear_index`, `lowbias32`
 // and `keyed_uniform` it reuses rather than restating — every kernel in the
 // crate draws from the same hash, so a device run and a host run differ in how
 // they consume randomness and never in what the randomness is.

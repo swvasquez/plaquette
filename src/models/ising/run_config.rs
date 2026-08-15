@@ -6,7 +6,7 @@
 //! pieces — lattice, model, seeded generator, start configuration, `beta` — so
 //! that serde and I/O stay confined to this module and the physics core never
 //! learns a file was involved. The vocabulary it is written in —
-//! [`Start`], [`UpdaterKind`], [`ConfigError`] — comes from
+//! [`Start`], [`UpdaterRule`], [`ConfigError`] — comes from
 //! [`config`](crate::config) and is shared with the gauge schema; the schema
 //! itself is this module's alone.
 //!
@@ -23,7 +23,8 @@
 //! disagrees.
 
 use crate::config::{
-    ConfigError, Start, UpdaterKind, check_dimension, check_shape, check_updater, shape_array,
+    BackendKind, ConfigError, ScheduleKind, Start, UpdaterRule, check_dimension, check_shape,
+    check_updater, shape_array,
 };
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
@@ -67,12 +68,21 @@ pub struct IsingRunConfig {
     pub beta: f64,
 
     // --- driver controls ---
-    /// Which update algorithm advances the chain; defaults to
-    /// [`UpdaterKind::Metropolis`]. A run parameter rather than a caller's
+    /// Which update rule advances the chain; defaults to
+    /// [`UpdaterRule::Metropolis`]. A run parameter rather than a caller's
     /// choice, because two runs of the same physics under different algorithms
     /// are different runs.
     #[serde(default = "default_updater")]
-    pub updater: UpdaterKind,
+    pub updater: UpdaterRule,
+    /// Which schedule a local rule runs under; omitted means the random
+    /// schedule. Must stay unset for [`UpdaterRule::SwendsenWang`], which has
+    /// no schedule at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleKind>,
+    /// Where the run executes; defaults to the CPU. A local rule on the GPU
+    /// needs `schedule = "checkerboard"` and even extents.
+    #[serde(default)]
+    pub backend: BackendKind,
     /// Warmup sweeps run and discarded before any sample.
     pub thermalize: usize,
     /// Decorrelation sweeps between recorded samples.
@@ -102,8 +112,8 @@ fn default_start() -> Start {
     Start::Cold
 }
 
-fn default_updater() -> UpdaterKind {
-    UpdaterKind::Metropolis
+fn default_updater() -> UpdaterRule {
+    UpdaterRule::Metropolis
 }
 
 impl IsingRunConfig {
@@ -148,10 +158,9 @@ impl IsingRunConfig {
     /// `sweeps_between` may be zero — no warmup and no decorrelation gap are
     /// unusual but legitimate.
     ///
-    /// The updater rules are `check_updater`'s, applied against
-    /// [`Cell::Site`]: this model's variables live on sites, so it takes the
-    /// grade-neutral Metropolis or a site schedule and refuses a link one, and a
-    /// schedule that colors in parallel additionally needs even extents.
+    /// The updater rules are `check_updater`'s: a cluster rule takes no
+    /// schedule, and a local rule on the GPU needs the checkerboard schedule
+    /// and even extents.
     ///
     /// One rule on top of those is this schema's own: a cluster schedule needs
     /// the spin-flip symmetry a field breaks, so a non-zero `h` is refused.
@@ -176,11 +185,11 @@ impl IsingRunConfig {
                 self.h
             )));
         }
-        check_updater(self.updater, Cell::Site, &self.shape)?;
+        check_updater(self.updater, self.schedule, self.backend, &self.shape)?;
         // A cluster move relabels a whole cluster at once, which is only
         // weight-preserving when the two spin values are interchangeable — and a
         // field is exactly what tells them apart. The graceful counterpart of
-        // `SwendsenWang::for_model`'s panic.
+        // `ClusterUpdate::new`'s panic.
         if self.updater.builds_clusters() && self.h != 0.0 {
             return Err(ConfigError::Invalid(format!(
                 "{:?} relabels whole clusters at once, which needs the spin-flip \
@@ -260,7 +269,9 @@ mod tests {
             j: 1.0,
             h: 0.0,
             beta: 0.44,
-            updater: UpdaterKind::Metropolis,
+            updater: UpdaterRule::Metropolis,
+            schedule: None,
+            backend: BackendKind::Cpu,
             thermalize: 1000,
             sweeps_between: 10,
             n_samples: 500,
@@ -313,80 +324,65 @@ mod tests {
         assert_eq!(config.n_samples, 1000);
         assert_eq!(config.seed, 12345);
         assert_eq!(config.start, Start::Hot);
-        assert_eq!(config.updater, UpdaterKind::Metropolis);
+        assert_eq!(config.updater, UpdaterRule::Metropolis);
         assert_eq!(config.description.as_deref(), Some("near T_c"));
     }
 
     #[test]
-    fn parses_and_round_trips_the_checkerboard_updater() {
+    fn parses_and_round_trips_the_checkerboard_schedule() {
         let mut config = sample_config();
-        config.updater = UpdaterKind::SiteCheckerboard;
+        config.schedule = Some(ScheduleKind::Checkerboard);
 
         // Serializes with the lowercase variant name, and survives the round-trip.
         let text = config.to_toml().unwrap();
-        assert!(text.contains(r#"updater = "site_checkerboard""#));
-        assert_eq!(
-            IsingRunConfig::parse(&text).unwrap().updater,
-            UpdaterKind::SiteCheckerboard
-        );
+        assert!(text.contains(r#"schedule = "checkerboard""#));
+        assert_eq!(IsingRunConfig::parse(&text).unwrap(), config);
     }
 
-    /// Both heat bath kinds a site model can name survive the round trip.
-    ///
-    /// The names are what a config file is written against, so they are checked
-    /// literally rather than by `Debug`. The CPU kind is grade-neutral like
-    /// `metropolis` and the GPU kind colors sites like `gpu_site_checkerboard`,
-    /// which is what `validate` reads them as.
+    /// The heat bath rule survives the round trip under every schedule and
+    /// backend pairing a run can name. The name is what a config file is
+    /// written against, so it is checked literally rather than by `Debug`.
     #[test]
-    fn parses_and_round_trips_the_heat_bath_updaters() {
-        for (kind, name) in [
-            (UpdaterKind::HeatBath, r#"updater = "heat_bath""#),
-            (
-                UpdaterKind::SiteCheckerboardHeatBath,
-                r#"updater = "site_checkerboard_heat_bath""#,
-            ),
-            (
-                UpdaterKind::GpuSiteCheckerboardHeatBath,
-                r#"updater = "gpu_site_checkerboard_heat_bath""#,
-            ),
+    fn parses_and_round_trips_the_heat_bath_rule() {
+        for (schedule, backend) in [
+            (None, BackendKind::Cpu),
+            (Some(ScheduleKind::Checkerboard), BackendKind::Cpu),
+            (Some(ScheduleKind::Checkerboard), BackendKind::Gpu),
         ] {
             let mut config = sample_config();
-            config.updater = kind;
+            config.updater = UpdaterRule::HeatBath;
+            config.schedule = schedule;
+            config.backend = backend;
 
             let text = config.to_toml().unwrap();
-            assert!(text.contains(name), "{kind:?} should serialize as {name}");
-            assert_eq!(IsingRunConfig::parse(&text).unwrap().updater, kind);
-            assert!(
-                IsingRunConfig::parse(&text).unwrap().validate().is_ok(),
-                "{kind:?} should be accepted on a site model"
-            );
+            assert!(text.contains(r#"updater = "heat_bath""#));
+            let parsed = IsingRunConfig::parse(&text).unwrap();
+            assert_eq!(parsed, config);
+            assert!(parsed.validate().is_ok(), "{schedule:?} on {backend:?}");
         }
     }
 
     #[test]
-    fn parses_and_round_trips_the_gpu_checkerboard_updater() {
+    fn parses_and_round_trips_the_gpu_backend() {
         let mut config = sample_config();
-        config.updater = UpdaterKind::GpuSiteCheckerboard;
+        config.schedule = Some(ScheduleKind::Checkerboard);
+        config.backend = BackendKind::Gpu;
 
-        // Two words -> snake_case; survives the round-trip.
         let text = config.to_toml().unwrap();
-        assert!(text.contains(r#"updater = "gpu_site_checkerboard""#));
-        assert_eq!(
-            IsingRunConfig::parse(&text).unwrap().updater,
-            UpdaterKind::GpuSiteCheckerboard
-        );
+        assert!(text.contains(r#"backend = "gpu""#));
+        assert_eq!(IsingRunConfig::parse(&text).unwrap(), config);
     }
 
     #[test]
     fn parses_and_round_trips_the_cluster_updater() {
         let mut config = sample_config();
-        config.updater = UpdaterKind::SwendsenWang;
+        config.updater = UpdaterRule::SwendsenWang;
 
         let text = config.to_toml().unwrap();
         assert!(text.contains(r#"updater = "swendsen_wang""#));
         assert_eq!(
             IsingRunConfig::parse(&text).unwrap().updater,
-            UpdaterKind::SwendsenWang
+            UpdaterRule::SwendsenWang
         );
     }
 
@@ -394,46 +390,47 @@ mod tests {
     fn validate_rejects_a_cluster_updater_with_a_field() {
         // A field tells the two spin values apart, which is exactly the symmetry
         // flipping a whole cluster at once relies on. The load-time counterpart
-        // of `SwendsenWang::for_model`'s panic.
-        for kind in [UpdaterKind::SwendsenWang, UpdaterKind::GpuSwendsenWang] {
+        // of `ClusterUpdate::new`'s panic.
+        for backend in [BackendKind::Cpu, BackendKind::Gpu] {
             let mut config = sample_config();
-            config.updater = kind;
+            config.updater = UpdaterRule::SwendsenWang;
+            config.backend = backend;
             config.h = 0.25;
             let message = invalid_message(&config);
             assert!(
                 message.contains("spin-flip symmetry"),
-                "{kind:?}: {message}"
+                "{backend:?}: {message}"
             );
 
             config.h = 0.0;
-            assert!(config.validate().is_ok(), "{kind:?}: field-free is fine");
+            assert!(config.validate().is_ok(), "{backend:?}: field-free is fine");
         }
     }
 
     #[test]
     fn parses_and_round_trips_the_gpu_cluster_updater() {
-        // The device cluster chain names no model, so this schema accepts the
-        // kind rather than refusing it for want of a backend.
+        // The cluster rule composes with the gpu backend like any other —
+        // the device cluster chain names no model.
         let mut config = sample_config();
-        config.updater = UpdaterKind::GpuSwendsenWang;
+        config.updater = UpdaterRule::SwendsenWang;
+        config.backend = BackendKind::Gpu;
 
         let text = config.to_toml().unwrap();
-        assert!(text.contains(r#"updater = "gpu_swendsen_wang""#));
-        assert_eq!(
-            IsingRunConfig::parse(&text).unwrap().updater,
-            UpdaterKind::GpuSwendsenWang
-        );
+        assert!(text.contains(r#"updater = "swendsen_wang""#));
+        assert!(text.contains(r#"backend = "gpu""#));
+        assert_eq!(IsingRunConfig::parse(&text).unwrap(), config);
     }
 
     #[test]
     fn validate_accepts_an_odd_extent_for_a_cluster_kind() {
         // A cluster update has no coloring for the periodic wrap to spoil, so
         // unlike the GPU checkerboard it runs on any shape.
-        for kind in [UpdaterKind::SwendsenWang, UpdaterKind::GpuSwendsenWang] {
+        for backend in [BackendKind::Cpu, BackendKind::Gpu] {
             let mut config = sample_config();
-            config.updater = kind;
+            config.updater = UpdaterRule::SwendsenWang;
+            config.backend = backend;
             config.shape = vec![9, 7];
-            assert!(config.validate().is_ok(), "{kind:?} on an odd lattice");
+            assert!(config.validate().is_ok(), "{backend:?} on an odd lattice");
         }
     }
 
@@ -482,21 +479,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_the_link_updaters() {
-        // The mirror of the gauge schema's rule: both link schedules color
-        // links, so neither says anything about a field living on sites.
-        for kind in [
-            UpdaterKind::LinkCheckerboard,
-            UpdaterKind::GpuLinkCheckerboard,
-            UpdaterKind::GpuLinkCheckerboardHeatBath,
-        ] {
-            let mut config = sample_config();
-            config.updater = kind;
-            let message = invalid_message(&config);
-            assert!(message.contains("updates Site variables"), "{message}");
-            assert!(message.contains("colors Link variables"), "{message}");
-            assert!(message.contains(&format!("{kind:?}")), "{message}");
-        }
+    fn validate_rejects_a_random_schedule_on_the_gpu() {
+        // The device runs a local sweep as parallel color passes, and a random
+        // schedule has no colors — the combination is unrunnable, not slow.
+        let mut config = sample_config();
+        config.backend = BackendKind::Gpu;
+        let message = invalid_message(&config);
+        assert!(message.contains("checkerboard"), "{message}");
+
+        config.schedule = Some(ScheduleKind::Random);
+        let message = invalid_message(&config);
+        assert!(message.contains("checkerboard"), "{message}");
+    }
+
+    #[test]
+    fn validate_rejects_a_schedule_on_the_cluster_rule() {
+        // The cluster update is not a kernel under a schedule, so naming one
+        // alongside it is a contradiction rather than a preference.
+        let mut config = sample_config();
+        config.updater = UpdaterRule::SwendsenWang;
+        config.schedule = Some(ScheduleKind::Checkerboard);
+        let message = invalid_message(&config);
+        assert!(message.contains("takes no schedule"), "{message}");
     }
 
     #[test]
@@ -506,13 +510,14 @@ mod tests {
         // is built — the CPU schedules are unaffected, since a sequential sweep
         // has no such requirement.
         let mut config = sample_config();
-        config.updater = UpdaterKind::GpuSiteCheckerboard;
+        config.schedule = Some(ScheduleKind::Checkerboard);
+        config.backend = BackendKind::Gpu;
         config.shape = vec![16, 15];
         let message = invalid_message(&config);
         assert!(message.contains("even extents"), "{message}");
         assert!(message.contains("axis 1"), "{message}");
 
-        config.updater = UpdaterKind::SiteCheckerboard;
+        config.backend = BackendKind::Cpu;
         assert!(
             config.validate().is_ok(),
             "an odd extent is fine on the CPU"
@@ -703,7 +708,7 @@ mod tests {
         "#;
         let config = IsingRunConfig::parse(text).unwrap();
         assert_eq!(config.start, Start::Cold);
-        assert_eq!(config.updater, UpdaterKind::Metropolis);
+        assert_eq!(config.updater, UpdaterRule::Metropolis);
         assert_eq!(config.description, None);
     }
 }

@@ -1,119 +1,63 @@
-//! GPU Potts backend: a [`GpuPottsChain`] that runs the site checkerboard sweep
-//! on the GPU via `wgpu`, exposed through the same
-//! `Iterator<Item = Configuration>` interface as the CPU
-//! [`Chain`](crate::chain::Chain).
+//! GPU Potts backend: the model's side of the device seam, as a constructor
+//! for the shared [`GpuChain`].
 //!
-//! The Potts sibling of [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain), and
-//! close enough to it that the two share their whole schedule: the same
-//! two-color site checkerboard over the same neighbor table, launched one thread
-//! per site. What they do not share is what a thread computes, because the
-//! labels are unordered — the energy term is a count of matching neighbors
-//! rather than a sum of signed products, and the proposal has to *draw* among
-//! the `Q - 1` other labels where the Ising kernel simply flips. That is two
-//! bodies with nothing in common but their loop bounds, which is why this is a
-//! separate shader rather than a branch inside the Ising `checkerboard.wgsl`.
+//! Everything about running a sweep on the device lives in
+//! [`device`](crate::device) and is shared by every model; what this module
+//! owns is the part that is about the Potts model — the `Params` layout with
+//! its per-label offsets, the neighbor table, and the `model.wgsl` snippet
+//! whose `energy_delta` is the WGSL half of
+//! [`Action::energy_delta`](crate::action::Action::energy_delta).
 //!
-//! Everything about batching samples and reading them back lives in
-//! `DeviceSweeper`, shared with the other two backends; what this module owns is
-//! the `Params` layout, the neighbor table, and the two things the shader needs
-//! that no other kernel does — the state count, and the per-label energy offsets
-//! packed into the uniform block. It is also the only backend whose shader
-//! source is a template rather than a constant: WGSL needs a uniform array's
-//! length written literally in the source, and the length here is the state
-//! count, which the source has no way to see. Substituting that one number is
-//! what lets the device path take any `Q` rather than a capped one.
+//! This is the one backend whose snippet is a *template* rather than a
+//! constant: WGSL needs a uniform array's length written literally in the
+//! source, and the length of the offsets array is set by the state count,
+//! which the source has no way to see. Substituting that one token
+//! (`$H_VECTORS$`) is what lets the device path take any `Q` rather than a
+//! capped one; the kernels' own `$Q$` token is filled by the shared assembly
+//! for every model alike.
 //!
-//! There are two shader templates rather than one, `checkerboard.wgsl` and
-//! `heatbath.wgsl`, picked by the [`Kernel`] the caller names. They share the
-//! coloring, the neighbor table and every dispatch. This is the model where they
-//! share least beyond that: the Metropolis kernel picks a candidate first and
-//! then needs one signed counter, while the heat bath commits to no candidate
-//! and needs how many neighbors carry each label. That is why the heat bath
-//! template carries a second token — the tallies are arrays, and a WGSL array
-//! length must be written literally in the source, exactly as the offsets are.
-//!
-//! The coloring is compiled into the shader, so this
-//! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
-//! counter-based, keyed on `(seed, site, sweep)`, so the result is independent of
-//! GPU thread order — the property that lets the CPU site checkerboard serve as a
-//! reference.
+//! Randomness is counter-based, keyed on `(seed, site, sweep)`, so the result
+//! is independent of GPU thread order — the property that lets the CPU
+//! checkerboard [`LocalUpdate`](crate::updater::LocalUpdate) serve as the
+//! sequential reference.
 
 use crate::configuration::{Cell, Configuration};
-use crate::device::{
-    DeviceSweeper, Gpu, Kernel, SweepSetup, assert_even_extents, fold_seed, site_colors,
-    site_neighbor_table, state_words,
-};
+use crate::device::{Gpu, GpuChain, GpuModelSetup, Kernel, fold_seed, site_neighbor_table};
 use crate::lattice::Lattice;
 use crate::models::potts::{self as model, Potts};
 
-/// Color passes per sweep: the two coordinate-sum parities, as for Ising. A
-/// site's color does not depend on the dimension — a step along any axis flips
-/// the parity — nor on how many states it can take, so this is a constant.
-const N_COLORS: u32 = 2;
-
-/// The kernel *template*: the shared preamble followed by the site checkerboard,
-/// still carrying the one token the host has to fill in.
-const SHADER_TEMPLATE: &str = crate::device::shader_source!("checkerboard.wgsl");
-
-/// The heat bath kernel template, over the same preamble and the same coloring.
-/// It carries a second token, `$Q$`, because its per-label tallies are arrays
-/// and a WGSL array length must be a const-expression.
-const HEAT_BATH_TEMPLATE: &str = crate::device::shader_source!("heatbath.wgsl");
-
-/// The token standing for the state count itself, used by the heat bath kernel
-/// alone. `params.q` already carries the same number as a runtime uniform, which
-/// is all the Metropolis kernel needs of it; an array length is not something a
-/// uniform can be.
-const Q_TOKEN: &str = "$Q$";
-
-/// The token in that template standing for the number of `vec4` slots the
+/// The token in the snippet standing for the number of `vec4` slots the
 /// per-label offsets occupy.
 ///
 /// This is the only piece of shader source in the crate that is substituted
-/// rather than compiled as written, and it is worth saying why the usual route
-/// does not work. The lattice dimension reaches its kernels as a WGSL
-/// `override`, resolved when the pipeline is built, which keeps every shader
-/// source a compile-time constant. An `override` can size a loop bound but not
-/// an array in the uniform address space — that length has to be a literal in
-/// the source — and the offsets are exactly such an array. Substituting one
-/// number is the smallest way out, and it is what lets the device path take any
-/// state count rather than a capped one.
+/// with a model-specific value rather than compiled as written, and it is
+/// worth saying why the usual route does not work. The lattice dimension
+/// reaches its kernels as a WGSL `override`, resolved when the pipeline is
+/// built, which keeps every shader source a compile-time constant. An
+/// `override` can size a loop bound but not an array in the uniform address
+/// space — that length has to be a literal in the source — and the offsets
+/// are exactly such an array.
 const H_VECTORS_TOKEN: &str = "$H_VECTORS$";
 
 /// Labels per `vec4` slot in the uniform block.
 const LABELS_PER_VECTOR: usize = 4;
 
-/// The kernel for `q` labels: the template with its one token filled in.
-fn shader_for(template: &str, q: usize) -> String {
-    template
-        .replace(H_VECTORS_TOKEN, &q.div_ceil(LABELS_PER_VECTOR).to_string())
-        .replace(Q_TOKEN, &q.to_string())
+/// The snippet for `q` labels: the template with its one token filled in.
+fn shader_for(q: usize) -> String {
+    include_str!("model.wgsl").replace(H_VECTORS_TOKEN, &q.div_ceil(LABELS_PER_VECTOR).to_string())
 }
 
-/// The static run parameters uploaded to the shader's uniform buffer.
+/// The fixed head of the uniform block; the per-label offsets follow it as
+/// bytes, because their length depends on `Q` and so is not a fixed-size
+/// struct field at all.
 ///
 /// `#[repr(C)]` with explicit padding to a 16-byte multiple, matching the WGSL
-/// `Params` struct's uniform layout. It carries no geometry: the kernel reads a
-/// site's color from a table and takes the dimension as an override, so nothing
-/// about the shape has to be described here.
-///
-/// `q` is one of two fields with no Ising counterpart, and it rides here rather
-/// than arriving as an override because it bounds nothing the compiler needs:
-/// `D` fixes the neighbor row width and so has to be a constant, while `q` only
-/// scales a draw.
-///
-/// This covers the fixed head of the block only. The per-label offsets follow it
-/// and are appended as bytes, because their length depends on `Q` and so is not
-/// a fixed-size struct field at all —
-/// [`SweepSetup::params`](crate::device::SweepSetup) takes a byte slice and each
-/// backend supplies its own, so there is no shared layout this has to fit. The
-/// head is thirty-two bytes, which leaves the offsets starting on the sixteen-byte
-/// boundary WGSL wants for a `vec4` array.
-///
-/// They are packed four to a `vec4` rather than declared `array<f32, Q>` because
-/// in the uniform address space every array element is padded to sixteen bytes,
-/// which would waste three words in four. The kernel unpacks with
-/// `h[label / 4][label % 4]`.
+/// `Params` struct in `model.wgsl`. The head is thirty-two bytes, which leaves
+/// the offsets starting on the sixteen-byte boundary WGSL wants for a `vec4`
+/// array. They are packed four to a `vec4` rather than declared
+/// `array<f32, Q>` because in the uniform address space every array element is
+/// padded to sixteen bytes, which would waste three words in four; the snippet
+/// unpacks with `h[label / 4][label % 4]`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
@@ -127,153 +71,80 @@ struct Params {
     _pad2: u32,
 }
 
-/// The Potts Markov chain run on the GPU, yielding sampled [`Configuration`]s on
-/// sites.
+/// Build a Potts Markov chain on `gpu` over a copy of `start` — a
+/// [`GpuChain`] on sites, at any `Q`.
 ///
-/// A sibling of [`Chain`](crate::chain::Chain): same iterator interface, device
-/// machinery underneath. Owns everything it needs, so it borrows nothing and can
-/// be moved and driven freely.
+/// `model` supplies the coupling and the per-label offsets — taken whole
+/// rather than as loose numbers, since the offsets are `Q` of them and the CPU
+/// path is handed the same value — and `beta` is the inverse temperature;
+/// `seed` keys the counter-based RNG; `sweeps_between` is the decorrelation
+/// stride, `batch` how many samples per device round-trip, and `kernel` which
+/// single-variable rule a thread runs. Runs no sweeps — warmup is the
+/// caller's job via [`GpuChain::advance`].
 ///
-/// The type carries `Q` but not the dimension. `Q` is part of what a yielded
-/// [`Configuration<Q>`] *is*, so it cannot be anything but a type parameter;
-/// `D` is read once in [`new`](GpuPottsChain::new) to build the neighbor table
-/// and never needed again, so it is a parameter of the constructor alone — the
-/// same split [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain) makes.
-pub struct GpuPottsChain<const Q: usize> {
-    sweeper: DeviceSweeper<Q>,
-}
+/// # Panics
+///
+/// Panics if `batch` is zero, if `Q` is below
+/// [`Potts::MIN_STATES`](crate::models::potts::Potts::MIN_STATES), if `start`
+/// is not a site field of this lattice, or if any extent is odd (see
+/// [`GpuChain`]). There is no upper bound on `Q`: the snippet is generated for
+/// the state count it is given.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_chain<const Q: usize, const D: usize>(
+    gpu: Gpu,
+    lattice: &Lattice<D>,
+    model: &Potts<Q>,
+    beta: f64,
+    seed: u64,
+    start: &Configuration<Q>,
+    sweeps_between: usize,
+    batch: usize,
+    kernel: Kernel,
+) -> GpuChain<Q> {
+    // At one state the kernel would draw among zero alternatives, which is
+    // not a small model but no model at all. The host says so here, since the
+    // shader's `q - 1` would simply wrap.
+    assert!(Q >= model::POTTS_MIN_STATES, "{}", model::TOO_FEW_STATES);
 
-impl<const Q: usize> GpuPottsChain<Q> {
-    /// Build a chain on `gpu` over a copy of `start`, uploaded to the device.
-    ///
-    /// `start` is read only to upload it, so the host copy is untouched and the
-    /// same configuration can seed a CPU run too. `model` supplies the coupling
-    /// and the per-label offsets — taken whole rather than as loose numbers,
-    /// since the offsets are `Q` of them and the CPU path is handed the same
-    /// value — and `beta` is the inverse temperature; `seed` keys the
-    /// counter-based RNG. `sweeps_between` is the decorrelation stride, and
-    /// `batch` is how many samples are produced per device round-trip. `kernel`
-    /// picks which single-variable rule a thread runs; both sample the same
-    /// distribution over the same coloring.
-    ///
-    /// Runs no sweeps — like [`Chain::new`](crate::chain::Chain::new), warmup is
-    /// the caller's job via [`advance`](GpuPottsChain::advance).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `batch` is zero, if `Q` is below
-    /// [`Potts::MIN_STATES`](crate::models::potts::Potts::MIN_STATES), if `start` is not
-    /// a site field of this lattice, or if any extent is odd. There is no upper
-    /// bound on `Q`: the kernel is generated for the state count it is given.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new<const D: usize>(
-        gpu: Gpu,
-        lattice: &Lattice<D>,
-        model: &Potts<Q>,
-        beta: f64,
-        seed: u64,
-        start: &Configuration<Q>,
-        sweeps_between: usize,
-        batch: usize,
-        kernel: Kernel,
-    ) -> Self {
-        assert!(batch > 0, "batch size must be positive");
-        // At one state the kernel would draw among zero alternatives, which is
-        // not a small model but no model at all. The host says so here, since
-        // the shader's `q - 1` would simply wrap.
-        assert!(Q >= model::POTTS_MIN_STATES, "{}", model::TOO_FEW_STATES);
-        // The shader indexes the neighbor table by site, so a link field would
-        // be silently misread rather than rejected; the cell kind is what makes
-        // that checkable at all.
-        assert_eq!(
-            start.cell(),
-            Cell::Site,
-            "the GPU site checkerboard updates sites, so the start must be a site field"
-        );
-        assert_eq!(
-            start.n_vars(),
-            lattice.n_sites(),
-            "start configuration and lattice disagree on site count"
-        );
-        let shape = lattice.shape();
-        assert_even_extents(&shape, "site");
-
-        let n_sites = lattice.n_sites();
-
-        let labels = state_words(start);
-        let neighbors = site_neighbor_table(lattice);
-        let site_color = site_colors(lattice);
-        let head = Params {
-            n_sites: n_sites as u32,
-            seed: fold_seed(seed),
-            beta: beta as f32,
-            j: model.coupling() as f32,
-            q: Q as u32,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
-        };
-        // The offsets follow the head, rounded up to a whole number of `vec4`
-        // slots so the array the shader declares is exactly filled. The padding
-        // past `Q` is never read — the kernel only ever indexes a label that
-        // exists — and is only there because a slot is four wide.
-        let mut offsets = vec![0.0f32; Q.next_multiple_of(LABELS_PER_VECTOR)];
-        for (slot, &offset) in offsets.iter_mut().zip(model.offsets().iter()) {
-            *slot = offset as f32;
-        }
-        let head_bytes = bytemuck::bytes_of(&head);
-        let offset_bytes: &[u8] = bytemuck::cast_slice(&offsets);
-        let mut params = Vec::with_capacity(head_bytes.len() + offset_bytes.len());
-        params.extend_from_slice(head_bytes);
-        params.extend_from_slice(offset_bytes);
-
-        GpuPottsChain {
-            sweeper: DeviceSweeper::build(
-                gpu,
-                SweepSetup {
-                    label: match kernel {
-                        Kernel::Metropolis => "potts checkerboard",
-                        Kernel::HeatBath => "potts heat bath",
-                    },
-                    shader: &match kernel {
-                        Kernel::Metropolis => shader_for(SHADER_TEMPLATE, Q),
-                        Kernel::HeatBath => shader_for(HEAT_BATH_TEMPLATE, Q),
-                    },
-                    vars_init: &labels,
-                    table: &neighbors,
-                    site_color: &site_color,
-                    params: &params,
-                    dimension: D as u32,
-                    cell: Cell::Site,
-                    n_vars: n_sites,
-                    // One thread per site, which on a site field is also one per
-                    // variable.
-                    threads: n_sites,
-                    colors: N_COLORS,
-                    sweeps_between,
-                    batch,
-                },
-            ),
-        }
+    let head = Params {
+        n_sites: lattice.n_sites() as u32,
+        seed: fold_seed(seed),
+        beta: beta as f32,
+        j: model.coupling() as f32,
+        q: Q as u32,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    // The offsets follow the head, rounded up to a whole number of `vec4`
+    // slots so the array the shader declares is exactly filled. The padding
+    // past `Q` is never read — the kernel only ever indexes a label that
+    // exists — and is only there because a slot is four wide.
+    let mut offsets = vec![0.0f32; Q.next_multiple_of(LABELS_PER_VECTOR)];
+    for (slot, &offset) in offsets.iter_mut().zip(model.offsets().iter()) {
+        *slot = offset as f32;
     }
+    let head_bytes = bytemuck::bytes_of(&head);
+    let offset_bytes: &[u8] = bytemuck::cast_slice(&offsets);
+    let mut params = Vec::with_capacity(head_bytes.len() + offset_bytes.len());
+    params.extend_from_slice(head_bytes);
+    params.extend_from_slice(offset_bytes);
 
-    /// Advance the chain by `sweeps` sweeps on the device, producing no snapshot —
-    /// the GPU counterpart of [`Chain::advance`](crate::chain::Chain::advance),
-    /// used to discard warmup.
-    pub fn advance(&mut self, sweeps: usize) {
-        self.sweeper.advance(sweeps);
-    }
-}
-
-impl<const Q: usize> Iterator for GpuPottsChain<Q> {
-    type Item = Configuration<Q>;
-
-    /// Yield the next sampled configuration, running a fresh batch on the device
-    /// when the host-side buffer drains. Always `Some`: the chain is open-ended,
-    /// so callers bound it with `.take(n)`.
-    fn next(&mut self) -> Option<Self::Item> {
-        self.sweeper.next_sample()
-    }
+    GpuChain::build(
+        gpu,
+        lattice,
+        GpuModelSetup {
+            label: "potts",
+            source: shader_for(Q),
+            table: site_neighbor_table(lattice),
+            params,
+            cell: Cell::Site,
+        },
+        kernel,
+        start,
+        sweeps_between,
+        batch,
+    )
 }
 
 #[cfg(test)]
@@ -301,7 +172,7 @@ mod tests {
             "the start should carry a label an Ising field could not"
         );
 
-        let mut chain = GpuPottsChain::new(
+        let mut chain = gpu_chain(
             gpu,
             &lat,
             &Potts::symmetric(1.0),
@@ -339,7 +210,7 @@ mod tests {
 
         // beta = 0 accepts every proposal, so a sweep writes a fresh draw at
         // every site rather than mostly rejecting back to the current label.
-        let mut chain = GpuPottsChain::new(
+        let mut chain = gpu_chain(
             gpu,
             &lat,
             &Potts::symmetric(1.0),
@@ -376,8 +247,7 @@ mod tests {
         let model = Potts::<3>::symmetric(1.0);
         let start = Configuration::<3>::cold(&lat, Cell::Site);
 
-        let mut chain =
-            GpuPottsChain::new(gpu, &lat, &model, 4.0, 99, &start, 5, 4, Kernel::Metropolis);
+        let mut chain = gpu_chain(gpu, &lat, &model, 4.0, 99, &start, 5, 4, Kernel::Metropolis);
         chain.advance(20);
         let mean = chain
             .take(8)
@@ -423,13 +293,13 @@ mod tests {
             (e, m)
         };
 
-        // CPU reference: Chain driven by the SiteCheckerboard updater.
+        // CPU reference: Chain driven by the checkerboard LocalUpdate.
         let (e_cpu, m_cpu) = {
             use crate::chain::Chain;
-            use crate::updater::SiteCheckerboard;
+            use crate::updater::{LocalUpdate, Schedule};
             let mut rng = RandRng::seed_from_u64(11);
             let mut cfg = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
-            let updater = SiteCheckerboard;
+            let updater = LocalUpdate::new(Kernel::Metropolis, Schedule::Checkerboard);
             let mut chain = Chain::new(
                 &mut cfg,
                 &lat,
@@ -443,11 +313,11 @@ mod tests {
             means(chain.take(n).collect())
         };
 
-        // GPU: GpuPottsChain over the same model and geometry.
+        // GPU: the shared chain over the same model and geometry.
         let (e_gpu, m_gpu) = {
             let mut rng = RandRng::seed_from_u64(22);
             let start = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
-            let mut chain = GpuPottsChain::new(
+            let mut chain = gpu_chain(
                 gpu,
                 &lat,
                 &model,
@@ -484,7 +354,7 @@ mod tests {
         );
     }
 
-    /// The generated kernel takes a state count needing more than one `vec4` of
+    /// The generated snippet takes a state count needing more than one `vec4` of
     /// offsets, and reads the right entry out of the second one.
     ///
     /// This is what the templating buys and the only test that would notice it
@@ -515,7 +385,7 @@ mod tests {
 
         let mut rng = RandRng::seed_from_u64(7);
         let start = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
-        let mut chain = GpuPottsChain::new(
+        let mut chain = gpu_chain(
             gpu,
             &lat,
             &model,
@@ -565,7 +435,7 @@ mod tests {
         };
         let lat = Lattice::new([4, 3]);
         let start = Configuration::<3>::cold(&lat, Cell::Site);
-        let _ = GpuPottsChain::new(
+        let _ = gpu_chain(
             gpu,
             &lat,
             &Potts::symmetric(1.0),

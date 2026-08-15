@@ -1,51 +1,32 @@
-//! GPU gauge backend: a [`GpuGaugeChain`] that runs the link checkerboard sweep
-//! on the GPU via `wgpu`, exposed through the same
-//! `Iterator<Item = Configuration>` interface as the CPU
-//! [`Chain`](crate::chain::Chain).
+//! GPU gauge backend: the model's side of the device seam, as a constructor
+//! for the shared [`GpuChain`].
 //!
-//! The gauge sibling of [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain), and
-//! a separate type for the same reason
-//! [`LinkCheckerboard`] is separate from
-//! [`SiteCheckerboard`](crate::updater::SiteCheckerboard): that one runs over a
-//! site field and this over a link field, so they share no line of the schedule.
-//! What they *do* share — encoding color passes, batching samples, and reading
-//! them back — is `DeviceSweeper`, so this module holds only the part that is
-//! about the gauge model: the `Params` layout, the staple table, and the
-//! `2D`-color link checkerboard the shader implements.
+//! Everything about running a sweep on the device lives in
+//! [`device`](crate::device) and is shared by every model; what this module
+//! owns is the part that is about the Z2 gauge model — the `Params` layout,
+//! the staple table, and the `model.wgsl` snippet whose `energy_delta` is the
+//! WGSL half of [`Action::energy_delta`](crate::action::Action::energy_delta).
 //!
-//! There are two shaders rather than one, `checkerboard.wgsl` and
-//! `heatbath.wgsl`, picked by the [`Kernel`] the caller names. They share the
-//! `2D`-color link coloring, the staple table and every dispatch, differing only
-//! in what a thread does once the staple sum is in hand.
-//!
-//! The coloring is compiled into the shader, so this
-//! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
-//! counter-based, keyed on `(seed, link, sweep)`, so the result is independent of
-//! GPU thread order — the property that lets the CPU link checkerboard serve as a
-//! reference. See `docs/metropolis.md` for why the direction-and-parity coloring
-//! is the one a plaquette interaction needs.
+//! The variables live on links, so the shared chain assembles the *link*
+//! schedule fragment: `2D` direction–parity colors, launched one thread per
+//! site, exactly the walk the CPU checkerboard
+//! [`LocalUpdate`](crate::updater::LocalUpdate) makes on a link field — which
+//! is what lets that CPU sweep serve as the sequential reference. Randomness
+//! is counter-based, keyed on `(seed, link, sweep)`. See `docs/metropolis.md`
+//! for why the direction-and-parity coloring is the one a plaquette
+//! interaction needs.
 
 use crate::configuration::{Cell, Configuration};
-use crate::device::{
-    DeviceSweeper, Gpu, Kernel, SweepSetup, assert_even_extents, fold_seed, site_colors,
-    state_words,
-};
+use crate::device::{Gpu, GpuChain, GpuModelSetup, Kernel, fold_seed};
 use crate::lattice::Lattice;
 use crate::models::gauge::Z2Gauge;
-use crate::updater::LinkCheckerboard;
-
-/// The compiled kernel: the shared preamble followed by the link checkerboard.
-const METROPOLIS_SHADER: &str = crate::device::shader_source!("checkerboard.wgsl");
-
-/// The compiled heat bath kernel, over the same preamble and the same coloring.
-const HEAT_BATH_SHADER: &str = crate::device::shader_source!("heatbath.wgsl");
 
 /// The static run parameters uploaded to the shader's uniform buffer.
 ///
-/// `#[repr(C)]`, already a 16-byte multiple, matching the WGSL `Params` struct's
-/// uniform layout. It carries no geometry: the kernel reads a base site's parity
-/// from a table and takes the dimension as an override, so nothing about the
-/// shape has to be described here.
+/// `#[repr(C)]`, already a 16-byte multiple, matching the WGSL `Params` struct
+/// in `model.wgsl`. The head — `n_sites`, `seed`, `beta` — is the layout
+/// contract with the shared kernel and schedule fragments; the tail is this
+/// model's own.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
@@ -55,149 +36,74 @@ struct Params {
     j: f32,
 }
 
-/// The Z2 gauge Markov chain run on the GPU, yielding sampled
-/// [`Configuration`]s on links.
+/// Build a Z2 gauge Markov chain on `gpu` over a copy of `start` — a
+/// [`GpuChain`] on links, fixed at `Q = 2`.
 ///
-/// A sibling of [`Chain`](crate::chain::Chain): same iterator interface, device
-/// machinery underneath. Owns everything it needs, so it borrows nothing and can
-/// be moved and driven freely. Fixed at `Q = 2`.
+/// `j` is the plaquette coupling and `beta` the inverse temperature; `seed`
+/// keys the counter-based RNG; `sweeps_between` is the decorrelation stride,
+/// `batch` how many samples are produced per device round-trip, and `kernel`
+/// which single-variable rule a thread runs. Runs no sweeps — warmup is the
+/// caller's job via [`GpuChain::advance`].
 ///
-/// The type carries no dimension, for the reason
-/// [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain) does not: the lattice is
-/// read once in [`new`](GpuGaugeChain::new) to build the tables, and what
-/// survives is device buffers and counts.
-pub struct GpuGaugeChain {
-    sweeper: DeviceSweeper<2>,
-}
+/// # Panics
+///
+/// Panics if `batch` is zero, if `start` is not a link field of this lattice,
+/// if any extent is odd (see [`GpuChain`]), or if `D < 2`, where there is no
+/// plaquette for the action to score.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_chain<const D: usize>(
+    gpu: Gpu,
+    lattice: &Lattice<D>,
+    j: f64,
+    beta: f64,
+    seed: u64,
+    start: &Configuration<2>,
+    sweeps_between: usize,
+    batch: usize,
+    kernel: Kernel,
+) -> GpuChain<2> {
+    // Below two dimensions there is no direction pair, so the lattice has no
+    // plaquettes and the action is identically zero. That is a sweep with
+    // nothing to price rather than an error the arithmetic would raise, so it
+    // has to be said here.
+    assert!(
+        D >= Z2Gauge::MIN_DIMENSION,
+        "{}",
+        Z2Gauge::TOO_FEW_DIMENSIONS
+    );
 
-impl GpuGaugeChain {
-    /// Build a chain on `gpu` over a copy of `start`, uploaded to the device.
-    ///
-    /// `start` is read only to upload it, so the host copy is untouched and the
-    /// same configuration can seed a CPU run too. `j` is the plaquette coupling
-    /// and `beta` the inverse temperature; `seed` keys the counter-based RNG.
-    /// `sweeps_between` is the decorrelation stride, and `batch` is how many
-    /// samples are produced per device round-trip.
-    ///
-    /// Runs no sweeps — like [`Chain::new`](crate::chain::Chain::new), warmup is
-    /// the caller's job via [`advance`](GpuGaugeChain::advance).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `batch` is zero, if `start` is not a link field of this
-    /// lattice, if any extent is odd, or if `D < 2`, where there is no plaquette
-    /// for the action to score.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new<const D: usize>(
-        gpu: Gpu,
-        lattice: &Lattice<D>,
-        j: f64,
-        beta: f64,
-        seed: u64,
-        start: &Configuration<2>,
-        sweeps_between: usize,
-        batch: usize,
-        kernel: Kernel,
-    ) -> Self {
-        assert!(batch > 0, "batch size must be positive");
-        // Below two dimensions there is no direction pair, so the lattice has no
-        // plaquettes and the action is identically zero. That is a sweep with
-        // nothing to price rather than an error the arithmetic would raise, so
-        // it has to be said here.
-        assert!(
-            D >= Z2Gauge::MIN_DIMENSION,
-            "{}",
-            Z2Gauge::TOO_FEW_DIMENSIONS
-        );
-        // The shader indexes the staple table by link, so a site field would be
-        // silently misread rather than rejected; the cell kind is what makes
-        // that checkable at all.
-        assert_eq!(
-            start.cell(),
-            Cell::Link,
-            "the GPU link checkerboard updates links, so the start must be a link field"
-        );
-        assert_eq!(
-            start.n_vars(),
-            lattice.n_links(),
-            "start configuration and lattice disagree on link count"
-        );
-        let shape = lattice.shape();
-        assert_even_extents(&shape, "link");
-
-        let n_sites = lattice.n_sites();
-        let n_links = lattice.n_links();
-
-        let links = state_words(start);
-        // The staple table verbatim: for each link, the `2 * (D - 1)` groups of
-        // three link indices it is priced against, already flat and already in
-        // group order, so the shader reads it with the same arithmetic
-        // `link_staples` does.
-        let mut staples: Vec<u32> = Vec::with_capacity(n_links * Lattice::<D>::staple_stride());
-        for link in 0..n_links {
-            staples.extend(lattice.link_staples(link).iter().map(|&l| l as u32));
-        }
-        let site_color = site_colors(lattice);
-        let params = Params {
-            n_sites: n_sites as u32,
-            seed: fold_seed(seed),
-            beta: beta as f32,
-            j: j as f32,
-        };
-
-        GpuGaugeChain {
-            sweeper: DeviceSweeper::build(
-                gpu,
-                SweepSetup {
-                    label: match kernel {
-                        Kernel::Metropolis => "gauge checkerboard",
-                        Kernel::HeatBath => "gauge heat bath",
-                    },
-                    shader: match kernel {
-                        Kernel::Metropolis => METROPOLIS_SHADER,
-                        Kernel::HeatBath => HEAT_BATH_SHADER,
-                    },
-                    vars_init: &links,
-                    table: &staples,
-                    site_color: &site_color,
-                    params: bytemuck::bytes_of(&params),
-                    dimension: D as u32,
-                    cell: Cell::Link,
-                    n_vars: n_links,
-                    // One thread per site, each owning that site's link in the
-                    // pass's direction. A thread-per-link launch would idle all
-                    // but one thread in `2 * D`, since a dispatch owns one
-                    // direction of `D` and one parity of two; per-site idles one
-                    // in two whatever the dimension.
-                    threads: n_sites,
-                    // Read from the CPU schedule rather than restated: the two
-                    // must agree, since that schedule is the sequential
-                    // reference this kernel is checked against.
-                    colors: LinkCheckerboard::colors::<D>() as u32,
-                    sweeps_between,
-                    batch,
-                },
-            ),
-        }
+    // The staple table verbatim: for each link, the `2 * (D - 1)` groups of
+    // three link indices it is priced against, already flat and already in
+    // group order, so the shader reads it with the same arithmetic
+    // `link_staples` does.
+    let n_links = lattice.n_links();
+    let mut staples: Vec<u32> = Vec::with_capacity(n_links * Lattice::<D>::staple_stride());
+    for link in 0..n_links {
+        staples.extend(lattice.link_staples(link).iter().map(|&l| l as u32));
     }
 
-    /// Advance the chain by `sweeps` sweeps on the device, producing no snapshot —
-    /// the GPU counterpart of [`Chain::advance`](crate::chain::Chain::advance),
-    /// used to discard warmup.
-    pub fn advance(&mut self, sweeps: usize) {
-        self.sweeper.advance(sweeps);
-    }
-}
+    let params = Params {
+        n_sites: lattice.n_sites() as u32,
+        seed: fold_seed(seed),
+        beta: beta as f32,
+        j: j as f32,
+    };
 
-impl Iterator for GpuGaugeChain {
-    type Item = Configuration<2>;
-
-    /// Yield the next sampled configuration, running a fresh batch on the device
-    /// when the host-side buffer drains. Always `Some`: the chain is open-ended,
-    /// so callers bound it with `.take(n)`.
-    fn next(&mut self) -> Option<Self::Item> {
-        self.sweeper.next_sample()
-    }
+    GpuChain::build(
+        gpu,
+        lattice,
+        GpuModelSetup {
+            label: "gauge",
+            source: include_str!("model.wgsl").to_string(),
+            table: staples,
+            params: bytemuck::bytes_of(&params).to_vec(),
+            cell: Cell::Link,
+        },
+        kernel,
+        start,
+        sweeps_between,
+        batch,
+    )
 }
 
 #[cfg(test)]
@@ -221,8 +127,7 @@ mod tests {
             let mut rng = RandRng::seed_from_u64(0);
             let start = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
 
-            let mut chain =
-                GpuGaugeChain::new(gpu, &lat, 1.0, 0.5, 7, &start, 0, 1, Kernel::Metropolis);
+            let mut chain = gpu_chain(gpu, &lat, 1.0, 0.5, 7, &start, 0, 1, Kernel::Metropolis);
             let got = chain.next().expect("open-ended stream yields");
 
             assert_eq!(
@@ -259,8 +164,7 @@ mod tests {
         let start = Configuration::<2>::cold(&lat, Cell::Link);
         let n_plaquettes = lat.n_plaquettes() as f64;
 
-        let mut chain =
-            GpuGaugeChain::new(gpu, &lat, 1.0, 4.0, 99, &start, 5, 4, Kernel::Metropolis);
+        let mut chain = gpu_chain(gpu, &lat, 1.0, 4.0, 99, &start, 5, 4, Kernel::Metropolis);
         chain.advance(20);
         let mean = chain
             .take(8)
@@ -297,13 +201,13 @@ mod tests {
                 / count
         };
 
-        // CPU reference: Chain driven by the LinkCheckerboard updater.
+        // CPU reference: Chain driven by the checkerboard LocalUpdate.
         let cpu = {
             use crate::chain::Chain;
-            use crate::updater::LinkCheckerboard;
+            use crate::updater::{LocalUpdate, Schedule};
             let mut rng = RandRng::seed_from_u64(11);
             let mut cfg = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
-            let updater = LinkCheckerboard;
+            let updater = LocalUpdate::new(Kernel::Metropolis, Schedule::Checkerboard);
             let mut chain = Chain::new(
                 &mut cfg,
                 &lat,
@@ -317,11 +221,11 @@ mod tests {
             mean_plaquette(chain.take(n).collect())
         };
 
-        // GPU: GpuGaugeChain over the same model and geometry.
+        // GPU: the shared chain over the same model and geometry.
         let gpu_mean = {
             let mut rng = RandRng::seed_from_u64(22);
             let start = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
-            let mut chain = GpuGaugeChain::new(
+            let mut chain = gpu_chain(
                 gpu,
                 &lat,
                 j,
@@ -365,6 +269,6 @@ mod tests {
         };
         let lat = Lattice::new([4, 3, 4]);
         let start = Configuration::<2>::cold(&lat, Cell::Link);
-        let _ = GpuGaugeChain::new(gpu, &lat, 1.0, 0.5, 1, &start, 1, 1, Kernel::Metropolis);
+        let _ = gpu_chain(gpu, &lat, 1.0, 0.5, 1, &start, 1, 1, Kernel::Metropolis);
     }
 }

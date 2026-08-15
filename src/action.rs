@@ -59,7 +59,7 @@ pub trait Action<const Q: usize, const D: usize> {
 /// add nothing, and naming `D` here would leave it uninferable at a constructor
 /// that takes only the model — [`Potts`](crate::models::potts::Potts) implements
 /// `Action<Q, D>` for *every* `D`, so
-/// [`SwendsenWang::for_model`](crate::updater::SwendsenWang::for_model) could not
+/// [`ClusterUpdate::new`](crate::updater::ClusterUpdate::new) could not
 /// resolve one and every call site would need a turbofish. See
 /// `docs/swendsen-wang.md`.
 ///

@@ -42,6 +42,31 @@ const N_SAMPLES: usize = 200;
 /// The hot start is deliberate: ordering from a disordered start is the stronger
 /// check, since it shows the chain *reaches* the ordered phase rather than
 /// merely staying in it.
+/// The `updater`/`schedule`/`backend` lines for a shorthand name, so a test
+/// names a run the way its report labels it while the file speaks the composed
+/// config vocabulary.
+fn driver_lines(name: &str) -> String {
+    let (rule, schedule, backend) = match name {
+        "metropolis" => ("metropolis", None, None),
+        "heat_bath" => ("heat_bath", None, None),
+        "checkerboard" => ("metropolis", Some("checkerboard"), None),
+        "checkerboard_heat_bath" => ("heat_bath", Some("checkerboard"), None),
+        "gpu_checkerboard" => ("metropolis", Some("checkerboard"), Some("gpu")),
+        "gpu_checkerboard_heat_bath" => ("heat_bath", Some("checkerboard"), Some("gpu")),
+        "swendsen_wang" => ("swendsen_wang", None, None),
+        "gpu_swendsen_wang" => ("swendsen_wang", None, Some("gpu")),
+        other => panic!("unknown updater shorthand {other}"),
+    };
+    let mut lines = format!("updater = \"{rule}\"\n");
+    if let Some(schedule) = schedule {
+        lines.push_str(&format!("schedule = \"{schedule}\"\n"));
+    }
+    if let Some(backend) = backend {
+        lines.push_str(&format!("backend = \"{backend}\"\n"));
+    }
+    lines
+}
+
 fn run_toml<const D: usize>(
     shape: [usize; D],
     beta: f64,
@@ -52,12 +77,13 @@ fn run_toml<const D: usize>(
         "shape = {shape:?}\n\
          j = 1.0\n\
          beta = {beta}\n\
-         updater = \"{updater}\"\n\
+         {driver}\
          thermalize = 500\n\
          sweeps_between = 2\n\
          n_samples = {n_samples}\n\
          seed = 20260728\n\
-         start = \"hot\"\n"
+         start = \"hot\"\n",
+        driver = driver_lines(updater),
     )
 }
 
@@ -99,7 +125,7 @@ fn cpu_metropolis_orders_at_low_temperature() {
 /// same threshold — only the update rule differs.
 #[test]
 fn cpu_checkerboard_orders_at_low_temperature() {
-    let mean_abs_m = mean_abs_magnetization([16, 16], 1.0, "site_checkerboard");
+    let mean_abs_m = mean_abs_magnetization([16, 16], 1.0, "checkerboard");
     assert!(
         mean_abs_m > 0.5,
         "low-T checkerboard run should order: mean |m| = {mean_abs_m}"
@@ -132,7 +158,7 @@ fn gpu_checkerboard_orders_at_low_temperature() {
     if !gpu_available() {
         return;
     }
-    let mean_abs_m = mean_abs_magnetization([16, 16], 1.0, "gpu_site_checkerboard");
+    let mean_abs_m = mean_abs_magnetization([16, 16], 1.0, "gpu_checkerboard");
     assert!(
         mean_abs_m > 0.5,
         "low-T GPU checkerboard run should order: mean |m| = {mean_abs_m}"
@@ -152,8 +178,9 @@ fn gpu_checkerboard_orders_at_low_temperature() {
 /// still orders, and still looks healthy.
 ///
 /// The GPU arm is what makes the shader's correctness a claim about the stack
-/// rather than about a kernel: the config names `gpu_site_checkerboard_heat_bath`,
-/// `IsingSampler` builds the device chain with `Kernel::HeatBath`, and the same
+/// rather than about a kernel: the config names the heat bath rule under the
+/// checkerboard schedule on the gpu backend, `IsingSampler` builds the device
+/// chain with `Kernel::HeatBath`, and the same
 /// comparison decides it. The three runs cannot be compared bit-for-bit —
 /// Metropolis draws a site index per step, the CPU heat bath draws one uniform
 /// per variable, and the GPU keys a counter on `(seed, site, sweep)` — so the
@@ -179,7 +206,7 @@ fn the_heat_bath_agrees_with_metropolis() {
     // only against Metropolis is what makes the check specific to the shader —
     // agreement with a differently-scheduled run leaves open that the coloring
     // and the kernel are each wrong in compensating ways.
-    let cpu_checkerboard = mean_abs_magnetization(shape, beta, "site_checkerboard_heat_bath");
+    let cpu_checkerboard = mean_abs_magnetization(shape, beta, "checkerboard_heat_bath");
     assert!(
         (metropolis - cpu_checkerboard).abs() < 0.05,
         "the checkerboard heat bath disagrees: metropolis {metropolis:.4} \
@@ -189,7 +216,7 @@ fn the_heat_bath_agrees_with_metropolis() {
     if !gpu_available() {
         return;
     }
-    let gpu = mean_abs_magnetization(shape, beta, "gpu_site_checkerboard_heat_bath");
+    let gpu = mean_abs_magnetization(shape, beta, "gpu_checkerboard_heat_bath");
     assert!(
         (cpu_checkerboard - gpu).abs() < 0.05,
         "the GPU heat bath disagrees with its sequential reference: \
@@ -243,7 +270,7 @@ fn the_heat_bath_runs_with_an_external_field() {
     if !gpu_available() {
         return;
     }
-    let gpu = with_field("gpu_site_checkerboard_heat_bath");
+    let gpu = with_field("gpu_checkerboard_heat_bath");
     assert!(
         (metropolis - gpu).abs() < 0.05,
         "GPU heat bath disagrees under a field: metropolis {metropolis:.4} vs gpu {gpu:.4}"
@@ -408,7 +435,7 @@ fn the_backends_agree_in_three_dimensions() {
     let beta = 0.28; // ordered, but not so deep that |m| saturates and hides a bug
 
     let metropolis = mean_abs_magnetization(shape, beta, "metropolis");
-    let checkerboard = mean_abs_magnetization(shape, beta, "site_checkerboard");
+    let checkerboard = mean_abs_magnetization(shape, beta, "checkerboard");
     assert!(
         (metropolis - checkerboard).abs() < 0.05,
         "CPU schedules disagree in 3D: metropolis {metropolis:.4} vs checkerboard {checkerboard:.4}"
@@ -417,7 +444,7 @@ fn the_backends_agree_in_three_dimensions() {
     if !gpu_available() {
         return;
     }
-    let gpu = mean_abs_magnetization(shape, beta, "gpu_site_checkerboard");
+    let gpu = mean_abs_magnetization(shape, beta, "gpu_checkerboard");
     assert!(
         (metropolis - gpu).abs() < 0.05,
         "GPU disagrees in 3D: metropolis {metropolis:.4} vs gpu {gpu:.4}"
@@ -445,7 +472,7 @@ fn the_backends_agree_in_six_dimensions() {
     let beta = 0.12;
 
     let metropolis = mean_abs_magnetization(shape, beta, "metropolis");
-    let checkerboard = mean_abs_magnetization(shape, beta, "site_checkerboard");
+    let checkerboard = mean_abs_magnetization(shape, beta, "checkerboard");
     assert!(
         metropolis > 0.4 && metropolis < 0.95,
         "6D run should order without saturating: {metropolis}"
@@ -458,7 +485,7 @@ fn the_backends_agree_in_six_dimensions() {
     if !gpu_available() {
         return;
     }
-    let gpu = mean_abs_magnetization(shape, beta, "gpu_site_checkerboard");
+    let gpu = mean_abs_magnetization(shape, beta, "gpu_checkerboard");
     assert!(
         (metropolis - gpu).abs() < 0.1,
         "GPU disagrees in 6D: metropolis {metropolis:.4} vs gpu {gpu:.4}"

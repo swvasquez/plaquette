@@ -49,6 +49,31 @@ const MAX_SIDE: usize = 2;
 /// here without making the test slow.
 const N_SAMPLES: usize = 300;
 
+/// The `updater`/`schedule`/`backend` lines for a shorthand name, so a test
+/// names a run the way its report labels it while the file speaks the composed
+/// config vocabulary.
+fn driver_lines(name: &str) -> String {
+    let (rule, schedule, backend) = match name {
+        "metropolis" => ("metropolis", None, None),
+        "heat_bath" => ("heat_bath", None, None),
+        "checkerboard" => ("metropolis", Some("checkerboard"), None),
+        "checkerboard_heat_bath" => ("heat_bath", Some("checkerboard"), None),
+        "gpu_checkerboard" => ("metropolis", Some("checkerboard"), Some("gpu")),
+        "gpu_checkerboard_heat_bath" => ("heat_bath", Some("checkerboard"), Some("gpu")),
+        "swendsen_wang" => ("swendsen_wang", None, None),
+        "gpu_swendsen_wang" => ("swendsen_wang", None, Some("gpu")),
+        other => panic!("unknown updater shorthand {other}"),
+    };
+    let mut lines = format!("updater = \"{rule}\"\n");
+    if let Some(schedule) = schedule {
+        lines.push_str(&format!("schedule = \"{schedule}\"\n"));
+    }
+    if let Some(backend) = backend {
+        lines.push_str(&format!("backend = \"{backend}\"\n"));
+    }
+    lines
+}
+
 /// The run parameters every test below holds fixed, as TOML.
 ///
 /// One builder rather than a literal per helper, so a decorrelation stride or a
@@ -59,12 +84,13 @@ fn run_toml<const D: usize>(shape: [usize; D], beta: f64, seed: u64, updater: &s
         "shape = {shape:?}\n\
          j = 1.0\n\
          beta = {beta}\n\
-         updater = \"{updater}\"\n\
+         {driver}\
          thermalize = 200\n\
          sweeps_between = 3\n\
          n_samples = {N_SAMPLES}\n\
          seed = {seed}\n\
-         start = \"cold\"\n"
+         start = \"cold\"\n",
+        driver = driver_lines(updater),
     )
 }
 
@@ -394,13 +420,13 @@ fn gpu_available() -> bool {
 /// CPU link checkerboard: reordering the moves into color passes measures the
 /// same physics, through the whole public stack rather than at the sweep level.
 #[test]
-fn cpu_link_checkerboard_matches_metropolis() {
+fn cpu_checkerboard_matches_metropolis() {
     let metropolis = run([6, 6, 6], AGREEMENT_BETA, 20260801, "metropolis");
-    let checkerboard = run([6, 6, 6], AGREEMENT_BETA, 20260802, "link_checkerboard");
+    let checkerboard = run([6, 6, 6], AGREEMENT_BETA, 20260802, "checkerboard");
     report("metropolis", &metropolis);
-    report("link_checkerboard", &checkerboard);
+    report("checkerboard", &checkerboard);
 
-    assert_matches(&metropolis, &checkerboard, "link_checkerboard");
+    assert_matches(&metropolis, &checkerboard, "checkerboard");
 }
 
 /// GPU link checkerboard: the device backend measures it too. Skips rather than
@@ -411,16 +437,16 @@ fn cpu_link_checkerboard_matches_metropolis() {
 /// stack: the config names the backend, `GaugeSampler` builds the device chain,
 /// and the same statistical comparison the CPU arm uses decides it.
 #[test]
-fn gpu_link_checkerboard_matches_metropolis() {
+fn gpu_checkerboard_matches_metropolis() {
     if !gpu_available() {
         return;
     }
     let metropolis = run([6, 6, 6], AGREEMENT_BETA, 20260803, "metropolis");
-    let checkerboard = run([6, 6, 6], AGREEMENT_BETA, 20260804, "gpu_link_checkerboard");
+    let checkerboard = run([6, 6, 6], AGREEMENT_BETA, 20260804, "gpu_checkerboard");
     report("metropolis", &metropolis);
-    report("gpu_link_checkerboard", &checkerboard);
+    report("gpu_checkerboard", &checkerboard);
 
-    assert_matches(&metropolis, &checkerboard, "gpu_link_checkerboard");
+    assert_matches(&metropolis, &checkerboard, "gpu_checkerboard");
 }
 
 /// CPU heat bath: drawing the link from its conditional rather than proposing a
@@ -452,7 +478,7 @@ fn cpu_heat_bath_matches_metropolis() {
 /// actually independent would show up here as a shifted mean plaquette rather
 /// than as a crash.
 #[test]
-fn gpu_link_checkerboard_heat_bath_matches_metropolis() {
+fn gpu_checkerboard_heat_bath_matches_metropolis() {
     if !gpu_available() {
         return;
     }
@@ -463,18 +489,18 @@ fn gpu_link_checkerboard_heat_bath_matches_metropolis() {
         [6, 6, 6],
         AGREEMENT_BETA,
         20260807,
-        "link_checkerboard_heat_bath",
+        "checkerboard_heat_bath",
     );
     let gpu = run(
         [6, 6, 6],
         AGREEMENT_BETA,
         20260808,
-        "gpu_link_checkerboard_heat_bath",
+        "gpu_checkerboard_heat_bath",
     );
-    report("link_checkerboard_heat_bath", &reference);
-    report("gpu_link_checkerboard_heat_bath", &gpu);
+    report("checkerboard_heat_bath", &reference);
+    report("gpu_checkerboard_heat_bath", &gpu);
 
-    assert_matches(&reference, &gpu, "gpu_link_checkerboard_heat_bath");
+    assert_matches(&reference, &gpu, "gpu_checkerboard_heat_bath");
 }
 
 /// The backends agree at a dimension the GPU kernel was not written for.
@@ -488,17 +514,17 @@ fn gpu_link_checkerboard_heat_bath_matches_metropolis() {
 #[test]
 fn the_backends_agree_in_two_dimensions() {
     let metropolis = run([8, 8], AGREEMENT_BETA, 20260810, "metropolis");
-    let checkerboard = run([8, 8], AGREEMENT_BETA, 20260811, "link_checkerboard");
+    let checkerboard = run([8, 8], AGREEMENT_BETA, 20260811, "checkerboard");
     report("2D metropolis", &metropolis);
-    report("2D link_checkerboard", &checkerboard);
-    assert_matches(&metropolis, &checkerboard, "link_checkerboard");
+    report("2D checkerboard", &checkerboard);
+    assert_matches(&metropolis, &checkerboard, "checkerboard");
 
     if !gpu_available() {
         return;
     }
-    let gpu = run([8, 8], AGREEMENT_BETA, 20260812, "gpu_link_checkerboard");
-    report("2D gpu_link_checkerboard", &gpu);
-    assert_matches(&metropolis, &gpu, "gpu_link_checkerboard");
+    let gpu = run([8, 8], AGREEMENT_BETA, 20260812, "gpu_checkerboard");
+    report("2D gpu_checkerboard", &gpu);
+    assert_matches(&metropolis, &gpu, "gpu_checkerboard");
 }
 
 /// The other side of the same bracket — see
@@ -509,17 +535,17 @@ fn the_backends_agree_in_two_dimensions() {
 fn the_backends_agree_in_four_dimensions() {
     let shape = [4, 4, 4, 4];
     let metropolis = run(shape, AGREEMENT_BETA, 20260813, "metropolis");
-    let checkerboard = run(shape, AGREEMENT_BETA, 20260814, "link_checkerboard");
+    let checkerboard = run(shape, AGREEMENT_BETA, 20260814, "checkerboard");
     report("4D metropolis", &metropolis);
-    report("4D link_checkerboard", &checkerboard);
-    assert_matches(&metropolis, &checkerboard, "link_checkerboard");
+    report("4D checkerboard", &checkerboard);
+    assert_matches(&metropolis, &checkerboard, "checkerboard");
 
     if !gpu_available() {
         return;
     }
-    let gpu = run(shape, AGREEMENT_BETA, 20260815, "gpu_link_checkerboard");
-    report("4D gpu_link_checkerboard", &gpu);
-    assert_matches(&metropolis, &gpu, "gpu_link_checkerboard");
+    let gpu = run(shape, AGREEMENT_BETA, 20260815, "gpu_checkerboard");
+    report("4D gpu_checkerboard", &gpu);
+    assert_matches(&metropolis, &gpu, "gpu_checkerboard");
 }
 
 /// The three backends still agree at six dimensions, and the plaquette still
@@ -546,7 +572,7 @@ fn the_backends_agree_in_six_dimensions() {
     let beta = 0.2;
 
     let metropolis = run(shape, beta, 20260820, "metropolis");
-    let checkerboard = run(shape, beta, 20260821, "link_checkerboard");
+    let checkerboard = run(shape, beta, 20260821, "checkerboard");
     eprintln!(
         "6D: metropolis {:.4}({:.4}), checkerboard {:.4}({:.4}), tanh({beta}) = {:.4}",
         metropolis.plaquette.mean,
@@ -574,7 +600,7 @@ fn the_backends_agree_in_six_dimensions() {
     if !gpu_available() {
         return;
     }
-    let gpu = run(shape, beta, 20260822, "gpu_link_checkerboard");
+    let gpu = run(shape, beta, 20260822, "gpu_checkerboard");
     eprintln!(
         "6D: gpu {:.4}({:.4})",
         gpu.plaquette.mean, gpu.plaquette.stderr

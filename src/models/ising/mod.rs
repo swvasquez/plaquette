@@ -14,7 +14,7 @@ pub mod gpu;
 pub mod run_config;
 pub mod sampler;
 
-pub use gpu::GpuIsingChain;
+pub use gpu::gpu_chain;
 pub use run_config::IsingRunConfig;
 pub use sampler::{AnyIsingChain, IsingSampler};
 

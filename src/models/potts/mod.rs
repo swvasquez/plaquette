@@ -12,7 +12,7 @@ pub mod gpu;
 pub mod run_config;
 pub mod sampler;
 
-pub use gpu::GpuPottsChain;
+pub use gpu::gpu_chain;
 pub use run_config::PottsRunConfig;
 pub use sampler::{AnyPottsChain, PottsSampler};
 

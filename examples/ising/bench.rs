@@ -20,10 +20,10 @@ use std::time::Instant;
 
 use plaquette::chain::Chain;
 use plaquette::device::Kernel;
-use plaquette::models::ising::GpuIsingChain;
 use plaquette::models::ising::Ising;
+use plaquette::models::ising::gpu_chain;
 use plaquette::rng::RandRng;
-use plaquette::{Cell, Configuration, Gpu, Lattice, Metropolis};
+use plaquette::{Cell, Configuration, Gpu, Lattice, LocalUpdate};
 
 const BETA: f64 = 0.44;
 const J: f64 = 1.0;
@@ -66,7 +66,7 @@ fn cpu_mups(l: usize, sweeps: usize) -> f64 {
     let model = Ising::new(J, H);
     let mut rng = RandRng::seed_from_u64(1);
     let mut config = Configuration::<2>::hot(&lattice, Cell::Site, &mut rng);
-    let updater = Metropolis;
+    let updater = LocalUpdate::default();
     let mut chain = Chain::new(&mut config, &lattice, &model, &updater, BETA, &mut rng, 1);
 
     chain.advance(50); // warmup, discarded
@@ -81,7 +81,7 @@ fn gpu_mups(l: usize, sweeps: usize) -> f64 {
     let lattice = Lattice::new([l, l]);
     let mut rng = RandRng::seed_from_u64(2);
     let start = Configuration::<2>::hot(&lattice, Cell::Site, &mut rng);
-    let mut chain = GpuIsingChain::new(
+    let mut chain = gpu_chain(
         gpu,
         &lattice,
         J,

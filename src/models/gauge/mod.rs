@@ -14,7 +14,7 @@ pub mod gpu;
 pub mod run_config;
 pub mod sampler;
 
-pub use gpu::GpuGaugeChain;
+pub use gpu::gpu_chain;
 pub use run_config::GaugeRunConfig;
 pub use sampler::{AnyGaugeChain, GaugeSampler};
 
@@ -75,7 +75,7 @@ impl Z2Gauge {
     /// It lives here because it follows from what this action scores. The config
     /// schema re-exports it as
     /// [`MIN_DIMENSION`](crate::models::gauge::run_config::MIN_DIMENSION) and
-    /// `GpuGaugeChain::new` reads it too, so the rule has one home and one
+    /// the device constructor reads it too, so the rule has one home and one
     /// wording rather than a literal `2` in each.
     pub const MIN_DIMENSION: usize = 2;
 
@@ -799,11 +799,11 @@ mod tests {
         // plaquettes it encloses — averages to `tanh(β)` raised to its area.
         // A chain has to land on that, and the fixed seed makes it reproducible.
         use crate::chain::Chain;
-        use crate::updater::Metropolis;
+        use crate::updater::LocalUpdate;
 
         let lat = Lattice::new([8, 8]);
         let action = Z2Gauge::new(1.0);
-        let updater = Metropolis;
+        let updater = LocalUpdate::default();
         let beta = 0.5;
         let samples = 800;
 

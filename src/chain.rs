@@ -41,7 +41,7 @@
 //! callers bound a run with `.take(n)`.
 //!
 //! ```
-//! # use plaquette::{Cell, Lattice, Configuration, Metropolis};
+//! # use plaquette::{Cell, Lattice, Configuration, LocalUpdate};
 //! # use plaquette::models::ising::{Ising, measure};
 //! # use plaquette::rng::RandRng;
 //! # use plaquette::chain::Chain;
@@ -50,7 +50,7 @@
 //! # let mut rng = RandRng::seed_from_u64(0);
 //! # let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 //! # let (beta, thermalize, sweeps_between) = (1.0, 10, 2);
-//! let updater = Metropolis;
+//! let updater = LocalUpdate::default();
 //! let mut chain = Chain::new(&mut config, &lat, &model, &updater, beta, &mut rng, sweeps_between);
 //!
 //! // Warmup is the caller's job: advance past the approach to equilibrium,
@@ -193,7 +193,7 @@ mod tests {
     use crate::models::ising::Ising;
     use crate::models::ising::{self as observables, Sample};
     use crate::rng::RandRng;
-    use crate::updater::Metropolis;
+    use crate::updater::LocalUpdate;
 
     /// An [`Updater`] that does nothing but count the sweeps it is asked to run.
     /// Its `sweep` is the whole implementation — the trait requires nothing else.
@@ -283,7 +283,7 @@ mod tests {
     fn take_map_measure_collects_n_samples() {
         let lat = Lattice::new([8, 8]);
         let model = Ising::new(1.0, 0.0);
-        let updater = Metropolis;
+        let updater = LocalUpdate::default();
         let mut rng = RandRng::seed_from_u64(7);
         let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
@@ -304,7 +304,7 @@ mod tests {
     fn take_collect_gives_a_vec_of_configs() {
         let lat = Lattice::new([8, 8]);
         let model = Ising::new(1.0, 0.0);
-        let updater = Metropolis;
+        let updater = LocalUpdate::default();
         let mut rng = RandRng::seed_from_u64(7);
         let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
@@ -326,7 +326,7 @@ mod tests {
     fn low_temperature_chain_trends_toward_alignment() {
         let lat = Lattice::new([16, 16]);
         let model = Ising::new(1.0, 0.0);
-        let updater = Metropolis;
+        let updater = LocalUpdate::default();
         let mut rng = RandRng::seed_from_u64(20260718);
         let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 

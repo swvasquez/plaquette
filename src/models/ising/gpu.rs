@@ -1,55 +1,32 @@
-//! GPU Ising backend: a [`GpuIsingChain`] that runs the site checkerboard sweep
-//! on the GPU via `wgpu`, exposed through the same
-//! `Iterator<Item = Configuration>` interface as the CPU
-//! [`Chain`](crate::chain::Chain).
+//! GPU Ising backend: the model's side of the device seam, as a constructor
+//! for the shared [`GpuChain`].
 //!
-//! `GpuIsingChain` is a *sibling* of `Chain`, not a variant of it: they share
-//! only the iterator interface. Where `Chain` borrows a host `Configuration` and
-//! mutates it a sweep at a time, this owns its device resources and keeps the
-//! configuration in a device buffer, crossing the host boundary once per batch.
-//! All of that batching lives in `DeviceSweeper`, shared with the gauge
-//! backend; what this module owns is the part that is about the Ising model —
-//! the `Params` layout, the neighbor table, and the two-color site
-//! checkerboard the shader implements.
+//! Everything about running a sweep on the device — assembling the shader
+//! from prelude, model snippet, kernel, and schedule; encoding color passes;
+//! batching samples — lives in [`device`](crate::device) and is shared by
+//! every model. What this module owns is the part that is about the Ising
+//! model: the `Params` layout, the neighbor table, and the `model.wgsl`
+//! snippet whose `energy_delta` is the WGSL half of
+//! [`Action::energy_delta`](crate::action::Action::energy_delta).
 //!
-//! There are two shaders rather than one, `checkerboard.wgsl` and
-//! `heatbath.wgsl`, picked by the [`Kernel`] the caller names. They share the
-//! coloring, the tables and every dispatch, and differ only in what one thread
-//! does once it has the energy change in hand — the coloring belongs to the
-//! schedule, not to the kernel, so a heat bath sweep needs exactly the
-//! independence a Metropolis sweep needs.
-//!
-//! The coloring is compiled into the shader, so this
-//! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
-//! counter-based, keyed on `(seed, site, sweep)`, so the result is independent of
-//! GPU thread order — the property that lets the CPU site checkerboard serve as a
-//! reference.
+//! The device runs the checkerboard schedule — on this model's site field,
+//! two parity colors — with whichever [`Kernel`] the caller names. Its
+//! randomness is counter-based, keyed on `(seed, site, sweep)`, so the result
+//! is independent of GPU thread order — the property that lets the CPU
+//! checkerboard [`LocalUpdate`](crate::updater::LocalUpdate) serve as the
+//! sequential reference.
 
 use crate::configuration::{Cell, Configuration};
-use crate::device::{
-    DeviceSweeper, Gpu, Kernel, SweepSetup, assert_even_extents, fold_seed, site_colors,
-    site_neighbor_table, state_words,
-};
+use crate::device::{Gpu, GpuChain, GpuModelSetup, Kernel, fold_seed, site_neighbor_table};
 use crate::lattice::Lattice;
-
-/// Color passes per sweep: the two coordinate-sum parities. A site's color does
-/// not depend on the dimension — a step along any axis flips the parity, in one
-/// dimension as in six — so unlike the link coloring this count is a constant.
-const N_COLORS: u32 = 2;
-
-/// The compiled Metropolis kernel: the shared preamble followed by the site
-/// checkerboard.
-const METROPOLIS_SHADER: &str = crate::device::shader_source!("checkerboard.wgsl");
-
-/// The compiled heat bath kernel, over the same preamble and the same coloring.
-const HEAT_BATH_SHADER: &str = crate::device::shader_source!("heatbath.wgsl");
 
 /// The static run parameters uploaded to the shader's uniform buffer.
 ///
 /// `#[repr(C)]` with explicit padding to a 16-byte multiple, matching the WGSL
-/// `Params` struct's uniform layout. It carries no geometry: the kernel reads a
-/// site's color from a table and takes the dimension as an override, so nothing
-/// about the shape has to be described here.
+/// `Params` struct in `model.wgsl`. The head — `n_sites`, `seed`, `beta` — is
+/// the layout contract with the shared kernel and schedule fragments; the tail
+/// is this model's own. It carries no geometry: the kernel reads a site's
+/// color from a table and takes the dimension as an override.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
@@ -63,132 +40,58 @@ struct Params {
     _pad2: f32,
 }
 
-/// The Ising Markov chain run on the GPU, yielding sampled [`Configuration`]s on
-/// sites.
+/// Build an Ising Markov chain on `gpu` over a copy of `start` — a
+/// [`GpuChain`] on sites, fixed at `Q = 2`.
 ///
-/// A sibling of [`Chain`](crate::chain::Chain): same iterator interface, device
-/// machinery underneath. Owns everything it needs, so it borrows nothing and can
-/// be moved and driven freely. Fixed at `Q = 2`.
+/// `j`, `h`, `beta` are the Ising parameters; `seed` keys the counter-based
+/// RNG; `sweeps_between` is the decorrelation stride, `batch` how many samples
+/// are produced per device round-trip, and `kernel` which single-variable rule
+/// a thread runs. Runs no sweeps — warmup is the caller's job via
+/// [`GpuChain::advance`].
 ///
-/// The type carries no dimension. It reads the lattice once, in
-/// [`new`](GpuIsingChain::new), to build the tables it uploads, and afterwards
-/// holds only device buffers and counts — so `D` is a parameter of the
-/// constructor rather than of the chain.
-pub struct GpuIsingChain {
-    sweeper: DeviceSweeper<2>,
-}
+/// # Panics
+///
+/// Panics if `batch` is zero, if `start` is not a site field of this lattice,
+/// or if any extent is odd (see [`GpuChain`]).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_chain<const D: usize>(
+    gpu: Gpu,
+    lattice: &Lattice<D>,
+    j: f64,
+    h: f64,
+    beta: f64,
+    seed: u64,
+    start: &Configuration<2>,
+    sweeps_between: usize,
+    batch: usize,
+    kernel: Kernel,
+) -> GpuChain<2> {
+    let params = Params {
+        n_sites: lattice.n_sites() as u32,
+        seed: fold_seed(seed),
+        beta: beta as f32,
+        j: j as f32,
+        h: h as f32,
+        _pad0: 0.0,
+        _pad1: 0.0,
+        _pad2: 0.0,
+    };
 
-impl GpuIsingChain {
-    /// Build a chain on `gpu` over a copy of `start`, uploaded to the device.
-    ///
-    /// `start` is read only to upload it, so the host copy is untouched and the
-    /// same configuration can seed a CPU run too. `j`, `h`, `beta` are the Ising
-    /// parameters; `seed` keys the counter-based RNG. `sweeps_between` is the
-    /// decorrelation stride, and `batch` is how many samples are produced per
-    /// device round-trip. `kernel` picks which single-variable rule a thread
-    /// runs; both sample the same distribution over the same coloring, so it is
-    /// a choice of algorithm and not of physics.
-    ///
-    /// Runs no sweeps — like [`Chain::new`](crate::chain::Chain::new), warmup is
-    /// the caller's job via [`advance`](GpuIsingChain::advance).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `batch` is zero, if `start` is not a site field of this
-    /// lattice, or if any extent is odd.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new<const D: usize>(
-        gpu: Gpu,
-        lattice: &Lattice<D>,
-        j: f64,
-        h: f64,
-        beta: f64,
-        seed: u64,
-        start: &Configuration<2>,
-        sweeps_between: usize,
-        batch: usize,
-        kernel: Kernel,
-    ) -> Self {
-        assert!(batch > 0, "batch size must be positive");
-        // The shader indexes the neighbor table by site, so a link field would
-        // be silently misread rather than rejected; the cell kind is what makes
-        // that checkable at all.
-        assert_eq!(
-            start.cell(),
-            Cell::Site,
-            "the GPU site checkerboard updates sites, so the start must be a site field"
-        );
-        assert_eq!(
-            start.n_vars(),
-            lattice.n_sites(),
-            "start configuration and lattice disagree on site count"
-        );
-        let shape = lattice.shape();
-        assert_even_extents(&shape, "site");
-
-        let n_sites = lattice.n_sites();
-
-        let spins = state_words(start);
-        let neighbors = site_neighbor_table(lattice);
-        let site_color = site_colors(lattice);
-        let params = Params {
-            n_sites: n_sites as u32,
-            seed: fold_seed(seed),
-            beta: beta as f32,
-            j: j as f32,
-            h: h as f32,
-            _pad0: 0.0,
-            _pad1: 0.0,
-            _pad2: 0.0,
-        };
-
-        GpuIsingChain {
-            sweeper: DeviceSweeper::build(
-                gpu,
-                SweepSetup {
-                    label: match kernel {
-                        Kernel::Metropolis => "ising checkerboard",
-                        Kernel::HeatBath => "ising heat bath",
-                    },
-                    shader: match kernel {
-                        Kernel::Metropolis => METROPOLIS_SHADER,
-                        Kernel::HeatBath => HEAT_BATH_SHADER,
-                    },
-                    vars_init: &spins,
-                    table: &neighbors,
-                    site_color: &site_color,
-                    params: bytemuck::bytes_of(&params),
-                    dimension: D as u32,
-                    cell: Cell::Site,
-                    n_vars: n_sites,
-                    // One thread per site, which on a site field is also one per
-                    // variable.
-                    threads: n_sites,
-                    colors: N_COLORS,
-                    sweeps_between,
-                    batch,
-                },
-            ),
-        }
-    }
-
-    /// Advance the chain by `sweeps` sweeps on the device, producing no snapshot —
-    /// the GPU counterpart of [`Chain::advance`](crate::chain::Chain::advance),
-    /// used to discard warmup.
-    pub fn advance(&mut self, sweeps: usize) {
-        self.sweeper.advance(sweeps);
-    }
-}
-
-impl Iterator for GpuIsingChain {
-    type Item = Configuration<2>;
-
-    /// Yield the next sampled configuration, running a fresh batch on the device
-    /// when the host-side buffer drains. Always `Some`: the chain is open-ended,
-    /// so callers bound it with `.take(n)`.
-    fn next(&mut self) -> Option<Self::Item> {
-        self.sweeper.next_sample()
-    }
+    GpuChain::build(
+        gpu,
+        lattice,
+        GpuModelSetup {
+            label: "ising",
+            source: include_str!("model.wgsl").to_string(),
+            table: site_neighbor_table(lattice),
+            params: bytemuck::bytes_of(&params).to_vec(),
+            cell: Cell::Site,
+        },
+        kernel,
+        start,
+        sweeps_between,
+        batch,
+    )
 }
 
 #[cfg(test)]
@@ -219,7 +122,7 @@ mod tests {
         let mut rng = RandRng::seed_from_u64(0);
         let start = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
-        let mut chain = GpuIsingChain::new(
+        let mut chain = gpu_chain(
             gpu,
             &lat,
             1.0,
@@ -266,7 +169,7 @@ mod tests {
         );
 
         let start = Configuration::<2>::cold(&lat, Cell::Site);
-        let mut chain = GpuIsingChain::new(
+        let mut chain = gpu_chain(
             gpu,
             &lat,
             0.0,
@@ -304,14 +207,14 @@ mod tests {
         let n_sites = (shape[0] * shape[1]) as f64;
         let model = Ising::new(j, h);
 
-        // CPU reference: Chain driven by the SiteCheckerboard updater.
+        // CPU reference: Chain driven by the checkerboard LocalUpdate.
         let (e_cpu, m_cpu) = {
             use crate::chain::Chain;
-            use crate::updater::SiteCheckerboard;
+            use crate::updater::{LocalUpdate, Schedule};
             let lat = Lattice::new(shape);
             let mut rng = RandRng::seed_from_u64(11);
             let mut cfg = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
-            let updater = SiteCheckerboard;
+            let updater = LocalUpdate::new(Kernel::Metropolis, Schedule::Checkerboard);
             let mut chain = Chain::new(
                 &mut cfg,
                 &lat,
@@ -326,12 +229,12 @@ mod tests {
             mean_densities(&samples, n_sites)
         };
 
-        // GPU: GpuIsingChain over the same model and geometry.
+        // GPU: the shared chain over the same model and geometry.
         let (e_gpu, m_gpu) = {
             let lat = Lattice::new(shape);
             let mut rng = RandRng::seed_from_u64(22);
             let start = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
-            let mut chain = GpuIsingChain::new(
+            let mut chain = gpu_chain(
                 gpu,
                 &lat,
                 j,

@@ -58,14 +58,14 @@ use crate::device::{
 };
 use crate::lattice::Lattice;
 use crate::state::State;
-use crate::updater::SwendsenWang;
+use crate::updater::ClusterUpdate;
 
 /// The four-stage kernel: the shared randomness, the graph stages, and the
 /// relabel.
 const SHADER: &str = concat!(
-    include_str!("checkerboard_prelude.wgsl"),
-    include_str!("cluster_prelude.wgsl"),
-    include_str!("cluster_relabel.wgsl"),
+    include_str!("wgsl/rng.wgsl"),
+    include_str!("wgsl/cluster_prelude.wgsl"),
+    include_str!("wgsl/cluster_relabel.wgsl"),
 );
 
 /// The fewest states a cluster redraw is defined at.
@@ -122,7 +122,7 @@ struct Params {
 /// implementing that trait.
 ///
 /// The type carries `Q` but not the dimension, the same split
-/// [`GpuPottsChain`](crate::models::potts::gpu::GpuPottsChain) makes: `Q` is part
+/// [`GpuChain`](crate::device::GpuChain) makes: `Q` is part
 /// of what a yielded [`Configuration<Q>`] is, while `D` is read once in
 /// [`new`](GpuClusterChain::new) to build the neighbor table and never
 /// needed again.
@@ -180,7 +180,7 @@ impl<const Q: usize> GpuClusterChain<Q> {
     /// # Panics
     ///
     /// Panics if `Q` is below two, if `start` is not a site field of this
-    /// lattice, or — through [`SwendsenWang::for_model`] — if the model's
+    /// lattice, or — through [`ClusterUpdate::swendsen_wang`] — if the model's
     /// symmetry-breaking term rules the cluster move out. Extents may be odd.
     pub fn new<const D: usize, M: BondAction<Q>>(
         gpu: Gpu,
@@ -212,7 +212,7 @@ impl<const Q: usize> GpuClusterChain<Q> {
         // The symmetry and coupling guards, and the probability formula, come
         // from the CPU updater rather than being restated here — a device path
         // that opened its bonds by a different rule would be the whole bug.
-        let p = SwendsenWang::for_model(model).bond_probability(beta);
+        let p = ClusterUpdate::swendsen_wang(model).bond_probability(beta);
 
         let device = &gpu.device;
         let n_sites = lattice.n_sites();
@@ -697,7 +697,7 @@ mod tests {
             use crate::chain::Chain;
             let mut rng = RandRng::seed_from_u64(11);
             let mut cfg = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
-            let updater = SwendsenWang::for_model(&model);
+            let updater = ClusterUpdate::swendsen_wang(&model);
             let mut chain = Chain::new(
                 &mut cfg,
                 &lat,

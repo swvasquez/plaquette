@@ -26,8 +26,8 @@ beta = 1.0        # inverse temperature; beta_c = ln(1 + sqrt(q)) ~ 1.0050 at q 
 # differences between entries matter, so the usual choice offsets one label and
 # leaves the rest at zero. The list must be exactly `const Q` long, and that is
 # checked when the run is built rather than when the file is parsed, since
-# nothing here says what Q is. An offset is refused by the cluster updaters
-# below, which need the label symmetry it breaks.
+# nothing here says what Q is. An offset is refused by the cluster rule
+# below, which needs the label symmetry it breaks.
 #
 # h = [0.1, 0.0, 0.0]
 
@@ -36,11 +36,13 @@ beta = 1.0        # inverse temperature; beta_c = ln(1 + sqrt(q)) ~ 1.0050 at q 
 # lattice size and the printed n_eff collapses, which is the critical slowing
 # down cluster algorithms exist to escape (see docs/swendsen-wang.md).
 #
-# The alternatives to "metropolis" are "site_checkerboard" and
-# "gpu_site_checkerboard", which are the same physics under a different schedule,
-# and the two cluster kinds "swendsen_wang" and "gpu_swendsen_wang", which are a
-# different move: they relabel whole clusters at once and are the thing to reach
-# for near beta_c. Swap the line below for
+# A run is named by three orthogonal fields: `updater` picks the rule
+# ("metropolis", "heat_bath", or "swendsen_wang"), `schedule` picks the walk
+# for the local rules ("random" when omitted, or "checkerboard"), and
+# `backend` picks where it runs ("cpu" when omitted, or "gpu", which needs the
+# checkerboard schedule and even extents). The cluster rule "swendsen_wang" is
+# a different move — it relabels whole clusters at once, takes no schedule,
+# and is the thing to reach for near beta_c. Swap the line below for
 #
 #     updater = "swendsen_wang"
 #

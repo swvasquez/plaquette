@@ -6,7 +6,6 @@
 //! The schemas stay separate types — one wide enough for both would carry a
 //! hole for whichever model is running.
 
-use crate::configuration::Cell;
 use serde::{Deserialize, Serialize};
 
 /// Check that a config's shape names `expected` axes, the dimension the driver
@@ -56,148 +55,100 @@ pub enum Start {
     Hot,
 }
 
-/// Which update algorithm a run uses to advance the chain — the *serializable
-/// choice of* an [`Updater`](crate::updater::Updater), not an updater itself.
+/// Which update rule advances the chain — the serializable choice of the
+/// *algorithm*, one third of the vocabulary a run is named in.
 ///
-/// The set is the union across models, not a promise that every model runs
-/// every entry: each schema's `validate` rejects the kinds that color the wrong
-/// grade, rather than each model carrying a separate, narrower enum.
+/// The other two thirds are [`ScheduleKind`] and [`BackendKind`], and the
+/// three fields are orthogonal, so a config file reads the way the physics is
+/// spoken: "heat bath under a checkerboard schedule on the GPU". Nothing here
+/// names a cell: whether a checkerboard colors sites or links follows from the
+/// model being run, so a config cannot pair a schedule with the wrong grade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UpdaterKind {
-    /// Single-variable-flip Metropolis on the CPU
-    /// ([`Metropolis`](crate::updater::Metropolis)).
+pub enum UpdaterRule {
+    /// Propose one alternative per variable and accept with `min(1, e^{-β ΔE})`
+    /// — [`Kernel::Metropolis`](crate::updater::Kernel::Metropolis) under the
+    /// run's schedule.
     Metropolis,
-    /// Single-variable heat bath on the CPU
-    /// ([`HeatBath`](crate::updater::HeatBath)).
-    ///
-    /// The same random-variable schedule as
-    /// [`Metropolis`](UpdaterKind::Metropolis), differing only in the kernel, so
-    /// it is grade-neutral for the same reason and every model can name it.
+    /// Price every state a variable could take and draw from the conditional
+    /// they define — [`Kernel::HeatBath`](crate::updater::Kernel::HeatBath)
+    /// under the run's schedule.
     HeatBath,
-    /// Metropolis under a site checkerboard schedule, on the CPU
-    /// ([`SiteCheckerboard`](crate::updater::SiteCheckerboard)).
-    SiteCheckerboard,
-    /// Metropolis under a link checkerboard schedule, on the CPU
-    /// ([`LinkCheckerboard`](crate::updater::LinkCheckerboard)).
-    LinkCheckerboard,
-    /// The heat bath under a site checkerboard schedule, on the CPU
-    /// ([`SiteCheckerboardHeatBath`](crate::updater::SiteCheckerboardHeatBath)).
+    /// The Swendsen–Wang cluster update — [`ClusterUpdate`](crate::updater::ClusterUpdate)
+    /// with [`Extent::All`](crate::updater::Extent::All) and
+    /// [`Relabel::Redraw`](crate::updater::Relabel::Redraw). Not a kernel under
+    /// a schedule, so a config naming it must leave `schedule` unset.
     ///
-    /// The sequential reference for
-    /// [`GpuSiteCheckerboardHeatBath`](UpdaterKind::GpuSiteCheckerboardHeatBath), which is why it is
-    /// nameable rather than being only a test fixture.
-    SiteCheckerboardHeatBath,
-    /// The heat bath under a link checkerboard schedule, on the CPU
-    /// ([`LinkCheckerboardHeatBath`](crate::updater::LinkCheckerboardHeatBath)),
-    /// the reference for [`GpuLinkCheckerboardHeatBath`](UpdaterKind::GpuLinkCheckerboardHeatBath).
-    LinkCheckerboardHeatBath,
-    /// The site checkerboard schedule run on the GPU
-    /// ([`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain)). Backend
-    /// and schedule are one variant, so a GPU run cannot be named without the
-    /// coloring its kernel is written for.
-    GpuSiteCheckerboard,
-    /// The link checkerboard schedule run on the GPU
-    /// ([`GpuGaugeChain`](crate::models::gauge::gpu::GpuGaugeChain)), fused for
-    /// the same reason as
-    /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard).
-    GpuLinkCheckerboard,
-    /// The site checkerboard schedule run on the GPU with the heat bath kernel
-    /// ([`Kernel::HeatBath`](crate::device::Kernel::HeatBath)).
-    ///
-    /// Its own variant rather than a kernel axis on
-    /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard), because this
-    /// enum is what a config file names and a flat closed set is what makes that
-    /// choice recordable. The coloring and its even-extent requirement are
-    /// identical; only the body of a thread differs. Its sequential reference is
-    /// [`SiteCheckerboardHeatBath`](UpdaterKind::SiteCheckerboardHeatBath).
-    GpuSiteCheckerboardHeatBath,
-    /// The link checkerboard schedule run on the GPU with the heat bath kernel,
-    /// the gauge counterpart of
-    /// [`GpuSiteCheckerboardHeatBath`](UpdaterKind::GpuSiteCheckerboardHeatBath).
-    GpuLinkCheckerboardHeatBath,
-    /// The Swendsen–Wang cluster update on the CPU
-    /// ([`SwendsenWang`](crate::updater::SwendsenWang)).
-    ///
-    /// It runs on any lattice shape, unlike the parallel kinds — see
-    /// [`colors_in_parallel`](UpdaterKind::colors_in_parallel) — and needs a
-    /// model whose energy is invariant under relabeling, which each schema
-    /// checks against its own field or offsets.
+    /// It runs on any lattice shape, on either backend (the device chain,
+    /// [`GpuClusterChain`](crate::gpu_cluster::GpuClusterChain), names no
+    /// model), and needs a model whose energy is invariant under relabeling —
+    /// which each schema checks against its own field or offsets, since what
+    /// breaks the symmetry is the model's business and not this enum's.
     SwendsenWang,
-    /// The Swendsen–Wang cluster update run on the GPU
-    /// ([`GpuClusterChain`](crate::gpu_cluster::GpuClusterChain)), fused for the
-    /// same reason as
-    /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard).
-    ///
-    /// Unlike the checkerboard kinds this one names no model. A cluster move is a
-    /// uniform redraw over the states whatever the states mean, so one device
-    /// chain serves every model implementing
-    /// [`BondAction`](crate::action::BondAction).
-    GpuSwendsenWang,
 }
 
-impl UpdaterKind {
-    /// Which lattice cell this kind's schedule colors, or `None` for a schedule
-    /// that reads a bare variable index and so works on either grade.
-    ///
-    /// The one fact behind both schemas' updater rule, stated here so a new
-    /// variant must answer it to compile rather than the two rules drifting.
-    pub fn cell(self) -> Option<Cell> {
+impl UpdaterRule {
+    /// Whether this rule builds clusters, and so needs a model whose energy is
+    /// invariant under relabeling. The load-time counterpart of the panic in
+    /// [`ClusterUpdate::new`](crate::updater::ClusterUpdate::new).
+    pub fn builds_clusters(self) -> bool {
+        matches!(self, UpdaterRule::SwendsenWang)
+    }
+
+    /// The kernel a local rule composes with, or `None` for the cluster
+    /// update. This is the whole config-to-updater mapping for the rule axis,
+    /// stated once so the samplers cannot drift from each other.
+    pub fn kernel(self) -> Option<crate::updater::Kernel> {
         match self {
-            UpdaterKind::Metropolis | UpdaterKind::HeatBath => None,
-            UpdaterKind::SiteCheckerboard
-            | UpdaterKind::SiteCheckerboardHeatBath
-            | UpdaterKind::GpuSiteCheckerboard
-            | UpdaterKind::GpuSiteCheckerboardHeatBath
-            | UpdaterKind::SwendsenWang
-            | UpdaterKind::GpuSwendsenWang => Some(Cell::Site),
-            UpdaterKind::LinkCheckerboard
-            | UpdaterKind::LinkCheckerboardHeatBath
-            | UpdaterKind::GpuLinkCheckerboard
-            | UpdaterKind::GpuLinkCheckerboardHeatBath => Some(Cell::Link),
+            UpdaterRule::Metropolis => Some(crate::updater::Kernel::Metropolis),
+            UpdaterRule::HeatBath => Some(crate::updater::Kernel::HeatBath),
+            UpdaterRule::SwendsenWang => None,
         }
     }
+}
 
-    /// Whether this kind builds clusters, and so needs a model whose energy is
-    /// invariant under relabeling.
-    ///
-    /// Asked by both site schemas, which then check their own symmetry-breaking
-    /// term — Ising's field, Potts's per-label offsets — since what breaks the
-    /// symmetry is the model's business and not this enum's. It is the load-time
-    /// counterpart of the panic in
-    /// [`SwendsenWang::for_model`](crate::updater::SwendsenWang::for_model).
-    pub fn builds_clusters(self) -> bool {
-        matches!(
-            self,
-            UpdaterKind::SwendsenWang | UpdaterKind::GpuSwendsenWang
-        )
-    }
+/// Which schedule a local rule runs under — the serializable choice of a
+/// [`Schedule`](crate::updater::Schedule).
+///
+/// In a config file the field is optional and means the random schedule when
+/// omitted; a run whose rule is [`UpdaterRule::SwendsenWang`] must leave it
+/// unset, since the cluster update has no schedule at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleKind {
+    /// `n_vars` uniformly random picks per sweep.
+    Random,
+    /// Every variable once, color by color — sites by parity, links by
+    /// direction and base parity, decided by the model's grade.
+    Checkerboard,
+}
 
-    /// Whether this kind colors in parallel, so its coloring must be
-    /// collision-free *simultaneously* and every extent has to be even.
-    ///
-    /// The requirement follows from the pass running concurrently, not from the
-    /// work happening on a device — a parallel CPU schedule would need it too.
-    /// Both schemas ask this in `validate` so an odd shape fails at load rather
-    /// than when the device chain is built; the device constructors assert it
-    /// again, since they are reachable without a config.
-    ///
-    /// This is `false` for [`GpuSwendsenWang`](UpdaterKind::GpuSwendsenWang),
-    /// which is the one answer here a reader is likely to expect the other way
-    /// round. What the even extents protect is a *coloring*: an odd extent wraps
-    /// two same-color neighbors together, so a color stops being independent. A
-    /// cluster update has no coloring — it labels a graph, and the graph is
-    /// whatever the bonds make of it — so a device cluster run is correct on any
-    /// shape.
-    pub fn colors_in_parallel(self) -> bool {
-        matches!(
-            self,
-            UpdaterKind::GpuSiteCheckerboard
-                | UpdaterKind::GpuLinkCheckerboard
-                | UpdaterKind::GpuSiteCheckerboardHeatBath
-                | UpdaterKind::GpuLinkCheckerboardHeatBath
-        )
+impl From<ScheduleKind> for crate::updater::Schedule {
+    fn from(kind: ScheduleKind) -> Self {
+        match kind {
+            ScheduleKind::Random => crate::updater::Schedule::Random,
+            ScheduleKind::Checkerboard => crate::updater::Schedule::Checkerboard,
+        }
     }
+}
+
+/// Where a run executes: sequentially on the CPU, or as parallel color passes
+/// (or the parallel cluster labeling) on the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    /// Sequential sweeps on the host — the default.
+    #[default]
+    Cpu,
+    /// Device sweeps via `wgpu`. A local rule needs the checkerboard schedule
+    /// here, since a random schedule has no colors to run in parallel.
+    Gpu,
+}
+
+/// The random-when-omitted reading of an optional `schedule` field, in one
+/// place so the schemas and samplers agree on it.
+pub fn effective_schedule(schedule: Option<ScheduleKind>) -> ScheduleKind {
+    schedule.unwrap_or(ScheduleKind::Random)
 }
 
 /// Check that `shape` describes a lattice this model can live on: at least
@@ -227,36 +178,44 @@ pub(crate) fn check_shape(
     Ok(())
 }
 
-/// Check that `updater` can advance a field on `cell` over a lattice of
-/// `shape`, or say what is wrong with the pairing.
+/// Check that the `(updater, schedule, backend)` triple names a runnable
+/// combination on a lattice of `shape`, or say what is wrong with it.
 ///
-/// The two rules both schemas apply, in one place. The grade: only a
-/// grade-neutral schedule or one coloring `cell` itself can run here — a
-/// mismatched schedule would be wrong physics, not slower physics. The shape: a
-/// parallel color pass needs every extent even, or an odd extent wraps a
-/// variable onto a same-color one and detailed balance breaks silently; see
-/// `docs/metropolis.md`. Sequential schedules have no such requirement, which
-/// is why the second rule asks about the updater and not the shape alone.
+/// The rules both schemas apply, in one place. A cluster rule takes no
+/// schedule, since it is not a kernel under one. A local rule on the GPU needs
+/// the checkerboard schedule — the device runs a sweep as parallel color
+/// passes, and a random schedule has no colors — and even extents, because an
+/// odd extent wraps a variable onto a same-color one, the coloring stops being
+/// collision-free, and detailed balance breaks silently; see
+/// `docs/metropolis.md`. Sequential (CPU) schedules carry no shape
+/// requirement, and neither does the cluster update on either backend: it
+/// labels a graph rather than coloring a lattice, so a device cluster run is
+/// correct on any shape.
 pub(crate) fn check_updater(
-    updater: UpdaterKind,
-    cell: Cell,
+    updater: UpdaterRule,
+    schedule: Option<ScheduleKind>,
+    backend: BackendKind,
     shape: &[usize],
 ) -> Result<(), ConfigError> {
-    if let Some(colored) = updater.cell()
-        && colored != cell
-    {
+    if updater.builds_clusters() && schedule.is_some() {
         return Err(ConfigError::Invalid(format!(
-            "this run updates {cell:?} variables, so it cannot use {updater:?}, \
-             which colors {colored:?} variables"
+            "{updater:?} builds clusters rather than walking variables, so it \
+             takes no schedule; remove the schedule field"
         )));
     }
-    if updater.colors_in_parallel()
-        && let Some(axis) = shape.iter().position(|l| !l.is_multiple_of(2))
-    {
-        return Err(ConfigError::Invalid(format!(
-            "{updater:?} colors in parallel, which needs even extents, \
-             but shape{shape:?} is odd on axis {axis}"
-        )));
+    if backend == BackendKind::Gpu && !updater.builds_clusters() {
+        if effective_schedule(schedule) != ScheduleKind::Checkerboard {
+            return Err(ConfigError::Invalid(format!(
+                "the gpu backend runs {updater:?} as parallel color passes, \
+                 which needs schedule = \"checkerboard\""
+            )));
+        }
+        if let Some(axis) = shape.iter().position(|l| !l.is_multiple_of(2)) {
+            return Err(ConfigError::Invalid(format!(
+                "the gpu checkerboard colors in parallel, which needs even \
+                 extents, but shape{shape:?} is odd on axis {axis}"
+            )));
+        }
     }
     Ok(())
 }

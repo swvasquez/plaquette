@@ -18,7 +18,7 @@
 //! cargo run --example checkerboard
 //! ```
 
-use plaquette::config::{Start, UpdaterKind};
+use plaquette::config::{BackendKind, ScheduleKind, Start, UpdaterRule};
 use plaquette::models::ising::run_config::IsingRunConfig;
 use plaquette::models::ising::{IsingSampler, Sample, measure};
 use plaquette::{Estimate, reduce};
@@ -60,7 +60,7 @@ fn row(label: &str, energy: &Estimate, abs_mag: &Estimate) {
 }
 
 fn main() {
-    // One physics point; the two runs differ only in the updater below. Both draw
+    // One physics point; the two runs differ only in the schedule below. Both draw
     // from the same seed — the schedules consume randomness differently, so the
     // sample streams are not identical, but the distributions they sample are.
     let base = IsingRunConfig {
@@ -68,7 +68,9 @@ fn main() {
         j: 1.0,
         h: 0.0,
         beta: 0.44, // beta_c = ln(1 + sqrt(2)) / 2 ~ 0.4407
-        updater: UpdaterKind::Metropolis,
+        updater: UpdaterRule::Metropolis,
+        schedule: None,
+        backend: BackendKind::Cpu,
         thermalize: 1000,
         sweeps_between: 5,
         n_samples: 2000,
@@ -77,12 +79,9 @@ fn main() {
         description: None,
     };
 
-    let metropolis = IsingRunConfig {
-        updater: UpdaterKind::Metropolis,
-        ..base.clone()
-    };
+    let metropolis = base.clone();
     let checkerboard = IsingRunConfig {
-        updater: UpdaterKind::SiteCheckerboard,
+        schedule: Some(ScheduleKind::Checkerboard),
         ..base.clone()
     };
 

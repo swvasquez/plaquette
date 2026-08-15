@@ -5,7 +5,8 @@ and for Ising: why a local update becomes useless near a continuous transition,
 how the Fortuin–Kasteleyn bond representation turns the spin model into a
 percolation problem, why the resulting move never has to be rejected, and which
 models the construction does not reach. The code it describes is
-`SwendsenWang` in `src/updater.rs`, the model-side seam `BondAction` in
+`ClusterUpdate` in `src/updater.rs` (Swendsen–Wang is the `Extent::All`,
+`Relabel::Redraw` composition), the model-side seam `BondAction` in
 `src/action.rs`, the labeling in `src/cluster.rs`, and the device backend in
 `src/models/potts/gpu_cluster.rs`. `docs/metropolis.md` is the companion piece
 for the local updates, and everything here assumes its account of detailed
@@ -168,7 +169,7 @@ degenerates to redrawing every site independently — which is correct, since th
 *is* the infinite-temperature model. An antiferromagnetic coupling does not: it
 would give a negative $p$, no bond would ever open, and the chain would sample
 the infinite-temperature model while reporting the coupling it was handed.
-`SwendsenWang::for_model` refuses it rather than letting that happen.
+`ClusterUpdate::new` refuses it rather than letting that happen.
 
 ## Redrawing rather than flipping
 
@@ -210,7 +211,7 @@ uniformly as before. It works, and it is not implemented here. Adding it would
 mean a second lattice geometry, a bond kind the neighbor table does not
 describe, and a cluster labeling over $N + 1$ vertices — a change to what a
 lattice *is*, made for a term no run in this crate currently uses in anger. So
-the crate refuses instead, at two places: `SwendsenWang::for_model` panics, and
+the crate refuses instead, at two places: `ClusterUpdate::new` panics, and
 each run config's `validate` reports it as a load-time error. That pairing — a
 graceful message on the path a config file takes and a backstop panic for a
 caller who skipped it — is the one `check_dimension` and `shape_array` already

@@ -89,6 +89,23 @@ from a long enough run look like independent draws from the Boltzmann
 distribution, and averaging an observable over them estimates its Boltzmann
 average.
 
+## Kernels, schedules, models, backends
+
+Before the checkerboard sections, it is worth naming the factoring the code is
+built around, because the derivations below slot into it. A *kernel* is what
+happens at one variable once it has been chosen — the propose-and-accept rule
+above, or the heat bath of `docs/heat-bath.md` — and it talks to the *model*
+only through the price of a move, `Action::energy_delta` on the CPU and a WGSL
+`energy_delta` on the GPU, receiving a bare variable index either way. A
+*schedule* is which variables are chosen in what order — uniformly at random,
+or the checkerboards below — and it talks only to the lattice. A *backend* is
+where the composition runs: sequentially on the CPU, where any order is valid,
+or as parallel color passes on the GPU, where the checkerboard's independence
+argument is load-bearing. `LocalUpdate` in `src/updater.rs` is the CPU
+composition and `device::assemble_shader` the GPU one; the correctness
+arguments in this file attach to the schedule and kernel separately, which is
+why they hold for every model that meets the seam.
+
 ## Checkerboard on sites
 
 The sampling above runs its moves in sequence, each seeing what the last one left,
@@ -128,8 +145,8 @@ is that the interaction is nearest-neighbor and that the lattice is bipartite, s
 that a two-coloring exists in which no site interacts with another of its own
 color; the acceptance step then leaves $P$ invariant whatever a single move does
 to one site. The schedule therefore carries from Ising to the $q$-state Potts
-model unchanged, and `SiteCheckerboard` implements it once for any $q$ rather
-than once per model. What does generalize is the *proposal*. At two states the
+model unchanged, and the checkerboard `Schedule` of `LocalUpdate` implements
+it once for any $q$ rather than once per model. What does generalize is the *proposal*. At two states the
 alternative is determined and the move is a flip; at $q$ states there are $q-1$
 alternatives, so the proposal draws one uniformly among them. That keeps it
 symmetric — every other label is offered with probability $1/(q-1)$ from any

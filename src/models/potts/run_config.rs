@@ -12,7 +12,7 @@
 //! generalization.
 //!
 //! What the schemas share is the vocabulary in [`config`](crate::config) —
-//! [`Start`], [`UpdaterKind`], [`ConfigError`] — so the driver fields, the
+//! [`Start`], [`UpdaterRule`], [`ConfigError`] — so the driver fields, the
 //! reproducibility fields, and the load/parse/validate/round-trip contract are
 //! written and read the same way across all three models.
 //!
@@ -20,7 +20,7 @@
 //!
 //! Both are const generics, resolved when the program is compiled, and a config
 //! file is read when it runs. The action and the updaters stay generic over both
-//! — nothing in [`Potts`] or in [`SiteCheckerboard`](crate::updater::SiteCheckerboard)
+//! — nothing in [`Potts`] or in the checkerboard schedule
 //! names a state count or a dimension — but a *driver* has to pick one pair to
 //! build, because the lattice's dimension and the configuration's state count are
 //! part of their types. So the driver names them in its own source, the way
@@ -34,7 +34,8 @@
 //! naming here rather than leaving loose in the example.
 
 use crate::config::{
-    ConfigError, Start, UpdaterKind, check_dimension, check_shape, check_updater, shape_array,
+    BackendKind, ConfigError, ScheduleKind, Start, UpdaterRule, check_dimension, check_shape,
+    check_updater, shape_array,
 };
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
@@ -114,13 +115,21 @@ pub struct PottsRunConfig {
     pub beta: f64,
 
     // --- driver controls ---
-    /// Which update algorithm advances the chain; defaults to
-    /// [`UpdaterKind::Metropolis`], and [`validate`](PottsRunConfig::validate)
-    /// rejects the link schedules. A run parameter rather than a caller's
+    /// Which update rule advances the chain; defaults to
+    /// [`UpdaterRule::Metropolis`]. A run parameter rather than a caller's
     /// choice, because two runs of the same physics under different algorithms
     /// are different runs.
     #[serde(default = "default_updater")]
-    pub updater: UpdaterKind,
+    pub updater: UpdaterRule,
+    /// Which schedule a local rule runs under; omitted means the random
+    /// schedule. Must stay unset for [`UpdaterRule::SwendsenWang`], which has
+    /// no schedule at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleKind>,
+    /// Where the run executes; defaults to the CPU. A local rule on the GPU
+    /// needs `schedule = "checkerboard"` and even extents.
+    #[serde(default)]
+    pub backend: BackendKind,
     /// Warmup sweeps run and discarded before any sample.
     pub thermalize: usize,
     /// Decorrelation sweeps between recorded samples.
@@ -151,8 +160,8 @@ fn default_start() -> Start {
     Start::Cold
 }
 
-fn default_updater() -> UpdaterKind {
-    UpdaterKind::Metropolis
+fn default_updater() -> UpdaterRule {
+    UpdaterRule::Metropolis
 }
 
 impl PottsRunConfig {
@@ -202,7 +211,7 @@ impl PottsRunConfig {
     ///
     /// A cluster schedule carries a rule of its own: it needs the label symmetry,
     /// so a non-zero `h` is refused. That is the graceful counterpart of the
-    /// panic in [`SwendsenWang::for_model`](crate::updater::SwendsenWang::for_model),
+    /// panic in [`ClusterUpdate::new`](crate::updater::ClusterUpdate::new),
     /// the same pairing [`check_dimension`](PottsRunConfig::check_dimension) and
     /// `shape_array` already use.
     ///
@@ -231,8 +240,8 @@ impl PottsRunConfig {
                 self.h[label]
             )));
         }
-        check_updater(self.updater, Cell::Site, &self.shape)?;
-        // The load-time counterpart of `SwendsenWang::for_model`'s panic. A
+        check_updater(self.updater, self.schedule, self.backend, &self.shape)?;
+        // The load-time counterpart of `ClusterUpdate::new`'s panic. A
         // cluster move relabels a whole cluster at once, which is only
         // weight-preserving when nothing distinguishes one label from another,
         // and an offset is exactly what distinguishes them.
@@ -333,7 +342,9 @@ mod tests {
             j: 1.0,
             h: Vec::new(),
             beta: 1.0,
-            updater: UpdaterKind::Metropolis,
+            updater: UpdaterRule::Metropolis,
+            schedule: None,
+            backend: BackendKind::Cpu,
             thermalize: 1000,
             sweeps_between: 10,
             n_samples: 500,
@@ -367,7 +378,7 @@ mod tests {
             shape = [24, 24]
             j = 1.0
             beta = 1.005
-            updater = "site_checkerboard"
+            schedule = "checkerboard"
             thermalize = 2000
             sweeps_between = 20
             n_samples = 1000
@@ -384,7 +395,7 @@ mod tests {
         assert_eq!(config.n_samples, 1000);
         assert_eq!(config.seed, 12345);
         assert_eq!(config.start, Start::Hot);
-        assert_eq!(config.updater, UpdaterKind::SiteCheckerboard);
+        assert_eq!(config.schedule, Some(ScheduleKind::Checkerboard));
         assert_eq!(config.description.as_deref(), Some("q = 3 near beta_c"));
     }
 
@@ -421,7 +432,7 @@ mod tests {
         "#;
         let config = PottsRunConfig::parse(text).unwrap();
         assert_eq!(config.start, Start::Cold);
-        assert_eq!(config.updater, UpdaterKind::Metropolis);
+        assert_eq!(config.updater, UpdaterRule::Metropolis);
         assert_eq!(config.description, None);
     }
 
@@ -463,54 +474,86 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_the_link_updaters() {
-        // The same rule the Ising schema applies, for the same reason: both link
-        // schedules color links, so neither says anything about a field of
-        // labels living on sites.
-        for kind in [
-            UpdaterKind::LinkCheckerboard,
-            UpdaterKind::GpuLinkCheckerboard,
-            UpdaterKind::GpuLinkCheckerboardHeatBath,
-        ] {
-            let mut config = sample_config();
-            config.updater = kind;
-            let message = invalid_message(&config);
-            assert!(message.contains("updates Site variables"), "{message}");
-            assert!(message.contains("colors Link variables"), "{message}");
-            assert!(message.contains(&format!("{kind:?}")), "{message}");
-        }
+    fn validate_rejects_a_random_schedule_on_the_gpu() {
+        // The same rule the Ising schema applies, for the same reason: the
+        // device runs a local sweep as parallel color passes, and a random
+        // schedule has no colors.
+        let mut config = sample_config();
+        config.backend = BackendKind::Gpu;
+        let message = invalid_message(&config);
+        assert!(message.contains("checkerboard"), "{message}");
     }
 
     #[test]
-    fn parses_and_round_trips_the_site_updaters() {
-        // The other half of the same rule: all three site-compatible schedules
-        // are accepted, so they survive validation on the way through TOML and
-        // back.
-        for (kind, rendered) in [
-            (UpdaterKind::Metropolis, "metropolis"),
-            (UpdaterKind::HeatBath, "heat_bath"),
-            (UpdaterKind::SiteCheckerboard, "site_checkerboard"),
+    fn validate_rejects_a_schedule_on_the_cluster_rule() {
+        // The cluster update is not a kernel under a schedule, so naming one
+        // alongside it is a contradiction rather than a preference.
+        let mut config = sample_config();
+        config.updater = UpdaterRule::SwendsenWang;
+        config.schedule = Some(ScheduleKind::Checkerboard);
+        let message = invalid_message(&config);
+        assert!(message.contains("takes no schedule"), "{message}");
+    }
+
+    #[test]
+    fn parses_and_round_trips_the_composed_updaters() {
+        // Every runnable (rule, schedule, backend) triple survives validation
+        // on the way through TOML and back, rendered under the composed names.
+        for (rule, rendered, schedule, backend) in [
             (
-                UpdaterKind::SiteCheckerboardHeatBath,
-                "site_checkerboard_heat_bath",
+                UpdaterRule::Metropolis,
+                "metropolis",
+                None,
+                BackendKind::Cpu,
             ),
-            (UpdaterKind::GpuSiteCheckerboard, "gpu_site_checkerboard"),
+            (UpdaterRule::HeatBath, "heat_bath", None, BackendKind::Cpu),
             (
-                UpdaterKind::GpuSiteCheckerboardHeatBath,
-                "gpu_site_checkerboard_heat_bath",
+                UpdaterRule::Metropolis,
+                "metropolis",
+                Some(ScheduleKind::Checkerboard),
+                BackendKind::Cpu,
             ),
-            (UpdaterKind::SwendsenWang, "swendsen_wang"),
-            (UpdaterKind::GpuSwendsenWang, "gpu_swendsen_wang"),
+            (
+                UpdaterRule::HeatBath,
+                "heat_bath",
+                Some(ScheduleKind::Checkerboard),
+                BackendKind::Gpu,
+            ),
+            (
+                UpdaterRule::Metropolis,
+                "metropolis",
+                Some(ScheduleKind::Checkerboard),
+                BackendKind::Gpu,
+            ),
+            (
+                UpdaterRule::SwendsenWang,
+                "swendsen_wang",
+                None,
+                BackendKind::Cpu,
+            ),
+            (
+                UpdaterRule::SwendsenWang,
+                "swendsen_wang",
+                None,
+                BackendKind::Gpu,
+            ),
         ] {
             let mut config = sample_config();
-            config.updater = kind;
+            config.updater = rule;
+            config.schedule = schedule;
+            config.backend = backend;
 
             let text = config.to_toml().unwrap();
             assert!(
                 text.contains(&format!(r#"updater = "{rendered}""#)),
                 "{text}"
             );
-            assert_eq!(PottsRunConfig::parse(&text).unwrap().updater, kind);
+            let parsed = PottsRunConfig::parse(&text).unwrap();
+            assert_eq!(parsed, config);
+            assert!(
+                parsed.validate().is_ok(),
+                "{rule:?} / {schedule:?} / {backend:?}"
+            );
         }
     }
 
@@ -521,13 +564,14 @@ mod tests {
         // chain is built. The CPU schedules are unaffected — run in sequence,
         // any site order is a valid Metropolis schedule.
         let mut config = sample_config();
-        config.updater = UpdaterKind::GpuSiteCheckerboard;
+        config.schedule = Some(ScheduleKind::Checkerboard);
+        config.backend = BackendKind::Gpu;
         config.shape = vec![16, 15];
         let message = invalid_message(&config);
         assert!(message.contains("even extents"), "{message}");
         assert!(message.contains("axis 1"), "{message}");
 
-        config.updater = UpdaterKind::SiteCheckerboard;
+        config.backend = BackendKind::Cpu;
         assert!(
             config.validate().is_ok(),
             "an odd extent is fine on the CPU"
@@ -536,43 +580,46 @@ mod tests {
 
     #[test]
     fn validate_rejects_a_cluster_updater_with_offsets() {
-        // The load-time half of the pair `SwendsenWang::for_model` panics on: a
+        // The load-time half of the pair `ClusterUpdate::new` panics on: a
         // per-label offset is exactly what makes relabeling a whole cluster
         // change the energy, so the move would sample the wrong distribution
         // rather than fail.
-        for kind in [UpdaterKind::SwendsenWang, UpdaterKind::GpuSwendsenWang] {
+        for backend in [BackendKind::Cpu, BackendKind::Gpu] {
             let mut config = sample_config();
-            config.updater = kind;
+            config.updater = UpdaterRule::SwendsenWang;
+            config.backend = backend;
             config.h = vec![0.1, 0.0, 0.0];
             let message = invalid_message(&config);
             assert!(message.contains("label symmetry"), "{message}");
-            assert!(message.contains(&format!("{kind:?}")), "{message}");
 
             // Absent and all-zero both mean the symmetric model, and both run.
             config.h = Vec::new();
-            assert!(config.validate().is_ok(), "{kind:?} with no offsets");
+            assert!(config.validate().is_ok(), "{backend:?} with no offsets");
             config.h = vec![0.0, 0.0, 0.0];
-            assert!(config.validate().is_ok(), "{kind:?} with zero offsets");
+            assert!(config.validate().is_ok(), "{backend:?} with zero offsets");
         }
     }
 
     #[test]
     fn a_cluster_updater_accepts_odd_extents_even_on_the_gpu() {
-        // The one place a reader is likely to expect `GpuSwendsenWang` to behave
-        // like `GpuSiteCheckerboard` and be wrong. The even-extent rule exists
-        // because an odd wrap puts two same-color neighbors in one parallel
-        // pass; a cluster update has no coloring to break, so any shape runs.
-        for kind in [UpdaterKind::SwendsenWang, UpdaterKind::GpuSwendsenWang] {
+        // The one place a reader is likely to expect the gpu cluster run to
+        // behave like the gpu checkerboard and be wrong. The even-extent rule
+        // exists because an odd wrap puts two same-color neighbors in one
+        // parallel pass; a cluster update has no coloring to break, so any
+        // shape runs.
+        for backend in [BackendKind::Cpu, BackendKind::Gpu] {
             let mut config = sample_config();
-            config.updater = kind;
+            config.updater = UpdaterRule::SwendsenWang;
+            config.backend = backend;
             config.shape = vec![15, 15, 7];
-            assert!(config.validate().is_ok(), "{kind:?} on an odd lattice");
+            assert!(config.validate().is_ok(), "{backend:?} on an odd lattice");
         }
 
         // The contrast, so this test would notice if the rule leaked the other
         // way and stopped applying to the coloring that does need it.
         let mut checkerboard = sample_config();
-        checkerboard.updater = UpdaterKind::GpuSiteCheckerboard;
+        checkerboard.schedule = Some(ScheduleKind::Checkerboard);
+        checkerboard.backend = BackendKind::Gpu;
         checkerboard.shape = vec![15, 15, 7];
         assert!(invalid_message(&checkerboard).contains("even extents"));
     }
@@ -580,12 +627,13 @@ mod tests {
     #[test]
     fn parse_rejects_an_invalid_config() {
         // Validation runs as part of parsing, so a bad file fails at load time —
-        // including the updater rule, which a parse alone would let through.
+        // including an unrunnable triple, which a parse alone would let through.
         let text = r#"
             shape = [8, 8]
             j = 1.0
             beta = 1.0
-            updater = "link_checkerboard"
+            updater = "metropolis"
+            backend = "gpu"
             thermalize = 10
             sweeps_between = 1
             n_samples = 10

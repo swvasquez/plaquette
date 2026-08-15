@@ -2,7 +2,7 @@
 #
 #     cargo run --release --example ising -- examples/ising/gpu.toml
 #
-# Same interface as the CPU runs — only `updater` changes. A larger lattice than
+# Same interface as the CPU runs — only `backend` changes. A larger lattice than
 # the CPU examples, since the GPU pays off at scale (crossover is near L = 64).
 # Needs a GPU adapter; run with the sandbox disabled.
 
@@ -11,7 +11,9 @@ j = 1.0
 h = 0.0
 beta = 0.44
 
-updater = "gpu_site_checkerboard"
+updater = "metropolis"
+schedule = "checkerboard"
+backend = "gpu"
 thermalize = 500
 sweeps_between = 5
 n_samples = 1000

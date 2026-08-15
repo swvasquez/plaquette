@@ -3,7 +3,7 @@
 The heat bath update is the second single-variable kernel, beside the
 Metropolis move derived in `docs/metropolis.md`. This file states the update as
 the definite procedure the code implements — `heat_bath_step` in
-`src/updater.rs` and the `heatbath.wgsl` kernels under `src/models/` — with the
+`src/updater.rs` and the `heat_bath.wgsl` kernel fragment under `src/wgsl/` — with the
 single-variable step and the parallel checkerboard sweep both given in full,
 and comparisons, cost accounting, and limits gathered at the end as context.
 
@@ -52,19 +52,20 @@ exponentiating.** A strongly downhill candidate at large $\beta$ makes
 $e^{-\beta\,\Delta E}$ overflow while the current state sits at weight one.
 Subtracting the minimum shifts the largest exponent to zero and cancels in the
 normalization, so it changes nothing mathematically and everything numerically.
-(At $Q = 2$ the two-state ratio can be rearranged so both limits saturate
-safely — the Ising and gauge GPU kernels do this — but the general kernel
-always subtracts the minimum.)
+(At $Q = 2$ the two-state ratio could be rearranged so both limits saturate
+safely, but every kernel here — CPU and GPU alike — subtracts the minimum,
+so the two-state models run the same arithmetic the general case does.)
 
 ## Schedules
 
 The kernel does not care in what order variables are visited: any sequential
 order is valid on any lattice, and it composes with the same schedules
-`docs/metropolis.md` derives. On the CPU the crate runs it on the
-random-variable schedule — `HeatBath` in `src/updater.rs`, deliberately the
-same schedule `Metropolis` walks, so the two differ in the kernel and in
-nothing else. The checkerboard schedules are how the GPU backends run it: the
-`GpuSiteCheckerboardHeatBath` and `GpuLinkCheckerboardHeatBath` config kinds select the coloring the
+`docs/metropolis.md` derives. That composition is literal in the code: a
+`LocalUpdate` in `src/updater.rs` pairs `Kernel::HeatBath` with either
+schedule, so the heat bath under the random schedule differs from Metropolis
+in the kernel and in nothing else, and the checkerboard schedule is how the
+GPU runs it — a config naming `updater = "heat_bath"` with
+`schedule = "checkerboard"` and `backend = "gpu"` selects the coloring the
 Metropolis chains already use with the heat bath kernel in its place.
 
 **HB3 — a parallel pass may only update mutually non-interacting variables.**
@@ -120,7 +121,7 @@ is why the CPU random-variable schedule runs on any lattice.
 
 **HB5 — the pass randomness is counter-based, keyed on
 `(seed, variable, sweep)`.** Each thread's uniform comes from `keyed_uniform`
-in `src/checkerboard_prelude.wgsl` rather than from a stream, so a sweep's
+in `src/wgsl/rng.wgsl` rather than from a stream, so a sweep's
 result does not depend on the order threads happen to run in. Every pass of a
 sweep shares the one sweep counter, which is safe because the passes' variable
 sets are disjoint — no key is ever used twice. The heat bath makes the budget

@@ -7,7 +7,7 @@
 //! [`Chain`] yields pre-equilibrium states, an `IsingSampler` has already
 //! thermalized before it gives you anything.
 //!
-//! It also owns the **backend choice**. The run's [`UpdaterKind`] selects between
+//! It also owns the **backend choice**. The run's [`BackendKind`] selects between
 //! the CPU chain and the GPU chain, and `IsingSampler` holds whichever one the
 //! config asked for. [`samples`](IsingSampler::samples) returns an [`AnyIsingChain`]
 //! over it — a thin front that yields [`Configuration`]s the same way regardless
@@ -22,27 +22,25 @@
 //! Geometry for measurement comes off the *sampler*, not the chain:
 //! [`lattice`](IsingSampler::lattice) and [`model`](IsingSampler::model) hand
 //! back owned copies, so a consumer reads them once and then streams. (The CPU
-//! `Chain` exposes its own borrowed accessors, but a `GpuIsingChain` owns its geometry and
+//! `Chain` exposes its own borrowed accessors, but a `GpuChain` owns its geometry and
 //! cannot lend it past a by-value consume, so the uniform seam puts them here.)
 
 use crate::chain::Chain;
-use crate::config::UpdaterKind;
+use crate::config::{BackendKind, UpdaterRule, effective_schedule};
 use crate::configuration::Configuration;
-use crate::device::{GPU_BATCH, Gpu, Kernel};
+use crate::device::{GPU_BATCH, Gpu, GpuChain};
 use crate::gpu_cluster::GpuClusterChain;
 use crate::lattice::Lattice;
 use crate::models::ising::Ising;
-use crate::models::ising::gpu::GpuIsingChain;
+use crate::models::ising::gpu::gpu_chain;
 use crate::models::ising::run_config::IsingRunConfig;
 use crate::rng::RandRng;
-use crate::updater::{
-    AnyUpdater, HeatBath, Metropolis, SiteCheckerboard, SiteCheckerboardHeatBath, SwendsenWang,
-};
+use crate::updater::{AnyUpdater, ClusterUpdate, LocalUpdate};
 
 /// The evolving state an [`IsingSampler`] streams from, one variant per backend.
 ///
 /// The CPU variant holds the loose pieces a transient [`Chain`] borrows each call;
-/// the GPU variant owns a persistent [`GpuIsingChain`]. This is where the two
+/// the GPU variant owns a persistent [`GpuChain`]. This is where the two
 /// backends' opposite ownership models are reconciled behind one type.
 enum Engine {
     Cpu {
@@ -53,7 +51,7 @@ enum Engine {
     },
     /// Boxed because the device chain is far larger than the CPU variant, and an
     /// enum is sized by its largest one.
-    Gpu(Box<GpuIsingChain>),
+    Gpu(Box<GpuChain<2>>),
     /// The device cluster chain, boxed for the same reason. A separate variant
     /// rather than a mode of `Gpu`, because the two device backends are separate
     /// types — one drives a fixed number of dispatches per sweep and the other
@@ -69,17 +67,17 @@ enum Engine {
 /// Both variants yield the same item, so a consumer bounds it with `.take(n)` and
 /// measures each config without knowing which backend produced it. The CPU
 /// variant is a transient [`Chain`] borrowing the sampler; the GPU variant a
-/// mutable borrow of the sampler's persistent [`GpuIsingChain`].
+/// mutable borrow of the sampler's persistent [`GpuChain`].
 ///
 /// Only the CPU variant carries the dimension. The device chain reads the
 /// lattice once when it is built and keeps buffers afterwards, so `D` never
-/// reaches [`GpuIsingChain`]'s type — the parameter here is the borrowed
+/// reaches [`GpuChain`]'s type — the parameter here is the borrowed
 /// [`Chain`]'s alone.
 pub enum AnyIsingChain<'a, const D: usize> {
     /// A transient chain borrowing the sampler's state for the length of the run.
     Cpu(Chain<'a, 2, D, Ising, AnyUpdater, RandRng>),
     /// A mutable borrow of the sampler's persistent device chain.
-    Gpu(&'a mut GpuIsingChain),
+    Gpu(&'a mut GpuChain<2>),
     /// A mutable borrow of the sampler's persistent device *cluster* chain.
     GpuCluster(&'a mut GpuClusterChain<2>),
 }
@@ -101,7 +99,7 @@ impl<const D: usize> Iterator for AnyIsingChain<'_, D> {
 ///
 /// Fixed at `Q = 2` and generic over the dimension, which a driver names in its
 /// own source and the config's shape must agree with. The backend is chosen from the config's
-/// [`UpdaterKind`] and held in a private per-backend `Engine`, so neither the
+/// [`BackendKind`] and held in a private per-backend `Engine`, so neither the
 /// CPU nor the GPU type leaks into the streaming interface.
 pub struct IsingSampler<const D: usize> {
     lattice: Lattice<D>,
@@ -133,19 +131,13 @@ impl<const D: usize> IsingSampler<D> {
         let (lattice, model, mut rng, mut state, beta) = config.build::<D>();
         let sweeps_between = config.sweeps_between;
 
-        // A `match` over the device kinds rather than a chain of `if let`s: there
-        // are two of them now, and they build different types.
-        let engine = match config.updater {
-            // The two device checkerboard kinds share everything but the kernel
-            // a thread runs, so they share an arm rather than repeating the
-            // construction.
-            kind
-            @ (UpdaterKind::GpuSiteCheckerboard | UpdaterKind::GpuSiteCheckerboardHeatBath) => {
-                let kernel = match kind {
-                    UpdaterKind::GpuSiteCheckerboardHeatBath => Kernel::HeatBath,
-                    _ => Kernel::Metropolis,
-                };
-                let mut chain = GpuIsingChain::new(
+        // A `match` over `(backend, rule)`: the schedule never picks the
+        // engine — on the GPU it is pinned to the checkerboard by `validate`,
+        // and on the CPU it is a parameter of the one `LocalUpdate`.
+        let engine = match (config.backend, config.updater) {
+            (BackendKind::Gpu, rule @ (UpdaterRule::Metropolis | UpdaterRule::HeatBath)) => {
+                let kernel = rule.kernel().expect("a local rule has a kernel");
+                let mut chain = gpu_chain(
                     require_adapter(),
                     &lattice,
                     config.j,
@@ -160,7 +152,7 @@ impl<const D: usize> IsingSampler<D> {
                 chain.advance(config.thermalize);
                 Engine::Gpu(Box::new(chain))
             }
-            UpdaterKind::GpuSwendsenWang => {
+            (BackendKind::Gpu, UpdaterRule::SwendsenWang) => {
                 let mut chain = GpuClusterChain::new(
                     require_adapter(),
                     &lattice,
@@ -173,18 +165,13 @@ impl<const D: usize> IsingSampler<D> {
                 chain.advance(config.thermalize);
                 Engine::GpuCluster(Box::new(chain))
             }
-            on_cpu => {
-                let updater = match on_cpu {
-                    UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
-                    UpdaterKind::HeatBath => AnyUpdater::HeatBath(HeatBath),
-                    UpdaterKind::SiteCheckerboard => AnyUpdater::SiteCheckerboard(SiteCheckerboard),
-                    UpdaterKind::SiteCheckerboardHeatBath => {
-                        AnyUpdater::SiteCheckerboardHeatBath(SiteCheckerboardHeatBath)
-                    }
-                    UpdaterKind::SwendsenWang => {
-                        AnyUpdater::SwendsenWang(SwendsenWang::for_model(&model))
-                    }
-                    other => unreachable!("rejected by IsingRunConfig::validate: {other:?}"),
+            (BackendKind::Cpu, rule) => {
+                let updater = match rule.kernel() {
+                    Some(kernel) => AnyUpdater::Local(LocalUpdate::new(
+                        kernel,
+                        effective_schedule(config.schedule).into(),
+                    )),
+                    None => AnyUpdater::Cluster(ClusterUpdate::swendsen_wang(&model)),
                 };
                 // Warm up a transient chain over the loose pieces, then stow them.
                 Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
@@ -274,7 +261,7 @@ fn require_adapter() -> Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Start;
+    use crate::config::{ScheduleKind, Start};
     use crate::models::ising::measure;
 
     fn config() -> IsingRunConfig {
@@ -283,7 +270,9 @@ mod tests {
             j: 1.0,
             h: 0.0,
             beta: 0.44,
-            updater: UpdaterKind::Metropolis,
+            updater: UpdaterRule::Metropolis,
+            schedule: None,
+            backend: BackendKind::Cpu,
             thermalize: 50,
             sweeps_between: 2,
             n_samples: 10,
@@ -303,12 +292,12 @@ mod tests {
         assert!(configs.iter().all(|c| c.n_vars() == 64));
     }
 
-    /// A checkerboard-configured run streams too: the `UpdaterKind` from the
+    /// A checkerboard-configured run streams too: the schedule field from the
     /// config selects the CPU checkerboard, driven like any other updater.
     #[test]
-    fn streams_with_the_checkerboard_updater() {
+    fn streams_with_the_checkerboard_schedule() {
         let mut run = config();
-        run.updater = UpdaterKind::SiteCheckerboard;
+        run.schedule = Some(ScheduleKind::Checkerboard);
 
         let mut sampler = IsingSampler::<2>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
@@ -323,7 +312,7 @@ mod tests {
     #[test]
     fn streams_with_the_cluster_updater() {
         let mut run = config();
-        run.updater = UpdaterKind::SwendsenWang;
+        run.updater = UpdaterRule::SwendsenWang;
 
         let mut sampler = IsingSampler::<2>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
@@ -344,7 +333,8 @@ mod tests {
             return;
         }
         let mut run = config();
-        run.updater = UpdaterKind::GpuSwendsenWang;
+        run.updater = UpdaterRule::SwendsenWang;
+        run.backend = BackendKind::Gpu;
         run.shape = vec![9, 7];
 
         let mut sampler = IsingSampler::<2>::new(&run);
@@ -357,12 +347,13 @@ mod tests {
     /// A GPU-configured run streams through the same interface. Skips when no GPU
     /// adapter is available, so the suite stays green on a headless runner.
     #[test]
-    fn streams_with_the_gpu_checkerboard() {
+    fn streams_with_the_gpu_backend() {
         if crate::device::require_gpu().is_none() {
             return;
         }
         let mut run = config();
-        run.updater = UpdaterKind::GpuSiteCheckerboard;
+        run.schedule = Some(ScheduleKind::Checkerboard);
+        run.backend = BackendKind::Gpu;
 
         let mut sampler = IsingSampler::<2>::new(&run);
         let configs: Vec<_> = sampler.samples().take(5).collect();
@@ -400,7 +391,7 @@ mod tests {
     fn matches_a_hand_driven_chain() {
         let run = config();
         let (lattice, model, mut rng, mut state, beta) = run.build::<2>();
-        let updater = Metropolis;
+        let updater = LocalUpdate::default();
         Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
             .advance(run.thermalize);
         let expected: Vec<_> = Chain::new(

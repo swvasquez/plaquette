@@ -1,13 +1,14 @@
-// Shared preamble for every checkerboard kernel: the state encoding and the
-// counter-based random source.
+// The shared device randomness and thread-indexing functions, used by every
+// assembled local-update shader and by the cluster kernels alike. Pure
+// functions only — no bindings and no overrides — so any shader family can
+// prepend this without declaration clashes.
 //
-// Prepended to each model's shader at build time (see `device::shader_source`),
-// because WGSL has no include and these must stay byte-identical across
-// backends. The CPU-versus-GPU tests are distributional, so a hash that drifted
-// in one kernel alone would bias it without obviously failing.
+// The RNG must stay byte-identical across backends and kernels: the
+// CPU-versus-GPU tests are distributional, so a hash that drifted in one
+// kernel alone would bias it without obviously failing.
 
-// Threads per workgroup, matching the `@workgroup_size(64)` both kernels declare
-// and the `WORKGROUP_SIZE` the host dispatches with.
+// Threads per workgroup, matching the `@workgroup_size(64)` the entry points
+// declare and the `WORKGROUP_SIZE` the host dispatches with.
 const WORKGROUP_SIZE: u32 = 64u;
 
 // The variable a thread owns, from a dispatch grid that may be two-dimensional.

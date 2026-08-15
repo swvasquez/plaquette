@@ -57,6 +57,31 @@ fn beta_c(q: usize) -> f64 {
     (1.0 + (q as f64).sqrt()).ln()
 }
 
+/// The `updater`/`schedule`/`backend` lines for a shorthand name, so a test
+/// names a run the way its report labels it while the file speaks the composed
+/// config vocabulary.
+fn driver_lines(name: &str) -> String {
+    let (rule, schedule, backend) = match name {
+        "metropolis" => ("metropolis", None, None),
+        "heat_bath" => ("heat_bath", None, None),
+        "checkerboard" => ("metropolis", Some("checkerboard"), None),
+        "checkerboard_heat_bath" => ("heat_bath", Some("checkerboard"), None),
+        "gpu_checkerboard" => ("metropolis", Some("checkerboard"), Some("gpu")),
+        "gpu_checkerboard_heat_bath" => ("heat_bath", Some("checkerboard"), Some("gpu")),
+        "swendsen_wang" => ("swendsen_wang", None, None),
+        "gpu_swendsen_wang" => ("swendsen_wang", None, Some("gpu")),
+        other => panic!("unknown updater shorthand {other}"),
+    };
+    let mut lines = format!("updater = \"{rule}\"\n");
+    if let Some(schedule) = schedule {
+        lines.push_str(&format!("schedule = \"{schedule}\"\n"));
+    }
+    if let Some(backend) = backend {
+        lines.push_str(&format!("backend = \"{backend}\"\n"));
+    }
+    lines
+}
+
 /// The run parameters the *comparison* tests hold fixed, as TOML.
 ///
 /// One builder for all of them, so a decorrelation stride or a start that
@@ -81,12 +106,13 @@ fn run_toml<const D: usize>(
         "shape = {shape:?}\n\
          j = {j}\n\
          beta = {beta}\n\
-         updater = \"{updater}\"\n\
+         {driver}\
          thermalize = 500\n\
          sweeps_between = 3\n\
          n_samples = {N_SAMPLES}\n\
          seed = {seed}\n\
-         start = \"hot\"\n"
+         start = \"hot\"\n",
+        driver = driver_lines(updater),
     )
 }
 
@@ -224,7 +250,7 @@ fn ordering_below_the_transition_holds_on_every_backend() {
     let beta = 1.5;
     assert!(beta > beta_c(3), "this test must sit in the ordered phase");
 
-    for (seed, updater) in [(20260901, "metropolis"), (20260902, "site_checkerboard")] {
+    for (seed, updater) in [(20260901, "metropolis"), (20260902, "checkerboard")] {
         let measured = run::<3, 2>(shape, 1.0, beta, seed, updater);
         report(updater, &measured);
         assert!(
@@ -237,11 +263,11 @@ fn ordering_below_the_transition_holds_on_every_backend() {
     if !gpu_available() {
         return;
     }
-    let gpu = run::<3, 2>(shape, 1.0, beta, 20260903, "gpu_site_checkerboard");
-    report("gpu_site_checkerboard", &gpu);
+    let gpu = run::<3, 2>(shape, 1.0, beta, 20260903, "gpu_checkerboard");
+    report("gpu_checkerboard", &gpu);
     assert!(
         gpu.order.mean > 0.5,
-        "gpu_site_checkerboard: a run at beta = {beta} should order, got m = {}",
+        "gpu_checkerboard: a run at beta = {beta} should order, got m = {}",
         gpu.order.mean
     );
 }
@@ -265,7 +291,7 @@ fn disorder_above_the_transition_holds_on_every_backend() {
         "this test must sit in the disordered phase"
     );
 
-    for (seed, updater) in [(20260904, "metropolis"), (20260905, "site_checkerboard")] {
+    for (seed, updater) in [(20260904, "metropolis"), (20260905, "checkerboard")] {
         let measured = run::<3, 2>(shape, 1.0, beta, seed, updater);
         report(updater, &measured);
         assert!(
@@ -278,11 +304,11 @@ fn disorder_above_the_transition_holds_on_every_backend() {
     if !gpu_available() {
         return;
     }
-    let gpu = run::<3, 2>(shape, 1.0, beta, 20260906, "gpu_site_checkerboard");
-    report("gpu_site_checkerboard", &gpu);
+    let gpu = run::<3, 2>(shape, 1.0, beta, 20260906, "gpu_checkerboard");
+    report("gpu_checkerboard", &gpu);
     assert!(
         gpu.order.mean < 0.25,
-        "gpu_site_checkerboard: a run at beta = {beta} should not order, got m = {}",
+        "gpu_checkerboard: a run at beta = {beta} should not order, got m = {}",
         gpu.order.mean
     );
 }
@@ -304,23 +330,17 @@ const AGREEMENT_BETA: f64 = 1.1;
 fn the_backends_agree_in_two_dimensions() {
     let shape = [16, 16];
     let metropolis = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260910, "metropolis");
-    let checkerboard = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260911, "site_checkerboard");
+    let checkerboard = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260911, "checkerboard");
     report("2D metropolis", &metropolis);
-    report("2D site_checkerboard", &checkerboard);
-    assert_matches(&metropolis, &checkerboard, "site_checkerboard");
+    report("2D checkerboard", &checkerboard);
+    assert_matches(&metropolis, &checkerboard, "checkerboard");
 
     if !gpu_available() {
         return;
     }
-    let gpu = run::<3, 2>(
-        shape,
-        1.0,
-        AGREEMENT_BETA,
-        20260912,
-        "gpu_site_checkerboard",
-    );
-    report("2D gpu_site_checkerboard", &gpu);
-    assert_matches(&metropolis, &gpu, "gpu_site_checkerboard");
+    let gpu = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260912, "gpu_checkerboard");
+    report("2D gpu_checkerboard", &gpu);
+    assert_matches(&metropolis, &gpu, "gpu_checkerboard");
 }
 
 /// The heat bath agrees with Metropolis on both backends, at three states and
@@ -365,10 +385,10 @@ fn the_heat_bath_agrees_with_metropolis() {
         1.0,
         AGREEMENT_BETA,
         20260926,
-        "site_checkerboard_heat_bath",
+        "checkerboard_heat_bath",
     );
-    report("2D q=3 site_checkerboard_heat_bath", &reference);
-    assert_matches(&metropolis, &reference, "site_checkerboard_heat_bath");
+    report("2D q=3 checkerboard_heat_bath", &reference);
+    assert_matches(&metropolis, &reference, "checkerboard_heat_bath");
 
     if !gpu_available() {
         return;
@@ -378,24 +398,20 @@ fn the_heat_bath_agrees_with_metropolis() {
         1.0,
         AGREEMENT_BETA,
         20260924,
-        "gpu_site_checkerboard_heat_bath",
+        "gpu_checkerboard_heat_bath",
     );
-    report("2D q=3 gpu_site_checkerboard_heat_bath", &gpu);
-    assert_matches(&reference, &gpu, "gpu_site_checkerboard_heat_bath");
+    report("2D q=3 gpu_checkerboard_heat_bath", &gpu);
+    assert_matches(&reference, &gpu, "gpu_checkerboard_heat_bath");
 
     let gpu_four = run::<4, 2>(
         shape,
         1.0,
         beta_four,
         20260925,
-        "gpu_site_checkerboard_heat_bath",
+        "gpu_checkerboard_heat_bath",
     );
-    report("2D q=4 gpu_site_checkerboard_heat_bath", &gpu_four);
-    assert_matches(
-        &metropolis_four,
-        &gpu_four,
-        "gpu_site_checkerboard_heat_bath",
-    );
+    report("2D q=4 gpu_checkerboard_heat_bath", &gpu_four);
+    assert_matches(&metropolis_four, &gpu_four, "gpu_checkerboard_heat_bath");
 }
 
 /// Three dimensions: the ordering contrast, and the same backend agreement.
@@ -432,17 +448,17 @@ fn three_dimensional_runs_order_below_the_transition_and_not_above() {
     // ceiling, for the same reason `AGREEMENT_BETA` sits where it does in two
     // dimensions.
     let metropolis = run::<3, 3>(shape, 1.0, 0.65, 20260922, "metropolis");
-    let checkerboard = run::<3, 3>(shape, 1.0, 0.65, 20260923, "site_checkerboard");
+    let checkerboard = run::<3, 3>(shape, 1.0, 0.65, 20260923, "checkerboard");
     report("3D metropolis", &metropolis);
-    report("3D site_checkerboard", &checkerboard);
-    assert_matches(&metropolis, &checkerboard, "site_checkerboard");
+    report("3D checkerboard", &checkerboard);
+    assert_matches(&metropolis, &checkerboard, "checkerboard");
 
     if !gpu_available() {
         return;
     }
-    let gpu = run::<3, 3>(shape, 1.0, 0.65, 20260924, "gpu_site_checkerboard");
-    report("3D gpu_site_checkerboard", &gpu);
-    assert_matches(&metropolis, &gpu, "gpu_site_checkerboard");
+    let gpu = run::<3, 3>(shape, 1.0, 0.65, 20260924, "gpu_checkerboard");
+    report("3D gpu_checkerboard", &gpu);
+    assert_matches(&metropolis, &gpu, "gpu_checkerboard");
 }
 
 /// The cluster update samples the same distribution the local ones do.
@@ -515,13 +531,14 @@ fn at_criticality(shape: [usize; 2], updater: &str, seed: u64) -> Measured {
         "shape = {shape:?}\n\
          j = 1.0\n\
          beta = {}\n\
-         updater = \"{updater}\"\n\
+         {driver}\
          thermalize = 1000\n\
          sweeps_between = 1\n\
          n_samples = {TAU_SAMPLES}\n\
          seed = {seed}\n\
          start = \"hot\"\n",
-        beta_c(3)
+        beta_c(3),
+        driver = driver_lines(updater),
     );
     drive::<3, 2>(&toml, TAU_SAMPLES)
 }
@@ -879,12 +896,13 @@ fn run_decoupled(offset: f64, beta: f64, seed: u64, updater: &str) -> Measured {
          j = 0.0\n\
          h = [{offset}, 0.0, 0.0]\n\
          beta = {beta}\n\
-         updater = \"{updater}\"\n\
+         {driver}\
          thermalize = 100\n\
          sweeps_between = 2\n\
          n_samples = {N_SAMPLES}\n\
          seed = {seed}\n\
-         start = \"hot\"\n"
+         start = \"hot\"\n",
+        driver = driver_lines(updater),
     );
     drive::<3, 2>(&toml, N_SAMPLES)
 }
@@ -922,8 +940,8 @@ fn a_decoupled_run_reproduces_the_exact_boltzmann_populations() {
 
     let backends = [
         (20260950, "metropolis"),
-        (20260951, "site_checkerboard"),
-        (20260952, "gpu_site_checkerboard"),
+        (20260951, "checkerboard"),
+        (20260952, "gpu_checkerboard"),
     ];
     for (seed, updater) in backends {
         if updater.starts_with("gpu") && !gpu_available() {

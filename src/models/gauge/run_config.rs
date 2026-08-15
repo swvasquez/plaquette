@@ -12,7 +12,7 @@
 //! rather than a generalization.
 //!
 //! What the two do share is the vocabulary in [`config`](crate::config) —
-//! [`Start`], [`UpdaterKind`], [`ConfigError`] — so the driver fields, the
+//! [`Start`], [`UpdaterRule`], [`ConfigError`] — so the driver fields, the
 //! reproducibility fields, and the load/parse/validate/round-trip contract are
 //! written the same way on both sides and read the same way from a file.
 //!
@@ -28,7 +28,8 @@
 //! disagrees.
 
 use crate::config::{
-    ConfigError, Start, UpdaterKind, check_dimension, check_shape, check_updater, shape_array,
+    BackendKind, ConfigError, ScheduleKind, Start, UpdaterRule, check_dimension, check_shape,
+    check_updater, shape_array,
 };
 use crate::configuration::{Cell, Configuration};
 use crate::lattice::Lattice;
@@ -72,13 +73,22 @@ pub struct GaugeRunConfig {
     pub beta: f64,
 
     // --- driver controls ---
-    /// Which update algorithm advances the chain; defaults to
-    /// [`UpdaterKind::Metropolis`], and [`validate`](GaugeRunConfig::validate)
-    /// rejects the others. A run parameter rather than a caller's choice,
-    /// because two runs of the same physics under different algorithms are
-    /// different runs.
+    /// Which update rule advances the chain; defaults to
+    /// [`UpdaterRule::Metropolis`], and [`validate`](GaugeRunConfig::validate)
+    /// rejects [`UpdaterRule::SwendsenWang`], which this model cannot run. A
+    /// run parameter rather than a caller's choice, because two runs of the
+    /// same physics under different algorithms are different runs.
     #[serde(default = "default_updater")]
-    pub updater: UpdaterKind,
+    pub updater: UpdaterRule,
+    /// Which schedule a local rule runs under; omitted means the random
+    /// schedule. Must stay unset for [`UpdaterRule::SwendsenWang`], which has
+    /// no schedule at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleKind>,
+    /// Where the run executes; defaults to the CPU. A local rule on the GPU
+    /// needs `schedule = "checkerboard"` and even extents.
+    #[serde(default)]
+    pub backend: BackendKind,
     /// Warmup sweeps run and discarded before any sample.
     pub thermalize: usize,
     /// Decorrelation sweeps between recorded samples.
@@ -108,8 +118,8 @@ fn default_start() -> Start {
     Start::Cold
 }
 
-fn default_updater() -> UpdaterKind {
-    UpdaterKind::Metropolis
+fn default_updater() -> UpdaterRule {
+    UpdaterRule::Metropolis
 }
 
 impl GaugeRunConfig {
@@ -156,10 +166,10 @@ impl GaugeRunConfig {
     /// Rejects what would otherwise panic or produce nothing — a shape below two
     /// dimensions or with a zero extent, a non-positive or non-finite `beta`, a
     /// non-finite coupling, a run recording no samples — and applies
-    /// `check_updater` against [`Cell::Link`]: this model's variables live on
-    /// links, so it takes the grade-neutral Metropolis or a link schedule and
-    /// refuses a site one, and a schedule that colors in parallel additionally
-    /// needs even extents.
+    /// `check_updater`'s shared rules: a cluster rule takes no schedule, and a
+    /// local rule on the GPU needs the checkerboard schedule and even extents.
+    /// Its own rule on top: the cluster update itself is refused, since the
+    /// plaquette energy has no bond graph to build clusters on.
     ///
     /// It checks the dimension floor but not which dimension the *program* was
     /// built for. Two is a statement about the physics and belongs to the
@@ -183,7 +193,17 @@ impl GaugeRunConfig {
                 self.j
             )));
         }
-        check_updater(self.updater, Cell::Link, &self.shape)?;
+        // The plaquette energy has no pairwise bond graph, so there is
+        // nothing for a cluster update to build on — the one rule here that is
+        // the model's own rather than the shared triple's.
+        if self.updater.builds_clusters() {
+            return Err(ConfigError::Invalid(
+                "the gauge action scores plaquettes, which have no pairwise \
+                 bond graph for a cluster update to build on"
+                    .to_string(),
+            ));
+        }
+        check_updater(self.updater, self.schedule, self.backend, &self.shape)?;
         if self.n_samples == 0 {
             return Err(ConfigError::Invalid(
                 "n_samples must be positive, or the run records nothing".to_string(),
@@ -259,7 +279,9 @@ mod tests {
             shape: vec![8, 8, 8],
             j: 1.0,
             beta: 0.75,
-            updater: UpdaterKind::Metropolis,
+            updater: UpdaterRule::Metropolis,
+            schedule: None,
+            backend: BackendKind::Cpu,
             thermalize: 1000,
             sweeps_between: 10,
             n_samples: 500,
@@ -310,7 +332,7 @@ mod tests {
         assert_eq!(config.n_samples, 1000);
         assert_eq!(config.seed, 12345);
         assert_eq!(config.start, Start::Hot);
-        assert_eq!(config.updater, UpdaterKind::Metropolis);
+        assert_eq!(config.updater, UpdaterRule::Metropolis);
         assert_eq!(config.description.as_deref(), Some("near the transition"));
     }
 
@@ -347,7 +369,7 @@ mod tests {
         "#;
         let config = GaugeRunConfig::parse(text).unwrap();
         assert_eq!(config.start, Start::Cold);
-        assert_eq!(config.updater, UpdaterKind::Metropolis);
+        assert_eq!(config.updater, UpdaterRule::Metropolis);
         assert_eq!(config.description, None);
     }
 
@@ -389,55 +411,69 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_the_site_updaters() {
-        // The rule the Ising schema does not have: both site schedules are built
-        // around a site field, so neither is a valid way to run this.
-        // The cluster kinds are refused by exactly the same rule and need no
-        // rule of their own: they name `Cell::Site` too, so `check_updater`
-        // stops them before anything asks whether a plaquette energy has a bond
-        // graph. (It does not — see the note on `Z2Gauge`.)
-        for kind in [
-            UpdaterKind::SiteCheckerboard,
-            UpdaterKind::GpuSiteCheckerboard,
-            UpdaterKind::GpuSiteCheckerboardHeatBath,
-            UpdaterKind::SwendsenWang,
-            UpdaterKind::GpuSwendsenWang,
-        ] {
+    fn validate_rejects_the_cluster_rule() {
+        // The rule the Ising schema does not have: the plaquette energy has no
+        // pairwise bond graph, so there is nothing for a cluster update to
+        // build on, whatever the backend. (See the note on `Z2Gauge`.)
+        for backend in [BackendKind::Cpu, BackendKind::Gpu] {
             let mut config = sample_config();
-            config.updater = kind;
+            config.updater = UpdaterRule::SwendsenWang;
+            config.backend = backend;
             let message = invalid_message(&config);
-            assert!(message.contains("updates Link variables"), "{message}");
-            assert!(message.contains("colors Site variables"), "{message}");
-            assert!(message.contains(&format!("{kind:?}")), "{message}");
+            assert!(message.contains("bond graph"), "{backend:?}: {message}");
         }
     }
 
     #[test]
-    fn parses_and_round_trips_the_link_updaters() {
-        // The other half of the same rule: the link schedules are accepted, so
-        // they survive validation on the way through TOML and back.
-        for (kind, rendered) in [
-            (UpdaterKind::LinkCheckerboard, "link_checkerboard"),
-            (UpdaterKind::GpuLinkCheckerboard, "gpu_link_checkerboard"),
-            (UpdaterKind::HeatBath, "heat_bath"),
+    fn validate_rejects_a_random_schedule_on_the_gpu() {
+        // The device runs a local sweep as parallel color passes, and a random
+        // schedule has no colors — the combination is unrunnable, not slow.
+        let mut config = sample_config();
+        config.backend = BackendKind::Gpu;
+        let message = invalid_message(&config);
+        assert!(message.contains("checkerboard"), "{message}");
+    }
+
+    #[test]
+    fn parses_and_round_trips_the_composed_updaters() {
+        // Every runnable (rule, schedule, backend) triple survives validation
+        // on the way through TOML and back.
+        for (rule, schedule, backend) in [
+            (UpdaterRule::Metropolis, None, BackendKind::Cpu),
             (
-                UpdaterKind::LinkCheckerboardHeatBath,
-                "link_checkerboard_heat_bath",
+                UpdaterRule::Metropolis,
+                Some(ScheduleKind::Checkerboard),
+                BackendKind::Cpu,
             ),
             (
-                UpdaterKind::GpuLinkCheckerboardHeatBath,
-                "gpu_link_checkerboard_heat_bath",
+                UpdaterRule::Metropolis,
+                Some(ScheduleKind::Checkerboard),
+                BackendKind::Gpu,
+            ),
+            (UpdaterRule::HeatBath, None, BackendKind::Cpu),
+            (
+                UpdaterRule::HeatBath,
+                Some(ScheduleKind::Checkerboard),
+                BackendKind::Cpu,
+            ),
+            (
+                UpdaterRule::HeatBath,
+                Some(ScheduleKind::Checkerboard),
+                BackendKind::Gpu,
             ),
         ] {
             let mut config = sample_config();
-            config.updater = kind;
+            config.updater = rule;
+            config.schedule = schedule;
+            config.backend = backend;
 
             let text = config.to_toml().unwrap();
+            let parsed = GaugeRunConfig::parse(&text).unwrap();
+            assert_eq!(parsed, config);
             assert!(
-                text.contains(&format!(r#"updater = "{rendered}""#)),
-                "{text}"
+                parsed.validate().is_ok(),
+                "{rule:?} / {schedule:?} / {backend:?}"
             );
-            assert_eq!(GaugeRunConfig::parse(&text).unwrap().updater, kind);
         }
     }
 
@@ -448,13 +484,14 @@ mod tests {
         // chain is built. The CPU link schedule is unaffected — run in sequence,
         // any link order is a valid Metropolis schedule.
         let mut config = sample_config();
-        config.updater = UpdaterKind::GpuLinkCheckerboard;
+        config.schedule = Some(ScheduleKind::Checkerboard);
+        config.backend = BackendKind::Gpu;
         config.shape = vec![8, 8, 7];
         let message = invalid_message(&config);
         assert!(message.contains("even extents"), "{message}");
         assert!(message.contains("axis 2"), "{message}");
 
-        config.updater = UpdaterKind::LinkCheckerboard;
+        config.backend = BackendKind::Cpu;
         assert!(
             config.validate().is_ok(),
             "an odd extent is fine on the CPU"
@@ -464,12 +501,12 @@ mod tests {
     #[test]
     fn parse_rejects_an_invalid_config() {
         // Validation runs as part of parsing, so a bad file fails at load time —
-        // including the updater rule, which a parse alone would let through.
+        // including an unrunnable triple, which a parse alone would let through.
         let text = r#"
             shape = [4, 4, 4]
             j = 1.0
             beta = 0.5
-            updater = "gpu_site_checkerboard"
+            updater = "swendsen_wang"
             thermalize = 10
             sweeps_between = 1
             n_samples = 10

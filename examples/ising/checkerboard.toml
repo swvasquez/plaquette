@@ -10,7 +10,8 @@ j = 1.0
 h = 0.0
 beta = 0.44
 
-updater = "site_checkerboard"
+updater = "metropolis"
+schedule = "checkerboard"
 thermalize = 500
 sweeps_between = 5
 n_samples = 1000

@@ -18,22 +18,22 @@ cargo build
 `plaquette` currently implements several models, each with multiple update
 implementations across the CPU and GPU:
 
-| Model    | Dimension | Implementation                | Device   |
-| -------- | --------- | ----------------------------- | -------- |
-| Ising    | D ≥ 1     | Metropolis                    | CPU      |
-| Ising    | D ≥ 1     | Metropolis, site checkerboard | CPU, GPU |
-| Ising    | D ≥ 1     | Heat bath                     | CPU      |
-| Ising    | D ≥ 1     | Heat bath, site checkerboard  | CPU, GPU |
-| Ising    | D ≥ 1     | Swendsen–Wang                 | CPU, GPU |
-| Potts    | D ≥ 1     | Metropolis                    | CPU      |
-| Potts    | D ≥ 1     | Metropolis, site checkerboard | CPU, GPU |
-| Potts    | D ≥ 1     | Heat bath                     | CPU      |
-| Potts    | D ≥ 1     | Heat bath, site checkerboard  | CPU, GPU |
-| Potts    | D ≥ 1     | Swendsen–Wang                 | CPU, GPU |
-| Z2 gauge | D ≥ 2     | Metropolis                    | CPU      |
-| Z2 gauge | D ≥ 2     | Metropolis, link checkerboard | CPU, GPU |
-| Z2 gauge | D ≥ 2     | Heat bath                     | CPU      |
-| Z2 gauge | D ≥ 2     | Heat bath, link checkerboard  | CPU, GPU |
+| Model    | Dimension | Implementation                    | Device   |
+| -------- | --------- | --------------------------------- | -------- |
+| Ising    | D ≥ 1     | Metropolis, random schedule       | CPU      |
+| Ising    | D ≥ 1     | Metropolis, checkerboard schedule | CPU, GPU |
+| Ising    | D ≥ 1     | Heat bath, random schedule        | CPU      |
+| Ising    | D ≥ 1     | Heat bath, checkerboard schedule  | CPU, GPU |
+| Ising    | D ≥ 1     | Swendsen–Wang                     | CPU, GPU |
+| Potts    | D ≥ 1     | Metropolis, random schedule       | CPU      |
+| Potts    | D ≥ 1     | Metropolis, checkerboard schedule | CPU, GPU |
+| Potts    | D ≥ 1     | Heat bath, random schedule        | CPU      |
+| Potts    | D ≥ 1     | Heat bath, checkerboard schedule  | CPU, GPU |
+| Potts    | D ≥ 1     | Swendsen–Wang                     | CPU, GPU |
+| Z2 gauge | D ≥ 2     | Metropolis, random schedule       | CPU      |
+| Z2 gauge | D ≥ 2     | Metropolis, checkerboard schedule | CPU, GPU |
+| Z2 gauge | D ≥ 2     | Heat bath, random schedule        | CPU      |
+| Z2 gauge | D ≥ 2     | Heat bath, checkerboard schedule  | CPU, GPU |
 
 Note that memory use grows quickly with the dimension: the lattice stores about
 `48 * D * (D - 1)` bytes of precomputed geometry per site. In 16 GB that allows a lattice of size 360³ sites in three dimensions, but only 5¹⁰ sites in ten.
@@ -45,10 +45,10 @@ Refer to [`docs/`](docs/) for descriptions of used algorithms.
 A simulation generates near-independent snapshots of the system, measures
 observables on each, and averages those measurements into a result with an
 error bar. The snapshots come from evolving the system through sweeps of the
-lattice. A local update makes as many attempts per sweep as the lattice has
-variables, and accepts each one with a probability set by the energy change it
-would cause. A cluster update instead changes a whole connected region in one
-move and always accepts it. Consecutive states are still strongly correlated, so
+lattice. A local update makes as many single-variable moves per sweep as the
+lattice has variables, weighing each outcome by the energy change it would
+cause. A cluster update instead changes a whole connected region in one move
+and always accepts it. Consecutive states are still strongly correlated, so
 snapshots are taken many sweeps apart, leaving each one close to independent of
 the last.
 
@@ -60,23 +60,40 @@ the last.
                | asks for the next snapshot
                v
   +------- Chain --------+                +--------- Rng ----------+
-  |  run a fixed number  |                |  random values for     |
-  |  of sweeps, then     |                |  the proposal and      |
-  |  yield a snapshot    |                |  the accept test       |
+  |  run a fixed number  |                |  random values for the |
+  |  of sweeps, then     |                |  schedule's picks and  |
+  |  yield a snapshot    |                |  the kernel's draws    |
   +----------------------+                +------------------------+
                |                                      |
                | drives each sweep                    |
                |     +--------- random draws ---------+
                v     v
-  +------ Updater -------+                +-------- Action --------+
-  |  pick a variable,    |   a proposed   |  prices a move:        |
-  |  propose a new value | ---- move ---> |  the energy change     |
-  |  accept or reject    | <- its cost -- |  it would cause        |
-  +----------------------+                +------------------------+
-        |                                              ^
-        | writes the                        reads the  |
-        | new value                     current state  |
-        v                                              |
+  +--------------- Updater ----------------+
+  |                                        |
+  |  +---------- Schedule -----------+     |
+  |  |  pick which variable is next  |     |
+  |  |  (random or checkerboard)     |     |
+  |  +--------------|----------------+     |
+  |                 | that variable        |
+  |                 v                      |
+  |  +----------- Kernel ------------+     |
+  |  |  choose the variable's new    |     |
+  |  |  value (Metropolis or heat    |     |
+  |  |  bath)                        |     |
+  |  +-------------------------------+     |
+  +------|----------------|-------------|--+
+         |                | candidate   ^
+         |                | moves       | their
+         |                v             | costs
+         |            +-------- Action --------+
+  writes |            |  prices a move:        |
+  the    |            |  the energy change     |
+  new    |            |  it would cause        |
+  value  |            +----------|-------------+
+         |                       ^
+         |                       | reads the
+         |                       | current state
+         v                       |
   +--------------------------- the system ---------------------------+
   |                                                                  |
   |  +--- Configuration ----+            +------ Lattice -------+    |
@@ -90,19 +107,29 @@ the last.
 ### Snapshot
 
 The driver — an example program, or a model's sampler — has already thermalized
-the system.
+the system. The walk-through follows a local update; a cluster update keeps the
+`Updater` box's outer arrows but replaces its interior with a single collective
+move (`ClusterUpdate`, described in `docs/swendsen-wang.md`).
 
 1. The driver asks `Chain` for the next snapshot.
 2. `Chain` runs a fixed number of sweeps before handing one back, and each sweep
    is a single call into `Updater`.
-3. `Updater` begins the sweep with a single update, picking a variable and
-   asking `Rng` for a proposed new value.
-4. `Action` prices that move, reading the geometry from `Lattice` and the
-   affected values from `Configuration`, and returns the energy change it would
-   cause.
-5. `Updater` accepts a downhill move outright and an uphill one only with a
-   probability set by that change and the temperature, writing an accepted value
-   into `Configuration` and leaving it untouched on a rejection.
+3. `Updater` begins the sweep with a single update. Its `Schedule` picks which
+   variable is next — drawn from `Rng` on the random schedule, taken in fixed
+   color order on the checkerboard — and hands it to the `Kernel`. The schedule
+   reads only the system's shape (the variable count, and the coloring from
+   `Lattice`), never the values in `Configuration`.
+4. The `Kernel` forms its candidate moves — Metropolis proposes one alternative
+   value (drawn from `Rng` when there is more than one), the heat bath considers
+   every value the variable could take — and asks `Action` to price them.
+   `Action` reads the geometry from `Lattice` and the affected values from
+   `Configuration`, and returns the energy change each move would cause.
+5. The `Kernel` then sets the variable: Metropolis accepts a downhill move
+   outright and an uphill one only with a probability set by its cost and the
+   temperature, leaving the variable untouched on a rejection; the heat bath
+   draws one of its candidates with the matching Boltzmann weight. The deciding
+   draw comes from `Rng`, and an accepted or drawn value is written into
+   `Configuration`.
 6. One sweep is as many of those updates as `Configuration` has variables.
 7. After the last sweep, `Chain` hands back a copy of `Configuration` as it
    stands, and that copy is the snapshot.

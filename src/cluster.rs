@@ -10,7 +10,7 @@
 //!
 //! It sits at the root rather than inside [`updater`](crate::updater) for that
 //! reason — the eventual consumers differ in their predicate and in nothing
-//! else. [`SwendsenWang`](crate::updater::SwendsenWang) is the first;
+//! else. [`ClusterUpdate`](crate::updater::ClusterUpdate) is the first;
 //! percolation observables (mean cluster size, wrapping probability) and a Wolff
 //! updater growing a single cluster would each pass a different closure to the
 //! same function.

@@ -1,15 +1,16 @@
 //! Device plumbing shared by every GPU backend: acquiring a device, and driving
 //! a color-pass sweep in batches.
 //!
-//! [`Gpu`] owns the device and queue. `DeviceSweeper` owns the loop: encode
-//! `colors` dispatches per sweep, run `sweeps_between` of them per sample, copy
-//! a whole batch back in one transfer, and hand out [`Configuration`]s until
-//! the batch drains. Each model backend —
-//! [`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain),
-//! [`GpuGaugeChain`](crate::models::gauge::gpu::GpuGaugeChain),
-//! [`GpuPottsChain`](crate::models::potts::gpu::GpuPottsChain) — is a
-//! constructor plus a `DeviceSweeper`; the batching is deliberately identical
-//! across them.
+//! [`Gpu`] owns the device and queue. [`GpuChain`] is the one chain type every
+//! model runs on: a shader assembled from four fragments — prelude, model
+//! snippet, kernel, schedule — mirroring the CPU composition of
+//! [`LocalUpdate`](crate::updater::LocalUpdate), driven by a `DeviceSweeper`
+//! that owns the loop: encode `colors` dispatches per sweep, run
+//! `sweeps_between` of them per sample, copy a whole batch back in one
+//! transfer, and hand out [`Configuration`]s until the batch drains. Each
+//! model backend is a constructor (`gpu_chain` in its module) that builds a
+//! `GpuModelSetup` — the model's tables, params, and `model.wgsl` snippet —
+//! and everything else is shared.
 //!
 //! Neither the batching nor any kernel knows the lattice dimension: site parity
 //! arrives as an uploaded table, and `D` itself is a WGSL `override` resolved at
@@ -76,8 +77,9 @@ impl Gpu {
     }
 }
 
-/// Threads per workgroup, matching the `@workgroup_size(64)` both shaders
-/// declare and the `WORKGROUP_SIZE` in the shared preamble.
+/// Threads per workgroup, matching the `@workgroup_size(64)` the schedule
+/// fragments and cluster kernels declare and the `WORKGROUP_SIZE` in
+/// `wgsl/rng.wgsl`.
 const WORKGROUP_SIZE: u32 = 64;
 
 /// How wide and how tall to launch, to cover `threads` threads under a cap of
@@ -132,44 +134,14 @@ pub(crate) fn check_fits(device: &wgpu::Device, bytes: u64, what: &str) {
 /// submission sizes comparable.
 const MAX_PASSES_PER_SUBMIT: usize = 512;
 
-/// The preamble every checkerboard shader is compiled with: the state encoding
-/// and the counter-based random source, which must be byte-identical across
-/// backends. WGSL has no include directive, so the concatenation happens here.
-///
-/// Both `include_str!` paths resolve relative to the file that *invokes* the
-/// macro — each model's `gpu.rs` under `src/models/<name>/` — which is why the
-/// prelude climbs two directories and each backend names its own
-/// `checkerboard.wgsl` bare.
-macro_rules! shader_source {
-    ($model:literal) => {
-        concat!(
-            include_str!("../../checkerboard_prelude.wgsl"),
-            include_str!($model)
-        )
-    };
-}
-pub(crate) use shader_source;
-
-/// Which single-variable kernel a device checkerboard sweep runs.
-///
-/// The coloring is the same either way — it comes from the schedule, not from
-/// the kernel — so the two share every table, every dispatch and the whole of
-/// `DeviceSweeper`. What differs is the body of one thread, and each model
-/// backend keeps the two as separate shader sources rather than one source with
-/// a branch in it. See `docs/heat-bath.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Kernel {
-    /// Propose one alternative state and accept or reject it, the rule
-    /// `docs/metropolis.md` derives.
-    #[default]
-    Metropolis,
-    /// Price every state the variable could take and draw one from the
-    /// conditional they define, the rule `docs/heat-bath.md` describes.
-    HeatBath,
-}
+/// The kernel enum is the same one the CPU updaters compose with — the choice
+/// of single-variable rule is backend-neutral, so it is defined once in
+/// [`updater`](crate::updater) and re-exported here for the device backends
+/// that pick a shader by it.
+pub use crate::updater::Kernel;
 
 /// Bytes of push constants a sweep dispatch carries: `(sweep, color)` as two
-/// `u32`, matching the `Push` struct the checkerboard shaders declare. It is
+/// `u32`, matching the `Push` struct the shared prelude declares. It is
 /// also the limit [`Gpu::new`] requests, so raising it means raising that too.
 /// The cluster kernels use only the first word and pad out the second, rather
 /// than asking the device for a second push-constant size.
@@ -528,6 +500,206 @@ impl<const Q: usize> DeviceSweeper<Q> {
 /// — so it is a default here rather than a config field.
 pub(crate) const GPU_BATCH: usize = 64;
 
+/// The token in the kernel fragments standing for the state count. Substituted
+/// for *every* model — `Q` is a const generic on the host, so the number is
+/// always known — because the heat bath's per-state arrays need a const
+/// length and the Metropolis two-state branch should constant-fold.
+const Q_TOKEN: &str = "$Q$";
+
+/// Assemble a local-update shader from its four fragments: the shared prelude,
+/// a model snippet, a kernel picked by `kernel`, and a schedule picked by
+/// `cell` — the device mirror of composing a
+/// [`LocalUpdate`](crate::updater::LocalUpdate) and handing it an action.
+///
+/// The model snippet must declare bindings 1 and 2 (its lookup table and a
+/// `Params` uniform whose head is `n_sites: u32, seed: u32, beta: f32`) and
+/// define `fn energy_delta(v: u32, current: u32, proposed: u32) -> f32` — the
+/// WGSL half of [`Action::energy_delta`](crate::action::Action::energy_delta).
+/// The structural contract is enforced when the pipeline is built: naga
+/// rejects a snippet that misses it, with the offending name in the error.
+///
+/// One part of the contract naga cannot check: `energy_delta` at a variable
+/// must read only variables of *other* colors under the schedule's coloring —
+/// nearest neighbors on a site field, the links of the variable's own
+/// plaquettes on a link field. The parallel color passes rest on that
+/// independence, and a longer-ranged action (an improved gauge action with
+/// rectangle terms, say) would sample the wrong distribution here while
+/// passing every validation; it needs a finer coloring, which means a new
+/// schedule fragment, not a workaround in the snippet.
+pub(crate) fn assemble_shader(model_snippet: &str, kernel: Kernel, cell: Cell, q: usize) -> String {
+    let kernel_src = match kernel {
+        Kernel::Metropolis => include_str!("wgsl/metropolis.wgsl"),
+        Kernel::HeatBath => include_str!("wgsl/heat_bath.wgsl"),
+    };
+    let schedule_src = match cell {
+        Cell::Site => include_str!("wgsl/site_schedule.wgsl"),
+        Cell::Link => include_str!("wgsl/link_schedule.wgsl"),
+    };
+    let shader = format!(
+        "{}{}{}{}{}",
+        include_str!("wgsl/rng.wgsl"),
+        include_str!("wgsl/prelude.wgsl"),
+        model_snippet,
+        kernel_src.replace(Q_TOKEN, &q.to_string()),
+        schedule_src
+    );
+    // A leftover token would reach naga as a parse error naming a line in a
+    // shader no file contains; failing here names the actual mistake — a
+    // snippet handed over with its own tokens unfilled, or a new fragment
+    // token this function does not know.
+    assert!(
+        !shader.contains('$'),
+        "assembled {} shader still carries an unfilled substitution token",
+        match cell {
+            Cell::Site => "site",
+            Cell::Link => "link",
+        }
+    );
+    shader
+}
+
+/// A model's device-side description: everything [`GpuChain`] needs that is
+/// about the model rather than the schedule, the kernel, or the batching —
+/// the host half of the seam whose WGSL half is the model snippet.
+pub(crate) struct GpuModelSetup {
+    /// Prefix for the device object labels, e.g. `"ising"`.
+    pub label: &'static str,
+    /// The model snippet, with any model-specific tokens already filled.
+    pub source: String,
+    /// The read-only lookup table `energy_delta` prices a move against —
+    /// neighbors for a site model, staples for a link one.
+    pub table: Vec<u32>,
+    /// The model's uniform block, already laid out for WGSL, head first.
+    pub params: Vec<u8>,
+    /// Which lattice cell the variables sit on. Decides the schedule fragment,
+    /// the color count, and what a device word means on read-back.
+    pub cell: Cell,
+}
+
+/// A Markov chain run on the GPU — one type for every model, as
+/// [`LocalUpdate`] is one type on the CPU.
+///
+/// A sibling of [`Chain`](crate::chain::Chain): same
+/// `Iterator<Item = Configuration>` interface, device machinery underneath.
+/// Owns everything it needs, so it borrows nothing and can be moved and driven
+/// freely. Everything model-specific arrived in a `GpuModelSetup` at
+/// construction; the type carries no dimension, because the lattice is read
+/// once to build the tables and what survives is device buffers and counts.
+///
+/// [`LocalUpdate`]: crate::updater::LocalUpdate
+pub struct GpuChain<const Q: usize> {
+    sweeper: DeviceSweeper<Q>,
+}
+
+impl<const Q: usize> GpuChain<Q> {
+    /// Build a chain on `gpu` over a copy of `start`, uploaded to the device.
+    ///
+    /// `start` is read only to upload it, so the host copy is untouched and
+    /// the same configuration can seed a CPU run too. `kernel` picks which
+    /// single-variable rule a thread runs — a choice of algorithm, not of
+    /// physics. The schedule is not a parameter: a device sweep *is* the
+    /// checkerboard, in the coloring `setup.cell` implies. Runs no sweeps —
+    /// warmup is the caller's job via [`advance`](GpuChain::advance).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `batch` is zero, if `start` is not a field on `setup.cell`
+    /// with one variable per cell of `lattice`, or if any extent is odd —
+    /// the precondition every parallel color pass carries.
+    pub(crate) fn build<const D: usize>(
+        gpu: Gpu,
+        lattice: &Lattice<D>,
+        setup: GpuModelSetup,
+        kernel: Kernel,
+        start: &Configuration<Q>,
+        sweeps_between: usize,
+        batch: usize,
+    ) -> Self {
+        assert!(batch > 0, "batch size must be positive");
+        // The shader indexes its table by variable, so a field on the wrong
+        // cell would be silently misread rather than rejected; the cell kind
+        // is what makes that checkable at all.
+        assert_eq!(
+            start.cell(),
+            setup.cell,
+            "the {} device chain updates {:?} variables, so the start must be a \
+             field on that cell",
+            setup.label,
+            setup.cell,
+        );
+        let n_vars = match setup.cell {
+            Cell::Site => lattice.n_sites(),
+            Cell::Link => lattice.n_links(),
+        };
+        assert_eq!(
+            start.n_vars(),
+            n_vars,
+            "start configuration and lattice disagree on variable count"
+        );
+        let shape = lattice.shape();
+        assert_even_extents(
+            &shape,
+            match setup.cell {
+                Cell::Site => "site",
+                Cell::Link => "link",
+            },
+        );
+
+        let shader = assemble_shader(&setup.source, kernel, setup.cell, Q);
+        let label = format!(
+            "{} {}",
+            setup.label,
+            match kernel {
+                Kernel::Metropolis => "checkerboard",
+                Kernel::HeatBath => "heat bath",
+            }
+        );
+
+        GpuChain {
+            sweeper: DeviceSweeper::build(
+                gpu,
+                SweepSetup {
+                    label: &label,
+                    shader: &shader,
+                    vars_init: &state_words(start),
+                    table: &setup.table,
+                    site_color: &site_colors(lattice),
+                    params: &setup.params,
+                    dimension: D as u32,
+                    cell: setup.cell,
+                    n_vars,
+                    // One thread per site on either cell: a site pass owns one
+                    // variable per thread, and a link pass owns the one link
+                    // each site bases in the pass's direction.
+                    threads: lattice.n_sites(),
+                    colors: crate::updater::checkerboard_colors(setup.cell, D) as u32,
+                    sweeps_between,
+                    batch,
+                },
+            ),
+        }
+    }
+
+    /// Advance the chain by `sweeps` sweeps on the device, producing no
+    /// snapshot — the GPU counterpart of
+    /// [`Chain::advance`](crate::chain::Chain::advance), used to discard
+    /// warmup.
+    pub fn advance(&mut self, sweeps: usize) {
+        self.sweeper.advance(sweeps);
+    }
+}
+
+impl<const Q: usize> Iterator for GpuChain<Q> {
+    type Item = Configuration<Q>;
+
+    /// Yield the next sampled configuration, running a fresh batch on the
+    /// device when the host-side buffer drains. Always `Some`: the chain is
+    /// open-ended, so callers bound it with `.take(n)`.
+    fn next(&mut self) -> Option<Self::Item> {
+        self.sweeper.next_sample()
+    }
+}
+
 /// Assert every extent is even, the precondition a parallel color pass carries.
 ///
 /// Under periodic boundaries an odd extent wraps a variable onto a same-color
@@ -641,6 +813,48 @@ pub(crate) fn require_gpu() -> Option<Gpu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every model snippet assembles with both kernels into a shader whose
+    /// tokens are all filled and whose contract names are all present.
+    ///
+    /// This runs without a device, so it is the check a machine with no
+    /// adapter still gets: token drift or a renamed contract function fails
+    /// here as a unit test rather than only at pipeline build. Full naga
+    /// validation still happens at `GpuChain::build`, which the GPU tests
+    /// exercise wherever an adapter exists. The Potts substitution is
+    /// restated here rather than imported because `shader_for` is private to
+    /// the Potts backend; two vec4 slots stand in for any real state count.
+    #[test]
+    fn every_model_and_kernel_pairing_assembles() {
+        let snippets: [(&str, String, Cell); 3] = [
+            (
+                "ising",
+                include_str!("models/ising/model.wgsl").to_string(),
+                Cell::Site,
+            ),
+            (
+                "gauge",
+                include_str!("models/gauge/model.wgsl").to_string(),
+                Cell::Link,
+            ),
+            (
+                "potts",
+                include_str!("models/potts/model.wgsl").replace("$H_VECTORS$", "2"),
+                Cell::Site,
+            ),
+        ];
+        for (label, snippet, cell) in snippets {
+            for kernel in [Kernel::Metropolis, Kernel::HeatBath] {
+                let shader = assemble_shader(&snippet, kernel, cell, 5);
+                for needle in ["fn energy_delta(", "fn update(", "fn sweep("] {
+                    assert!(
+                        shader.contains(needle),
+                        "{label} with {kernel:?}: assembled shader lacks {needle}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The launch grid covers every thread, never overruns an axis, and only
     /// becomes two-dimensional once one row cannot hold the work.

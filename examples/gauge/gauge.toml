@@ -20,12 +20,13 @@ beta = 0.75        # inverse temperature; the transition sits at beta_c ~ 0.7613
                    # Expect a long tau_int here for the usual reason: a chain
                    # near a transition decorrelates slowly.
 
-# Driver controls. A gauge run accepts the three updaters that schedule links:
-# "metropolis", "link_checkerboard", and "gpu_link_checkerboard". The
-# checkerboards visit links in a fixed color order rather than at random, which
-# samples the same distribution; the GPU one needs every extent even, since its
-# color pass runs in parallel. The site schedules color sites, which says nothing
-# about variables living on links, so they are rejected.
+# Driver controls. A run is named by three orthogonal fields: `updater` picks
+# the rule ("metropolis" or "heat_bath" here — "swendsen_wang" is rejected,
+# since a plaquette energy has no bond graph to build clusters on), `schedule`
+# picks the walk ("random" when omitted, or "checkerboard", which on this
+# model colors links by direction and base-site parity), and `backend` picks
+# where it runs ("cpu" when omitted, or "gpu", which needs the checkerboard
+# schedule and even extents).
 updater = "metropolis"  # optional, defaults to "metropolis"
 thermalize = 500        # warmup sweeps, discarded
 sweeps_between = 5      # decorrelation sweeps between samples

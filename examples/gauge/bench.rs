@@ -29,11 +29,10 @@
 use std::time::Instant;
 
 use plaquette::chain::Chain;
-use plaquette::device::Kernel;
-use plaquette::models::gauge::GpuGaugeChain;
 use plaquette::models::gauge::Z2Gauge;
+use plaquette::models::gauge::gpu_chain;
 use plaquette::rng::RandRng;
-use plaquette::{Cell, Configuration, Gpu, Lattice, LinkCheckerboard, Metropolis, Updater};
+use plaquette::{Cell, Configuration, Gpu, Kernel, Lattice, LocalUpdate, Schedule, Updater};
 
 const BETA: f64 = 0.75;
 const J: f64 = 1.0;
@@ -61,8 +60,12 @@ fn main() {
         let cpu_sweeps = (CPU_UPDATE_BUDGET / n_links).clamp(20, 2000);
         let gpu_sweeps = (GPU_UPDATE_BUDGET / n_links).clamp(100, 4000);
 
-        let metro = cpu_mlups(l, cpu_sweeps, Metropolis);
-        let cboard = cpu_mlups(l, cpu_sweeps, LinkCheckerboard);
+        let metro = cpu_mlups(l, cpu_sweeps, LocalUpdate::default());
+        let cboard = cpu_mlups(
+            l,
+            cpu_sweeps,
+            LocalUpdate::new(Kernel::Metropolis, Schedule::Checkerboard),
+        );
         let gpu = gpu_mlups(l, gpu_sweeps);
 
         println!(
@@ -99,7 +102,7 @@ fn gpu_mlups(l: usize, sweeps: usize) -> f64 {
     let lattice = Lattice::new([l, l, l]);
     let mut rng = RandRng::seed_from_u64(2);
     let start = Configuration::<2>::hot(&lattice, Cell::Link, &mut rng);
-    let mut chain = GpuGaugeChain::new(
+    let mut chain = gpu_chain(
         gpu,
         &lattice,
         J,
