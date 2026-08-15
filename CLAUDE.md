@@ -117,6 +117,9 @@ overwriting it.
 - Implement in small, reviewable steps so I stay aware of what is happening. For
   something multi-part (e.g. a struct and its methods), build the minimal base
   first, check in, then add one piece at a time.
+- Run `cargo doc --no-deps` alongside fmt, clippy, and test. `Cargo.toml` denies
+  the rustdoc lints, and clippy does not evaluate them, so a broken or private
+  intra-doc link passes every other local check and fails only in CI.
 
 ### TODOs
 
