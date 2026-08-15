@@ -4,5 +4,8 @@
 # credentials into .sbx/, so the directory is ignored by default and the kit is
 # named back in. Ignoring the contents rather than the directory itself is what
 # lets the negation take effect: git does not descend into an excluded directory.
+# The same rule is why .sbx/ is named back in first: a user's global ignore file
+# may exclude the directory outright, and a pattern here beats one from there.
+!/.sbx
 /.sbx/*
 !/.sbx/kit

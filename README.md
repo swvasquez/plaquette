@@ -155,7 +155,7 @@ cargo test
 
 `plaquette` is developed with AI assistance. The conventions that shape the code and docs are written down as rules under `.claude/rules/`, each a Markdown file scoped by a `paths:` glob to the files it applies to (for example, the README style guide in `.claude/rules/readme.md`).
 
-Claude Code can be run against this repository inside a Docker Sandboxes microVM, isolated from the host and with the local network denied. [`.sbx/kit/spec.yaml`](.sbx/kit/spec.yaml) describes the sandbox and the [`justfile`](justfile) drives it. To use the sandbox, install `just` and `sbx`.
+Claude Code can be run against this repository inside a Docker Sandboxes microVM, isolated from the host and with the local network denied. [`.sbx/kit/spec.yaml`](.sbx/kit/spec.yaml) describes the sandbox and the [`justfile`](justfile) drives it. Claude Code is configured in [`.sbx/kit/settings.json`](.sbx/kit/settings.json). To use the sandbox, install `just` and `sbx`.
 
 | Command | Description |
 | --- | --- |

@@ -95,3 +95,23 @@ setup:
           echo "export CLAUDE_CONFIG_DIR=$WORKSPACE_DIR/.sbx/claude"
           > /etc/sandbox-persistent.sh
       user: "0"
+    # How the agent behaves in the sandbox is declared in settings.json beside
+    # this file, and reaches Claude Code as the policy settings it reads from
+    # /etc/claude-code on Linux. That tier is what makes the file authoritative:
+    # Claude Code never writes to it, so a declared setting cannot be undone by
+    # a `/config` edit the way one in .sbx/claude/settings.json can, and it
+    # applies to every agent in the sandbox rather than only the one `just
+    # sbx-agent` starts. Nothing else is locked down — permission rules from the
+    # repository still merge, and the mode can still be switched mid-session.
+    #
+    # Linked rather than copied so editing the file takes effect at the next
+    # launch, which is what keeps day-to-day configuration off the recreate
+    # path. Only adding the link needs a restart, since this runs at startup.
+    - command:
+        - sh
+        - -c
+        - >-
+          mkdir -p /etc/claude-code &&
+          ln -sfn "$WORKSPACE_DIR/.sbx/kit/settings.json"
+          /etc/claude-code/managed-settings.json
+      user: "0"

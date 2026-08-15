@@ -11,7 +11,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # A kit only takes effect at creation, so changing it means recreating the
 # sandbox. Nothing is lost: the Claude Code configuration and session history the
-# kit puts under .sbx/ live on the host and outlive the sandbox.
+# kit puts under .sbx/ live on the host and outlive the sandbox. The exception is
+# .sbx/kit/settings.json, which holds how the agent behaves: the kit links to it
+# rather than installing a copy, so editing it takes effect at the next
+# `just sbx-agent`.
 #
 # The denied ranges are what keeps the sandbox off the LAN: the three RFC 1918
 # private blocks, RFC 3927 link-local (where cloud metadata endpoints such as
