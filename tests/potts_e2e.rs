@@ -1109,10 +1109,18 @@ fn run_decoupled(offset: f64, beta: f64, seed: u64, updater: &str) -> Measured {
 /// order parameter follow from it, so a sign error or a factor in the offset
 /// shows up immediately in a number rather than in a trend.
 ///
-/// Running all three backends is the point: the GPU kernel carries the offsets
-/// in its own uniform block, packed four to a `vec4`, and unpacks them with
+/// Running every backend is the point: the GPU kernels carry the offsets in
+/// their own uniform block, packed four to a `vec4`, and unpack them with
 /// arithmetic the CPU path does not share. Nothing else in this file would catch
 /// that unpacking being wrong.
+///
+/// The heat-bath rows are the sharpest of the set. At `j = 0` the conditional
+/// that kernel draws from *is* the single-site Boltzmann distribution being
+/// checked, with the offsets as its only non-flat term — so a sign error or a
+/// mispacked offset in the heat-bath weights lands directly on the closed form
+/// with nothing to dilute it. These rows are also the only end-to-end runs of
+/// the Potts heat bath with offsets at all; the agreement tests above run it
+/// symmetric.
 #[test]
 fn a_decoupled_run_reproduces_the_exact_boltzmann_populations() {
     const Q: f64 = 3.0;
@@ -1127,6 +1135,9 @@ fn a_decoupled_run_reproduces_the_exact_boltzmann_populations() {
         (20260950, "metropolis"),
         (20260951, "checkerboard"),
         (20260952, "gpu_checkerboard"),
+        (20260953, "heat_bath"),
+        (20260954, "checkerboard_heat_bath"),
+        (20260955, "gpu_checkerboard_heat_bath"),
     ];
     for (seed, updater) in backends {
         if updater.starts_with("gpu") && !gpu_available() {
