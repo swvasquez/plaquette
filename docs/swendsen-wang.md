@@ -8,9 +8,10 @@ models the construction does not reach. The code it describes is
 `ClusterUpdate` in `src/updater.rs` (Swendsen–Wang is the `Extent::All`,
 `Relabel::Redraw` composition), the model-side seam `BondAction` in
 `src/action.rs`, the labeling in `src/cluster.rs`, and the device backend in
-`src/models/potts/gpu_cluster.rs`. `docs/metropolis.md` is the companion piece
-for the local updates, and everything here assumes its account of detailed
-balance.
+`src/gpu_cluster.rs`. `docs/metropolis.md` is the companion piece for the
+local updates, and everything here assumes its account of detailed balance;
+`docs/wolff.md` covers the single-cluster sibling built on the same
+representation.
 
 Throughout, $H$ is the energy, $\beta$ the inverse temperature, $N$ the number
 of sites, $D$ the dimension, and $q$ the number of states a site can take.
@@ -320,12 +321,11 @@ comparing them are distributional.
 
 ## What is not built
 
-Wolff's single-cluster variant grows one cluster from a random seed site and
-relabels only that, which samples the same joint distribution with a different
-choice of what to update per move and is usually somewhat faster. It needs
-exactly the data `BondAction` already supplies and exactly the lattice walk
-`cluster::site_clusters` already takes, so nothing here should have to change
-when it arrives — but nothing here is built for it either.
+Wolff's single-cluster variant is no longer on this list: it is built as the
+`Extent::Seeded`, `Relabel::ForcedChange` composition of the same
+`ClusterUpdate`, on both backends, and `docs/wolff.md` is its own account —
+including why relabeling one cluster of the full decomposition (which is how
+the device runs it) is the same move as growing one.
 
 Two generalizations of the bond step are left out deliberately, and both are
 noted where they would go. Per-bond couplings would make the gap a function of

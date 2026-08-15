@@ -1,5 +1,6 @@
-//! The GPU cluster backend: a [`GpuClusterChain`] running the Swendsen–Wang
-//! sweep on the device, exposed through the same
+//! The GPU cluster backend: a [`GpuClusterChain`] running a cluster sweep —
+//! Swendsen–Wang or Wolff, composed from the same [`Extent`] and [`Relabel`]
+//! axes as the CPU updater — on the device, exposed through the same
 //! `Iterator<Item = Configuration>` interface as the CPU
 //! [`Chain`](crate::chain::Chain).
 //!
@@ -24,11 +25,23 @@
 //! alone.
 //!
 //! The shaders stay split all the same. `cluster_prelude.wgsl` holds the graph
-//! stages and `cluster_relabel.wgsl` the move, so a model whose cluster move is
-//! not a uniform redraw — a clock model reflecting about an axis, say — can
-//! supply its own fourth stage without touching the first three. That seam is
-//! kept open on the strength of the shaders being separable, not on a guess
-//! about which model will need it.
+//! stages and `cluster_relabel.wgsl` the move — both moves, since the redraw
+//! and the forced change differ only in the label arithmetic and share the
+//! keyed draw. A model whose cluster move is neither — a clock model
+//! reflecting about an axis, say — would supply its own fourth stage without
+//! touching the first three. That seam is kept open on the strength of the
+//! shaders being separable, not on a guess about which model will need it.
+//!
+//! Wolff's seeded extent runs here as a filter on the full decomposition
+//! rather than as a frontier walk: the prelude labels every cluster as it does
+//! for Swendsen–Wang, and the relabel stage moves only the cluster holding a
+//! keyed uniformly drawn seed site. Picking the cluster under a uniformly
+//! random site is exactly Wolff's size-biased cluster choice, so the move is
+//! the same one the CPU growth makes; what differs is the cost. A device Wolff
+//! sweep pays for labeling the whole lattice and updates one cluster, so it
+//! buys agreement with the CPU updater rather than speed — Swendsen–Wang
+//! remains the natural cluster move on the device, and `docs/wolff.md` says
+//! when the seeded move is worth that price anyway.
 //!
 //! # Why the host is in the loop
 //!
@@ -58,7 +71,7 @@ use crate::device::{
 };
 use crate::lattice::Lattice;
 use crate::state::State;
-use crate::updater::ClusterUpdate;
+use crate::updater::{ClusterUpdate, Extent, Relabel};
 
 /// The four-stage kernel: the shared randomness, the graph stages, and the
 /// relabel.
@@ -104,13 +117,15 @@ struct Params {
     seed: u32,
     p: f32,
     n_states: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    /// 1 when only the seed site's cluster is relabeled ([`Extent::Seeded`]).
+    seeded: u32,
+    /// 1 when the label is forced to change ([`Relabel::ForcedChange`]).
+    forced: u32,
+    _pad: u32,
 }
 
-/// A Markov chain advanced by Swendsen–Wang cluster updates on the GPU, yielding
-/// sampled [`Configuration`]s on sites.
+/// A Markov chain advanced by cluster updates — Swendsen–Wang or Wolff — on
+/// the GPU, yielding sampled [`Configuration`]s on sites.
 ///
 /// A sibling of [`Chain`](crate::chain::Chain): same iterator interface, device
 /// machinery underneath. Owns everything it needs, so it borrows nothing and can
@@ -159,8 +174,58 @@ pub struct GpuClusterChain<const Q: usize> {
 }
 
 impl<const Q: usize> GpuClusterChain<Q> {
+    /// The Swendsen–Wang composition: every cluster, freshly redrawn — the
+    /// device counterpart of [`ClusterUpdate::swendsen_wang`].
+    pub fn swendsen_wang<const D: usize, M: BondAction<Q>>(
+        gpu: Gpu,
+        lattice: &Lattice<D>,
+        model: &M,
+        beta: f64,
+        seed: u64,
+        start: &Configuration<Q>,
+        sweeps_between: usize,
+    ) -> Self {
+        Self::new(
+            gpu,
+            lattice,
+            model,
+            Extent::All,
+            Relabel::Redraw,
+            beta,
+            seed,
+            start,
+            sweeps_between,
+        )
+    }
+
+    /// The Wolff composition: one seeded cluster, forced onto a different
+    /// label — the device counterpart of [`ClusterUpdate::wolff`]. See
+    /// `docs/wolff.md`, and the module docs for what the seeded extent costs
+    /// on the device.
+    pub fn wolff<const D: usize, M: BondAction<Q>>(
+        gpu: Gpu,
+        lattice: &Lattice<D>,
+        model: &M,
+        beta: f64,
+        seed: u64,
+        start: &Configuration<Q>,
+        sweeps_between: usize,
+    ) -> Self {
+        Self::new(
+            gpu,
+            lattice,
+            model,
+            Extent::Seeded,
+            Relabel::ForcedChange,
+            beta,
+            seed,
+            start,
+            sweeps_between,
+        )
+    }
+
     /// Build a cluster chain on `gpu` over a copy of `start`, uploaded to the
-    /// device.
+    /// device, composed from the same axes as [`ClusterUpdate::new`].
     ///
     /// `start` is read only to upload it, so the host copy is untouched and the
     /// same configuration can seed a CPU run too. `model` supplies the bond gap,
@@ -180,12 +245,20 @@ impl<const Q: usize> GpuClusterChain<Q> {
     /// # Panics
     ///
     /// Panics if `Q` is below two, if `start` is not a site field of this
-    /// lattice, or — through [`ClusterUpdate::swendsen_wang`] — if the model's
-    /// symmetry-breaking term rules the cluster move out. Extents may be odd.
+    /// lattice, or — through [`ClusterUpdate::new`] — if the model's
+    /// symmetry-breaking term rules the cluster move out or the composition
+    /// itself is refused. Extents may be odd.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the run parameters mirror ClusterUpdate::new plus the device \
+                  chain's own; a builder for one call site is not worth it"
+    )]
     pub fn new<const D: usize, M: BondAction<Q>>(
         gpu: Gpu,
         lattice: &Lattice<D>,
         model: &M,
+        extent: Extent,
+        relabel: Relabel,
         beta: f64,
         seed: u64,
         start: &Configuration<Q>,
@@ -209,10 +282,11 @@ impl<const Q: usize> GpuClusterChain<Q> {
             "start configuration and lattice disagree on site count"
         );
 
-        // The symmetry and coupling guards, and the probability formula, come
-        // from the CPU updater rather than being restated here — a device path
-        // that opened its bonds by a different rule would be the whole bug.
-        let p = ClusterUpdate::swendsen_wang(model).bond_probability(beta);
+        // The symmetry, coupling, and composition guards, and the probability
+        // formula, come from the CPU updater rather than being restated here —
+        // a device path that opened its bonds by a different rule would be the
+        // whole bug.
+        let p = ClusterUpdate::new(model, extent, relabel).bond_probability(beta);
 
         let device = &gpu.device;
         let n_sites = lattice.n_sites();
@@ -242,9 +316,9 @@ impl<const Q: usize> GpuClusterChain<Q> {
             seed: fold_seed(seed),
             p: p as f32,
             n_states: Q as u32,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            seeded: u32::from(extent == Extent::Seeded),
+            forced: u32::from(relabel == Relabel::ForcedChange),
+            _pad: 0,
         };
 
         let labels = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -406,8 +480,8 @@ impl<const Q: usize> GpuClusterChain<Q> {
         }
     }
 
-    /// One Swendsen–Wang sweep: place the bonds, label the components, relabel
-    /// each component.
+    /// One cluster sweep: place the bonds, label the components, relabel each
+    /// selected component under the composed axes.
     ///
     /// # Panics
     ///
@@ -582,7 +656,8 @@ mod tests {
         let mut rng = RandRng::seed_from_u64(0);
         let start = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
 
-        let mut chain = GpuClusterChain::new(gpu, &lat, &Potts::symmetric(1.0), 0.5, 7, &start, 0);
+        let mut chain =
+            GpuClusterChain::swendsen_wang(gpu, &lat, &Potts::symmetric(1.0), 0.5, 7, &start, 0);
         let got = chain.next().expect("open-ended stream yields");
 
         assert_eq!(got, start, "zero-sweep round-trip must be the identity");
@@ -608,8 +683,15 @@ mod tests {
         let mut rng = RandRng::seed_from_u64(1);
         let start = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
 
-        let mut chain =
-            GpuClusterChain::new(gpu, &lat, &Potts::<Q>::symmetric(1.0), 0.0, 99, &start, 1);
+        let mut chain = GpuClusterChain::swendsen_wang(
+            gpu,
+            &lat,
+            &Potts::<Q>::symmetric(1.0),
+            0.0,
+            99,
+            &start,
+            1,
+        );
         for config in chain.by_ref().take(4) {
             let mut counts = [0usize; Q];
             for state in config.variables() {
@@ -646,7 +728,7 @@ mod tests {
         let model = Potts::<3>::symmetric(1.0);
         let start = Configuration::<3>::cold(&lat, Cell::Site);
 
-        let mut chain = GpuClusterChain::new(gpu, &lat, &model, 8.0, 99, &start, 1);
+        let mut chain = GpuClusterChain::swendsen_wang(gpu, &lat, &model, 8.0, 99, &start, 1);
         for config in chain.by_ref().take(4) {
             let first = config.peek(0);
             assert!(
@@ -669,7 +751,7 @@ mod tests {
         let mut rng = RandRng::seed_from_u64(5);
         let start = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
 
-        let mut chain = GpuClusterChain::new(gpu, &lat, &model, 0.5, 4242, &start, 2);
+        let mut chain = GpuClusterChain::swendsen_wang(gpu, &lat, &model, 0.5, 4242, &start, 2);
         chain.advance(10);
         let config = chain.next().expect("open-ended stream yields");
         assert_eq!(config.n_vars(), lat.n_sites());
@@ -683,9 +765,20 @@ mod tests {
     /// the two consume randomness differently by construction. `ordered` is the
     /// window both means must sit inside, which is what stops the comparison
     /// passing because two backends agree on something wrong.
-    fn compare_backends<const D: usize>(gpu: Gpu, shape: [usize; D], beta: f64) {
+    ///
+    /// Both backends run the composition named by the axes, so the same
+    /// harness compares the Swendsen–Wang and the Wolff pairs. The counts are
+    /// per composition: a Wolff sweep is one cluster rather than a lattice
+    /// pass, so its runs thermalize and decorrelate over more sweeps.
+    fn compare_backends<const D: usize>(
+        gpu: Gpu,
+        shape: [usize; D],
+        beta: f64,
+        extent: Extent,
+        relabel: Relabel,
+        (thermalize, sweeps_between, n): (usize, usize, usize),
+    ) {
         const Q: usize = 3;
-        let (thermalize, sweeps_between, n) = (100, 2, 200);
         let lat = Lattice::new(shape);
         let n_sites = lat.n_sites() as f64;
         let model = Potts::<Q>::symmetric(1.0);
@@ -705,7 +798,7 @@ mod tests {
             use crate::chain::Chain;
             let mut rng = RandRng::seed_from_u64(11);
             let mut cfg = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
-            let updater = ClusterUpdate::swendsen_wang(&model);
+            let updater = ClusterUpdate::new(&model, extent, relabel);
             let mut chain = Chain::new(
                 &mut cfg,
                 &lat,
@@ -722,14 +815,23 @@ mod tests {
         let (e_gpu, m_gpu) = {
             let mut rng = RandRng::seed_from_u64(22);
             let start = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
-            let mut chain =
-                GpuClusterChain::new(gpu, &lat, &model, beta, 12345, &start, sweeps_between);
+            let mut chain = GpuClusterChain::new(
+                gpu,
+                &lat,
+                &model,
+                extent,
+                relabel,
+                beta,
+                12345,
+                &start,
+                sweeps_between,
+            );
             chain.advance(thermalize);
             means(chain.take(n).collect())
         };
 
         eprintln!(
-            "cluster q = 3 on {shape:?} at beta = {beta}: \
+            "{extent:?}/{relabel:?} q = 3 on {shape:?} at beta = {beta}: \
              cpu ({e_cpu:.4}, {m_cpu:.4}), gpu ({e_gpu:.4}, {m_gpu:.4})"
         );
         // Both sides must land on the physics rather than merely on each other:
@@ -759,7 +861,15 @@ mod tests {
         let Some(gpu) = require_gpu() else {
             return;
         };
-        compare_backends(gpu, [16, 16], 1.1); // beta_c = ln(1 + sqrt(3)) ~ 1.005
+        // beta_c = ln(1 + sqrt(3)) ~ 1.005
+        compare_backends(
+            gpu,
+            [16, 16],
+            1.1,
+            Extent::All,
+            Relabel::Redraw,
+            (100, 2, 200),
+        );
     }
 
     /// The same comparison in three dimensions, which is what the `D`-dependent
@@ -789,7 +899,89 @@ mod tests {
         let Some(gpu) = require_gpu() else {
             return;
         };
-        compare_backends(gpu, [6, 6, 6], 0.65);
+        compare_backends(
+            gpu,
+            [6, 6, 6],
+            0.65,
+            Extent::All,
+            Relabel::Redraw,
+            (100, 2, 200),
+        );
+    }
+
+    /// The device Wolff sweep samples the same distribution the host Wolff
+    /// updater does — the two seeded extents are different constructions (a
+    /// frontier growth against a filtered full decomposition), so their
+    /// agreement is a real check on both, not a shared-code tautology. One
+    /// sweep is one cluster, hence the larger thermalization and stride.
+    #[test]
+    fn matches_the_cpu_wolff_distribution() {
+        let Some(gpu) = require_gpu() else {
+            return;
+        };
+        compare_backends(
+            gpu,
+            [16, 16],
+            1.1,
+            Extent::Seeded,
+            Relabel::ForcedChange,
+            (600, 8, 200),
+        );
+    }
+
+    /// At very large `beta` a uniform start is one cluster holding every site,
+    /// so a device Wolff sweep repaints the whole lattice onto a different
+    /// label every time — uniform after each sweep, never the label it had.
+    ///
+    /// This pins the two Wolff-specific shader branches at once: the seeded
+    /// filter keeps the (single) seed cluster rather than dropping everything,
+    /// and the forced change never lands on the current label, which at
+    /// `Q = 2` a redraw would half the time.
+    #[test]
+    fn a_device_wolff_sweep_repaints_a_uniform_lattice() {
+        let Some(gpu) = require_gpu() else {
+            return;
+        };
+        let lat = Lattice::new([8, 8]);
+        let model = Potts::<2>::symmetric(1.0);
+        let start = Configuration::<2>::cold(&lat, Cell::Site);
+
+        let mut chain = GpuClusterChain::wolff(gpu, &lat, &model, 8.0, 3, &start, 1);
+        let mut previous = start.peek(0);
+        for config in chain.by_ref().take(6) {
+            let first = config.peek(0);
+            assert!(
+                config.variables().iter().all(|&s| s == first),
+                "one cluster must land on one label"
+            );
+            assert_ne!(first, previous, "the forced change must change the label");
+            previous = first;
+        }
+    }
+
+    /// At `beta = 0` no bond opens, so the seeded cluster is the seed alone
+    /// and a device Wolff sweep moves exactly one site — the opposite limit,
+    /// and the one that catches a seeded filter matching more than the seed's
+    /// cluster.
+    #[test]
+    fn at_zero_beta_a_device_wolff_sweep_moves_one_site() {
+        let Some(gpu) = require_gpu() else {
+            return;
+        };
+        let lat = Lattice::new([8, 8]);
+        let model = Potts::<3>::symmetric(1.0);
+        let mut rng = RandRng::seed_from_u64(2);
+        let start = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
+
+        let mut chain = GpuClusterChain::wolff(gpu, &lat, &model, 0.0, 17, &start, 1);
+        let mut previous = start;
+        for config in chain.by_ref().take(6) {
+            let changed = (0..lat.n_sites())
+                .filter(|&s| config.peek(s) != previous.peek(s))
+                .count();
+            assert_eq!(changed, 1, "only the seed site may move at p = 0");
+            previous = config;
+        }
     }
 
     /// A model with per-label offsets is refused, through the same construction
@@ -807,7 +999,7 @@ mod tests {
         };
         let lat = Lattice::new([4, 4]);
         let start = Configuration::<3>::cold(&lat, Cell::Site);
-        let _ = GpuClusterChain::new(
+        let _ = GpuClusterChain::swendsen_wang(
             gpu,
             &lat,
             &Potts::<3>::new(1.0, [0.5, 0.0, 0.0]),
@@ -835,7 +1027,7 @@ mod tests {
         let mut rng = RandRng::seed_from_u64(20260718);
         let start = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
-        let mut chain = GpuClusterChain::new(gpu, &lat, &model, 0.88, 7, &start, 2);
+        let mut chain = GpuClusterChain::swendsen_wang(gpu, &lat, &model, 0.88, 7, &start, 2);
         chain.advance(6);
         let config = chain.next().expect("open-ended stream yields");
         assert_eq!(config.n_vars(), lat.n_sites());

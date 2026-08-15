@@ -1,5 +1,6 @@
-// Shared preamble for every cluster kernel: the buffers a Swendsen-Wang sweep
-// works over, and the three stages that are pure graph work.
+// Shared preamble for every cluster kernel: the buffers a cluster sweep
+// (Swendsen-Wang or Wolff) works over, and the three stages that are pure
+// graph work.
 //
 // Compiled after `wgsl/rng.wgsl`, whose `linear_index`, `lowbias32`
 // and `keyed_uniform` it reuses rather than restating — every kernel in the
@@ -33,9 +34,9 @@ struct Params {
     seed: u32,
     p: f32,             // bond probability, 1 - exp(-beta * gap), computed on the host
     n_states: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    seeded: u32,        // 1 = relabel only the seed site's cluster (Extent::Seeded)
+    forced: u32,        // 1 = force the label to change (Relabel::ForcedChange)
+    _pad: u32,
 };
 
 struct Push {

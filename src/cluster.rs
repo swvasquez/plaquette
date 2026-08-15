@@ -11,9 +11,15 @@
 //! It sits at the root rather than inside [`updater`](crate::updater) for that
 //! reason — the eventual consumers differ in their predicate and in nothing
 //! else. [`ClusterUpdate`](crate::updater::ClusterUpdate) is the first;
-//! percolation observables (mean cluster size, wrapping probability) and a Wolff
-//! updater growing a single cluster would each pass a different closure to the
-//! same function.
+//! percolation observables (mean cluster size, wrapping probability) would pass
+//! another closure to the same function.
+//!
+//! [`grow_cluster`] is the single-cluster counterpart: it starts from a seed
+//! site and walks outward only over bonds the predicate opens, touching work
+//! proportional to the cluster it returns rather than to the lattice. It exists
+//! for the Wolff updater, whose whole advantage on the CPU is that a move costs
+//! the cluster and not the volume, and it carries the same no-physics contract
+//! as [`site_clusters`].
 
 use crate::lattice::Lattice;
 
@@ -53,6 +59,55 @@ pub fn site_clusters<const D: usize>(
     }
 
     forest.into_clusters()
+}
+
+/// Grow one cluster outward from `seed` under a caller-supplied bond test,
+/// returning its member sites in the order they were reached (`seed` first).
+///
+/// `joined` receives the site already inside the cluster first and the outside
+/// candidate second, and returns whether the bond between them is open. It is
+/// asked exactly once per bond that runs from a member to a site not yet in the
+/// cluster at the moment the member is processed: a candidate that refuses one
+/// bond may be offered again over a *different* bond from another member, but
+/// never twice over the same one, and a bond whose far end has already joined
+/// is not offered at all. That per-bond accounting is what a Wolff updater's
+/// detailed balance rests on, so it is part of the contract rather than an
+/// implementation detail — as is the walk order (members processed in the
+/// order they joined, each offering its neighbor row in `+0, −0, +1, −1, …`
+/// order), because a stochastic predicate's draws land in the stream in the
+/// order the bonds are offered.
+///
+/// The two degeneracies of the periodic wrap are handled the way
+/// [`site_clusters`] handles them: on an extent of one a site is its own
+/// neighbor and the self-bond is never offered, and on an extent of two the
+/// forward and backward neighbors coincide, so the same pair is offered twice —
+/// two distinct bonds, either of which may open.
+///
+/// Work is proportional to the cluster's boundary-and-interior bond count, not
+/// to the lattice, which is the reason this exists beside [`site_clusters`].
+pub fn grow_cluster<const D: usize>(
+    lattice: &Lattice<D>,
+    seed: usize,
+    mut joined: impl FnMut(usize, usize) -> bool,
+) -> Vec<usize> {
+    let mut member = vec![false; lattice.n_sites()];
+    member[seed] = true;
+    let mut cluster = vec![seed];
+
+    // The frontier indexes into `cluster` rather than copying sites: everything
+    // ever pushed is a member, and members are never removed.
+    let mut next = 0;
+    while next < cluster.len() {
+        let site = cluster[next];
+        next += 1;
+        for &partner in lattice.site_neighbors(site) {
+            if !member[partner] && joined(site, partner) {
+                member[partner] = true;
+                cluster.push(partner);
+            }
+        }
+    }
+    cluster
 }
 
 /// A partition of the sites into clusters, with labels compacted to
@@ -410,5 +465,81 @@ mod tests {
 
         assert_eq!(calls, 2 * lat.n_sites());
         assert!(clusters.n_clusters() < lat.n_sites());
+    }
+
+    /// A growth that opens every bond reaches the whole lattice, and one that
+    /// opens none stays on the seed — the two ends the Wolff updater hits at
+    /// large and zero `beta`.
+    #[test]
+    fn a_grown_cluster_spans_the_two_limits() {
+        let lat = Lattice::new([4, 6]);
+
+        let all = grow_cluster(&lat, 5, |_, _| true);
+        assert_eq!(all.len(), lat.n_sites());
+        assert_eq!(all[0], 5, "the seed is the first member");
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..lat.n_sites()).collect::<Vec<_>>());
+
+        assert_eq!(grow_cluster(&lat, 5, |_, _| false), vec![5]);
+    }
+
+    /// Under a deterministic symmetric predicate the grown cluster is exactly
+    /// the [`site_clusters`] component holding the seed — the two walks name
+    /// the same partition cell, reached from opposite ends.
+    #[test]
+    fn a_grown_cluster_is_the_seeds_connected_component() {
+        fn probe<const D: usize>(shape: [usize; D]) {
+            let lat = Lattice::new(shape);
+            // Symmetric in (i, j), so growth (offered from the inside out) and
+            // the forward-bond walk of `site_clusters` agree on which bonds
+            // are open.
+            let open = |i: usize, j: usize| (i + j).is_multiple_of(3);
+            let clusters = site_clusters(&lat, open);
+
+            for seed in 0..lat.n_sites() {
+                let mut grown = grow_cluster(&lat, seed, open);
+                grown.sort_unstable();
+                let label = clusters.labels()[seed];
+                let component: Vec<usize> = (0..lat.n_sites())
+                    .filter(|&s| clusters.labels()[s] == label)
+                    .collect();
+                assert_eq!(grown, component, "{shape:?}, seed {seed}");
+            }
+        }
+
+        probe([6]);
+        probe([4, 6]);
+        probe([3, 4, 5]);
+        // The wrap degeneracies: a self-loop on an extent of one, a doubled
+        // bond on an extent of two.
+        probe([1, 8]);
+        probe([2, 5]);
+    }
+
+    /// Each bond from a member to a then-outside site is offered exactly once,
+    /// and a bond whose far end already joined is not offered at all. Offering
+    /// one twice would turn the Wolff add-probability `p` into `1 − (1−p)²` —
+    /// the same silent error `every_bond_is_offered_exactly_once` guards
+    /// against for the full decomposition.
+    #[test]
+    fn a_growth_offers_each_bond_at_most_once() {
+        let lat = Lattice::new([4, 6]);
+        let mut offered: Vec<(usize, usize)> = Vec::new();
+        // Open enough bonds that the cluster has interior sites and refused
+        // candidates that later join over another bond.
+        grow_cluster(&lat, 0, |i, j| {
+            offered.push((i, j));
+            (i * 7 + j) % 2 == 0
+        });
+
+        let mut bonds: Vec<(usize, usize)> =
+            offered.iter().map(|&(i, j)| (i.min(j), i.max(j))).collect();
+        let total = bonds.len();
+        bonds.sort_unstable();
+        bonds.dedup();
+        // On extents above two, one unordered pair is one bond; a duplicate
+        // offer would survive the dedup as a shrunken list.
+        assert_eq!(bonds.len(), total, "some bond was offered twice");
     }
 }

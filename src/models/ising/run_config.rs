@@ -75,7 +75,8 @@ pub struct IsingRunConfig {
     #[serde(default = "default_updater")]
     pub updater: UpdaterRule,
     /// Which schedule a local rule runs under; omitted means the random
-    /// schedule. Must stay unset for [`UpdaterRule::SwendsenWang`], which has
+    /// schedule. Must stay unset for the cluster rules
+    /// ([`UpdaterRule::SwendsenWang`] and [`UpdaterRule::Wolff`]), which have
     /// no schedule at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleKind>,
@@ -374,16 +375,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_round_trips_the_cluster_updater() {
-        let mut config = sample_config();
-        config.updater = UpdaterRule::SwendsenWang;
+    fn parses_and_round_trips_the_cluster_updaters() {
+        for (rule, rendered) in [
+            (UpdaterRule::SwendsenWang, r#"updater = "swendsen_wang""#),
+            (UpdaterRule::Wolff, r#"updater = "wolff""#),
+        ] {
+            let mut config = sample_config();
+            config.updater = rule;
 
-        let text = config.to_toml().unwrap();
-        assert!(text.contains(r#"updater = "swendsen_wang""#));
-        assert_eq!(
-            IsingRunConfig::parse(&text).unwrap().updater,
-            UpdaterRule::SwendsenWang
-        );
+            let text = config.to_toml().unwrap();
+            assert!(text.contains(rendered), "{rule:?}: {text}");
+            assert_eq!(IsingRunConfig::parse(&text).unwrap().updater, rule);
+        }
     }
 
     #[test]
@@ -392,18 +395,23 @@ mod tests {
         // flipping a whole cluster at once relies on. The load-time counterpart
         // of `ClusterUpdate::new`'s panic.
         for backend in [BackendKind::Cpu, BackendKind::Gpu] {
-            let mut config = sample_config();
-            config.updater = UpdaterRule::SwendsenWang;
-            config.backend = backend;
-            config.h = 0.25;
-            let message = invalid_message(&config);
-            assert!(
-                message.contains("spin-flip symmetry"),
-                "{backend:?}: {message}"
-            );
+            for rule in [UpdaterRule::SwendsenWang, UpdaterRule::Wolff] {
+                let mut config = sample_config();
+                config.updater = rule;
+                config.backend = backend;
+                config.h = 0.25;
+                let message = invalid_message(&config);
+                assert!(
+                    message.contains("spin-flip symmetry"),
+                    "{backend:?} / {rule:?}: {message}"
+                );
 
-            config.h = 0.0;
-            assert!(config.validate().is_ok(), "{backend:?}: field-free is fine");
+                config.h = 0.0;
+                assert!(
+                    config.validate().is_ok(),
+                    "{backend:?} / {rule:?}: field-free is fine"
+                );
+            }
         }
     }
 
@@ -426,11 +434,16 @@ mod tests {
         // A cluster update has no coloring for the periodic wrap to spoil, so
         // unlike the GPU checkerboard it runs on any shape.
         for backend in [BackendKind::Cpu, BackendKind::Gpu] {
-            let mut config = sample_config();
-            config.updater = UpdaterRule::SwendsenWang;
-            config.backend = backend;
-            config.shape = vec![9, 7];
-            assert!(config.validate().is_ok(), "{backend:?} on an odd lattice");
+            for rule in [UpdaterRule::SwendsenWang, UpdaterRule::Wolff] {
+                let mut config = sample_config();
+                config.updater = rule;
+                config.backend = backend;
+                config.shape = vec![9, 7];
+                assert!(
+                    config.validate().is_ok(),
+                    "{backend:?} / {rule:?} on an odd lattice"
+                );
+            }
         }
     }
 
@@ -496,11 +509,13 @@ mod tests {
     fn validate_rejects_a_schedule_on_the_cluster_rule() {
         // The cluster update is not a kernel under a schedule, so naming one
         // alongside it is a contradiction rather than a preference.
-        let mut config = sample_config();
-        config.updater = UpdaterRule::SwendsenWang;
-        config.schedule = Some(ScheduleKind::Checkerboard);
-        let message = invalid_message(&config);
-        assert!(message.contains("takes no schedule"), "{message}");
+        for rule in [UpdaterRule::SwendsenWang, UpdaterRule::Wolff] {
+            let mut config = sample_config();
+            config.updater = rule;
+            config.schedule = Some(ScheduleKind::Checkerboard);
+            let message = invalid_message(&config);
+            assert!(message.contains("takes no schedule"), "{rule:?}: {message}");
+        }
     }
 
     #[test]

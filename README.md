@@ -18,22 +18,18 @@ cargo build
 `plaquette` currently implements several models, each with multiple update
 implementations across the CPU and GPU:
 
-| Model    | Dimension | Implementation                    | Device   |
-| -------- | --------- | --------------------------------- | -------- |
-| Ising    | D ≥ 1     | Metropolis, random schedule       | CPU      |
-| Ising    | D ≥ 1     | Metropolis, checkerboard schedule | CPU, GPU |
-| Ising    | D ≥ 1     | Heat bath, random schedule        | CPU      |
-| Ising    | D ≥ 1     | Heat bath, checkerboard schedule  | CPU, GPU |
-| Ising    | D ≥ 1     | Swendsen–Wang                     | CPU, GPU |
-| Potts    | D ≥ 1     | Metropolis, random schedule       | CPU      |
-| Potts    | D ≥ 1     | Metropolis, checkerboard schedule | CPU, GPU |
-| Potts    | D ≥ 1     | Heat bath, random schedule        | CPU      |
-| Potts    | D ≥ 1     | Heat bath, checkerboard schedule  | CPU, GPU |
-| Potts    | D ≥ 1     | Swendsen–Wang                     | CPU, GPU |
-| Z2 gauge | D ≥ 2     | Metropolis, random schedule       | CPU      |
-| Z2 gauge | D ≥ 2     | Metropolis, checkerboard schedule | CPU, GPU |
-| Z2 gauge | D ≥ 2     | Heat bath, random schedule        | CPU      |
-| Z2 gauge | D ≥ 2     | Heat bath, checkerboard schedule  | CPU, GPU |
+| Model        | Dimension | Implementation             | Device   |
+| ------------ | --------- | -------------------------- | -------- |
+| Ising, Potts | D ≥ 1     | Metropolis (random)        | CPU      |
+| Ising, Potts | D ≥ 1     | Metropolis (checkerboard)  | CPU, GPU |
+| Ising, Potts | D ≥ 1     | Heat bath (random)         | CPU      |
+| Ising, Potts | D ≥ 1     | Heat bath (checkerboard)   | CPU, GPU |
+| Ising, Potts | D ≥ 1     | Swendsen–Wang              | CPU, GPU |
+| Ising, Potts | D ≥ 1     | Wolff                      | CPU, GPU |
+| Z2 gauge     | D ≥ 2     | Metropolis (random)        | CPU      |
+| Z2 gauge     | D ≥ 2     | Metropolis (checkerboard)  | CPU, GPU |
+| Z2 gauge     | D ≥ 2     | Heat bath (random)         | CPU      |
+| Z2 gauge     | D ≥ 2     | Heat bath (checkerboard)   | CPU, GPU |
 
 Note that memory use grows quickly with the dimension: the lattice stores about
 `48 * D * (D - 1)` bytes of precomputed geometry per site. In 16 GB that allows a lattice of size 360³ sites in three dimensions, but only 5¹⁰ sites in ten.
@@ -109,7 +105,7 @@ the last.
 The driver — an example program, or a model's sampler — has already thermalized
 the system. The walk-through follows a local update; a cluster update keeps the
 `Updater` box's outer arrows but replaces its interior with a single collective
-move (`ClusterUpdate`, described in `docs/swendsen-wang.md`).
+move (`ClusterUpdate`, described in `docs/swendsen-wang.md` and `docs/wolff.md`).
 
 1. The driver asks `Chain` for the next snapshot.
 2. `Chain` runs a fixed number of sweeps before handing one back, and each sweep

@@ -55,6 +55,8 @@ fn driver_lines(name: &str) -> String {
         "gpu_checkerboard_heat_bath" => ("heat_bath", Some("checkerboard"), Some("gpu")),
         "swendsen_wang" => ("swendsen_wang", None, None),
         "gpu_swendsen_wang" => ("swendsen_wang", None, Some("gpu")),
+        "wolff" => ("wolff", None, None),
+        "gpu_wolff" => ("wolff", None, Some("gpu")),
         other => panic!("unknown updater shorthand {other}"),
     };
     let mut lines = format!("updater = \"{rule}\"\n");
@@ -67,19 +69,28 @@ fn driver_lines(name: &str) -> String {
     lines
 }
 
-fn run_toml<const D: usize>(
+/// The general TOML builder, with the pacing named by the caller.
+///
+/// Almost every run here uses the shared pacing [`run_toml`] fixes, so the two
+/// runs of a comparison cannot drift apart. The exception is Wolff: its sweep
+/// is one cluster move rather than a pass over the lattice (see
+/// `docs/wolff.md`), so a Wolff run needs its warmup and stride several times
+/// larger to do the same amount of updating.
+fn run_toml_paced<const D: usize>(
     shape: [usize; D],
     beta: f64,
     updater: &str,
     n_samples: usize,
+    thermalize: usize,
+    sweeps_between: usize,
 ) -> String {
     format!(
         "shape = {shape:?}\n\
          j = 1.0\n\
          beta = {beta}\n\
          {driver}\
-         thermalize = 500\n\
-         sweeps_between = 2\n\
+         thermalize = {thermalize}\n\
+         sweeps_between = {sweeps_between}\n\
          n_samples = {n_samples}\n\
          seed = 20260728\n\
          start = \"hot\"\n",
@@ -87,15 +98,23 @@ fn run_toml<const D: usize>(
     )
 }
 
-/// Drive the full public stack at dimension `D` and return the mean of `|M| / N`
+fn run_toml<const D: usize>(
+    shape: [usize; D],
+    beta: f64,
+    updater: &str,
+    n_samples: usize,
+) -> String {
+    run_toml_paced(shape, beta, updater, n_samples, 500, 2)
+}
+
+/// Drive the full public stack over `text` and return the mean of `|M| / N`
 /// over the sampled configs.
 ///
 /// The absolute value is taken per config because the ordered phase settles into
 /// either the up or the down well arbitrarily, so the signed mean would cancel
 /// while `|m|` reports the ordering the assertions are after.
-fn mean_abs_magnetization<const D: usize>(shape: [usize; D], beta: f64, updater: &str) -> f64 {
-    let text = run_toml(shape, beta, updater, N_SAMPLES);
-    let config = IsingRunConfig::parse(&text).expect("run config should parse");
+fn mean_abs_magnetization_from<const D: usize>(text: &str) -> f64 {
+    let config = IsingRunConfig::parse(text).expect("run config should parse");
     let mut sampler = IsingSampler::<D>::new(&config);
 
     let lattice = sampler.lattice();
@@ -109,6 +128,11 @@ fn mean_abs_magnetization<const D: usize>(shape: [usize; D], beta: f64, updater:
         .sum();
 
     sum / N_SAMPLES as f64
+}
+
+/// [`mean_abs_magnetization_from`] under the shared comparison pacing.
+fn mean_abs_magnetization<const D: usize>(shape: [usize; D], beta: f64, updater: &str) -> f64 {
+    mean_abs_magnetization_from::<D>(&run_toml(shape, beta, updater, N_SAMPLES))
 }
 
 /// CPU Metropolis: a single-site Metropolis run orders at low temperature.
@@ -292,8 +316,8 @@ fn the_heat_bath_runs_with_an_external_field() {
 /// with `2 * D = 2` neighbors per site is the narrowest neighbor table the
 /// updaters ever walk.
 ///
-/// Both the local and the cluster update are held to the same closed form, and
-/// for the cluster one this is the whole of its validation on this model. What
+/// The local update and both cluster updates are held to the same closed form,
+/// and for the cluster ones this is the sharpest validation on this model. What
 /// it catches is the bond gap. Ising's `±1` convention makes a broken bond cost
 /// `2J` where Potts's delta convention makes it cost `J`, so the bond
 /// probability is `1 - exp(-2 beta J)` here — and a chain run at the other one
@@ -310,8 +334,15 @@ fn one_dimensional_correlator_matches_the_exact_solution() {
     const BETA: f64 = 0.4;
     const SAMPLES: usize = 4000;
 
-    for updater in ["metropolis", "swendsen_wang"] {
-        let text = run_toml([N], BETA, updater, SAMPLES);
+    // Wolff runs under its own pacing — its sweep is one cluster, so the
+    // shared two-sweep stride would leave consecutive samples correlated
+    // enough to crowd the tolerance below.
+    for (updater, thermalize, sweeps_between) in [
+        ("metropolis", 500, 2),
+        ("swendsen_wang", 500, 2),
+        ("wolff", 500, 8),
+    ] {
+        let text = run_toml_paced([N], BETA, updater, SAMPLES, thermalize, sweeps_between);
         let config = IsingRunConfig::parse(&text).expect("run config should parse");
         let mut sampler = IsingSampler::<1>::new(&config);
         let (lattice, model) = (sampler.lattice(), sampler.model());
@@ -376,6 +407,64 @@ fn the_cluster_update_agrees_with_metropolis() {
     assert!(
         (metropolis - gpu).abs() < 0.05,
         "cluster disagrees on the GPU: metropolis {metropolis:.4} vs gpu {gpu:.4}"
+    );
+}
+
+/// The Wolff update agrees with the local one on both the CPU and the GPU.
+///
+/// The same window and the same reasoning as
+/// [`the_cluster_update_agrees_with_metropolis`]: at `beta = 0.5` a run at
+/// half or double the effective coupling misses it by more than ten times its
+/// width, and the bond gap's factor of two (Ising scores a broken bond at
+/// `2J`) is the likeliest such error. What is new here is the extent: one
+/// Wolff sweep is one seeded cluster rather than a lattice pass, so the run is
+/// paced with a longer warmup and a wider stride to do comparable updating —
+/// which also makes this the end-to-end statement that the config-level sweep
+/// accounting of `docs/wolff.md` (W6) is a real difference and not a
+/// documentation nicety.
+///
+/// The GPU arm exercises the other construction entirely: the device grows no
+/// cluster but filters one out of the full decomposition by its seed site's
+/// root, so CPU–GPU agreement here is two independent realizations of the same
+/// move agreeing, not shared code agreeing with itself.
+#[test]
+fn the_wolff_update_agrees_with_metropolis() {
+    let shape = [16, 16];
+    let beta = 0.5;
+    let (thermalize, sweeps_between) = (3000, 10);
+
+    let metropolis = mean_abs_magnetization(shape, beta, "metropolis");
+    let wolff = mean_abs_magnetization_from::<2>(&run_toml_paced(
+        shape,
+        beta,
+        "wolff",
+        N_SAMPLES,
+        thermalize,
+        sweeps_between,
+    ));
+    assert!(
+        (0.7..0.99).contains(&metropolis),
+        "the reference should be ordered without saturating: {metropolis:.4}"
+    );
+    assert!(
+        (metropolis - wolff).abs() < 0.05,
+        "wolff disagrees on the CPU: metropolis {metropolis:.4} vs wolff {wolff:.4}"
+    );
+
+    if !gpu_available() {
+        return;
+    }
+    let gpu = mean_abs_magnetization_from::<2>(&run_toml_paced(
+        shape,
+        beta,
+        "gpu_wolff",
+        N_SAMPLES,
+        thermalize,
+        sweeps_between,
+    ));
+    assert!(
+        (metropolis - gpu).abs() < 0.05,
+        "wolff disagrees on the GPU: metropolis {metropolis:.4} vs gpu {gpu:.4}"
     );
 }
 

@@ -122,7 +122,8 @@ pub struct PottsRunConfig {
     #[serde(default = "default_updater")]
     pub updater: UpdaterRule,
     /// Which schedule a local rule runs under; omitted means the random
-    /// schedule. Must stay unset for [`UpdaterRule::SwendsenWang`], which has
+    /// schedule. Must stay unset for the cluster rules
+    /// ([`UpdaterRule::SwendsenWang`] and [`UpdaterRule::Wolff`]), which have
     /// no schedule at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleKind>,
@@ -485,14 +486,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_schedule_on_the_cluster_rule() {
-        // The cluster update is not a kernel under a schedule, so naming one
-        // alongside it is a contradiction rather than a preference.
-        let mut config = sample_config();
-        config.updater = UpdaterRule::SwendsenWang;
-        config.schedule = Some(ScheduleKind::Checkerboard);
-        let message = invalid_message(&config);
-        assert!(message.contains("takes no schedule"), "{message}");
+    fn validate_rejects_a_schedule_on_the_cluster_rules() {
+        // A cluster update is not a kernel under a schedule, so naming one
+        // alongside either cluster rule is a contradiction, not a preference.
+        for rule in [UpdaterRule::SwendsenWang, UpdaterRule::Wolff] {
+            let mut config = sample_config();
+            config.updater = rule;
+            config.schedule = Some(ScheduleKind::Checkerboard);
+            let message = invalid_message(&config);
+            assert!(message.contains("takes no schedule"), "{rule:?}: {message}");
+        }
     }
 
     #[test]
@@ -537,6 +540,8 @@ mod tests {
                 None,
                 BackendKind::Gpu,
             ),
+            (UpdaterRule::Wolff, "wolff", None, BackendKind::Cpu),
+            (UpdaterRule::Wolff, "wolff", None, BackendKind::Gpu),
         ] {
             let mut config = sample_config();
             config.updater = rule;
@@ -585,12 +590,17 @@ mod tests {
         // change the energy, so the move would sample the wrong distribution
         // rather than fail.
         for backend in [BackendKind::Cpu, BackendKind::Gpu] {
+            for rule in [UpdaterRule::SwendsenWang, UpdaterRule::Wolff] {
+                let mut config = sample_config();
+                config.updater = rule;
+                config.backend = backend;
+                config.h = vec![0.1, 0.0, 0.0];
+                let message = invalid_message(&config);
+                assert!(message.contains("label symmetry"), "{rule:?}: {message}");
+            }
             let mut config = sample_config();
             config.updater = UpdaterRule::SwendsenWang;
             config.backend = backend;
-            config.h = vec![0.1, 0.0, 0.0];
-            let message = invalid_message(&config);
-            assert!(message.contains("label symmetry"), "{message}");
 
             // Absent and all-zero both mean the symmetric model, and both run.
             config.h = Vec::new();

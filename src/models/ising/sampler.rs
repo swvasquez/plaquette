@@ -152,11 +152,14 @@ impl<const D: usize> IsingSampler<D> {
                 chain.advance(config.thermalize);
                 Engine::Gpu(Box::new(chain))
             }
-            (BackendKind::Gpu, UpdaterRule::SwendsenWang) => {
+            (BackendKind::Gpu, rule @ (UpdaterRule::SwendsenWang | UpdaterRule::Wolff)) => {
+                let (extent, relabel) = rule.cluster_axes().expect("a cluster rule has axes");
                 let mut chain = GpuClusterChain::new(
                     require_adapter(),
                     &lattice,
                     &model,
+                    extent,
+                    relabel,
                     beta,
                     config.seed,
                     &state,
@@ -166,12 +169,15 @@ impl<const D: usize> IsingSampler<D> {
                 Engine::GpuCluster(Box::new(chain))
             }
             (BackendKind::Cpu, rule) => {
-                let updater = match rule.kernel() {
-                    Some(kernel) => AnyUpdater::Local(LocalUpdate::new(
+                let updater = match (rule.kernel(), rule.cluster_axes()) {
+                    (Some(kernel), _) => AnyUpdater::Local(LocalUpdate::new(
                         kernel,
                         effective_schedule(config.schedule).into(),
                     )),
-                    None => AnyUpdater::Cluster(ClusterUpdate::swendsen_wang(&model)),
+                    (None, Some((extent, relabel))) => {
+                        AnyUpdater::Cluster(ClusterUpdate::new(&model, extent, relabel))
+                    }
+                    (None, None) => unreachable!("every rule is local or cluster"),
                 };
                 // Warm up a transient chain over the loose pieces, then stow them.
                 Chain::new(&mut state, &lattice, &model, &updater, beta, &mut rng, 1)
@@ -306,19 +312,22 @@ mod tests {
         assert!(configs.iter().all(|c| c.n_vars() == 64));
     }
 
-    /// A cluster-configured run streams too. This model has the CPU cluster
-    /// update and no device counterpart, which is what keeps `BondAction` a seam
-    /// with two real consumers rather than a trait shaped by one model.
+    /// A cluster-configured run streams too, under either cluster rule. This
+    /// model reaching the cluster machinery through `BondAction` is what keeps
+    /// that seam one with two real consumers rather than a trait shaped by one
+    /// model.
     #[test]
-    fn streams_with_the_cluster_updater() {
-        let mut run = config();
-        run.updater = UpdaterRule::SwendsenWang;
+    fn streams_with_the_cluster_updaters() {
+        for rule in [UpdaterRule::SwendsenWang, UpdaterRule::Wolff] {
+            let mut run = config();
+            run.updater = rule;
 
-        let mut sampler = IsingSampler::<2>::new(&run);
-        let configs: Vec<_> = sampler.samples().take(5).collect();
+            let mut sampler = IsingSampler::<2>::new(&run);
+            let configs: Vec<_> = sampler.samples().take(5).collect();
 
-        assert_eq!(configs.len(), 5);
-        assert!(configs.iter().all(|c| c.n_vars() == 64));
+            assert_eq!(configs.len(), 5, "{rule:?}");
+            assert!(configs.iter().all(|c| c.n_vars() == 64), "{rule:?}");
+        }
     }
 
     /// The device cluster backend streams through the same interface, on an odd
@@ -328,20 +337,22 @@ mod tests {
     /// the cluster move is a uniform redraw over the states whatever they mean,
     /// so nothing about the device path needed writing twice.
     #[test]
-    fn streams_with_the_gpu_cluster_updater() {
+    fn streams_with_the_gpu_cluster_updaters() {
         if crate::device::require_gpu().is_none() {
             return;
         }
-        let mut run = config();
-        run.updater = UpdaterRule::SwendsenWang;
-        run.backend = BackendKind::Gpu;
-        run.shape = vec![9, 7];
+        for rule in [UpdaterRule::SwendsenWang, UpdaterRule::Wolff] {
+            let mut run = config();
+            run.updater = rule;
+            run.backend = BackendKind::Gpu;
+            run.shape = vec![9, 7];
 
-        let mut sampler = IsingSampler::<2>::new(&run);
-        let configs: Vec<_> = sampler.samples().take(5).collect();
+            let mut sampler = IsingSampler::<2>::new(&run);
+            let configs: Vec<_> = sampler.samples().take(5).collect();
 
-        assert_eq!(configs.len(), 5);
-        assert!(configs.iter().all(|c| c.n_vars() == 63));
+            assert_eq!(configs.len(), 5, "{rule:?}");
+            assert!(configs.iter().all(|c| c.n_vars() == 63), "{rule:?}");
+        }
     }
 
     /// A GPU-configured run streams through the same interface. Skips when no GPU

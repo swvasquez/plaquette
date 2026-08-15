@@ -23,11 +23,12 @@
 //! [`ClusterUpdate`] is the second family, with a composition of its own
 //! that mirrors the first: an [`Extent`] says which clusters move together,
 //! and a [`Relabel`] rule says what happens to each — Swendsen–Wang is every
-//! cluster, freshly redrawn. Its variables are built stochastically from the
-//! current state, changed many at once, and accepted with probability one,
-//! which is why the family stands beside the local composition rather than
-//! inside it, sharing only the [`Updater`] seam. `docs/swendsen-wang.md`
-//! derives it.
+//! cluster, freshly redrawn (`docs/swendsen-wang.md`), and Wolff is one
+//! seeded cluster, forced onto a different label (`docs/wolff.md`). Its
+//! variables are built stochastically from the current state, changed many at
+//! once, and accepted with probability one, which is why the family stands
+//! beside the local composition rather than inside it, sharing only the
+//! [`Updater`] seam.
 //!
 //! The updater holds no chain state: the [`Configuration`] *is* the current
 //! state, mutated in place, and `β` is passed per call so one updater serves a
@@ -356,10 +357,15 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for LocalUpdate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Extent {
     /// Decompose the whole lattice into clusters and update every one — the
-    /// Swendsen–Wang extent. A seeded single-cluster extent — grow one
-    /// cluster outward from a uniformly random site — is the Wolff
-    /// algorithm's, and is the variant to add here when that updater lands.
+    /// Swendsen–Wang extent.
     All,
+    /// Grow one cluster outward from a uniformly random seed site and update
+    /// only that — the Wolff extent. Seeding at a uniformly random *site*
+    /// picks a cluster with probability proportional to its size, which is
+    /// what aims the move at the large clusters that decorrelate slowest; see
+    /// `docs/wolff.md`. On the CPU the growth touches only the cluster, so a
+    /// move costs the cluster rather than the volume.
+    Seeded,
 }
 
 /// What happens to each selected cluster's label — the cluster family's
@@ -368,24 +374,33 @@ pub enum Extent {
 pub enum Relabel {
     /// Draw a fresh label uniformly among all `Q`, so a cluster may come back
     /// on the label it had. Given the bonds, uniform *is* the exact
-    /// conditional — the heat bath archetype, one level up. A forced change
-    /// to a different label is the Wolff algorithm's rule (the
-    /// propose-and-accept archetype, with acceptance identically one), and is
-    /// the variant to add here when that updater lands.
+    /// conditional — the heat bath archetype, one level up.
     Redraw,
+    /// Draw a fresh label uniformly among the `Q − 1` labels the cluster does
+    /// not carry — the Wolff algorithm's rule (the propose-and-accept
+    /// archetype, with acceptance identically one). At `Q = 2` this is the
+    /// flip, and like the local kernels' proposal — whose draw it shares — it
+    /// then consumes no randomness. Given the
+    /// bonds it preserves the uniform label conditional — from any label,
+    /// every *other* label is equally likely, a symmetric doubly stochastic
+    /// kernel — so the move is exact without being the conditional itself.
+    ForcedChange,
 }
 
 /// A cluster update: an [`Extent`] applied with a [`Relabel`] rule — bond
 /// neighbors that agree, then relabel the clusters the bonds define.
 ///
 /// The cluster family's composition, mirroring how [`LocalUpdate`] composes a
-/// kernel under a schedule; Swendsen–Wang is
-/// [`Extent::All`] with [`Relabel::Redraw`], and today's one inhabitant.
+/// kernel under a schedule; Swendsen–Wang is [`Extent::All`] with
+/// [`Relabel::Redraw`] (`docs/swendsen-wang.md`) and Wolff is
+/// [`Extent::Seeded`] with [`Relabel::ForcedChange`] (`docs/wolff.md`). The
+/// off-diagonal compositions are valid too, with one exception refused at
+/// construction (see [`new`](ClusterUpdate::new)).
 /// The axes share no types with the local family because they obey different
 /// contracts: an extent reads the state and consumes randomness where a
 /// schedule is state-blind, and a relabel rule's conditional rests on the
 /// bond variables where a kernel prices through
-/// [`Action::energy_delta`]. See `docs/swendsen-wang.md`.
+/// [`Action::energy_delta`].
 ///
 /// Unlike the local updaters this one carries state — the model's bond gap,
 /// read once at construction — so it is built with
@@ -419,6 +434,16 @@ impl ClusterUpdate {
     /// quietly sample the infinite-temperature model. Both are the loud
     /// counterparts of load-time rules in the run configs. See
     /// `docs/swendsen-wang.md`.
+    ///
+    /// Panics, finally, on the one composition that is not a valid algorithm:
+    /// [`Extent::All`] with [`Relabel::ForcedChange`] at `Q = 2`. There the
+    /// forced change is the deterministic flip, so the move is a function of
+    /// the bonds alone — and a configuration that agrees everywhere is one
+    /// cluster under any bond draw, so it flips whole and lands on the other
+    /// uniform configuration, which flips straight back. The chain is trapped
+    /// in that two-cycle the moment it touches either ordered state, sampling
+    /// the wrong distribution without ever failing. At `Q ≥ 3` the forced
+    /// change has real choices and the composition is exact and ergodic.
     pub fn new<const Q: usize, M: BondAction<Q>>(
         model: &M,
         extent: Extent,
@@ -429,6 +454,13 @@ impl ClusterUpdate {
             "the cluster move relabels a whole cluster at once, which is only \
              weight-preserving when the energy is invariant under relabeling; \
              this model has a per-label offset or an external field set"
+        );
+        assert!(
+            !(Q == 2 && extent == Extent::All && relabel == Relabel::ForcedChange),
+            "at Q = 2 a forced change of every cluster is the deterministic \
+             global flip on any uniform configuration, so the chain falls into \
+             a two-cycle and stops being ergodic; use Relabel::Redraw for the \
+             all-clusters extent, or the seeded extent for a forced change"
         );
         let bond_gap = model.bond_energy_gap();
         assert!(
@@ -450,6 +482,12 @@ impl ClusterUpdate {
         Self::new(model, Extent::All, Relabel::Redraw)
     }
 
+    /// The Wolff composition: one seeded cluster, forced onto a different
+    /// label. See `docs/wolff.md`.
+    pub fn wolff<const Q: usize, M: BondAction<Q>>(model: &M) -> Self {
+        Self::new(model, Extent::Seeded, Relabel::ForcedChange)
+    }
+
     /// The probability `1 − exp(−β · gap)` that a bond between two *agreeing*
     /// sites is opened at inverse temperature `beta`.
     ///
@@ -463,14 +501,18 @@ impl ClusterUpdate {
     }
 
     /// One label under this update's relabel rule, for a cluster about to be
-    /// written.
-    fn fresh_label<const Q: usize>(&self, rng: &mut impl Rng) -> State<Q> {
+    /// written; `current` is the label the cluster carries, which every member
+    /// shares since bonds open only between agreeing sites.
+    fn fresh_label<const Q: usize>(&self, current: State<Q>, rng: &mut impl Rng) -> State<Q> {
         match self.relabel {
             // A *redraw*, not a flip: a cluster may come back on the label it
             // had. At Q = 2 that differs from the textbook "flip each cluster
             // with probability one half" only in bookkeeping, and both are
             // correct.
             Relabel::Redraw => State::new(rng.next_below(Q)).expect("next_below(Q) < Q"),
+            // The same symmetric draw over the Q − 1 alternatives the local
+            // kernels use, including its Q = 2 contract of consuming nothing.
+            Relabel::ForcedChange => propose(current, rng),
         }
     }
 }
@@ -478,13 +520,20 @@ impl ClusterUpdate {
 impl<const Q: usize, const D: usize> Updater<Q, D> for ClusterUpdate {
     /// One pass of the composed extent — under [`Extent::All`], a cluster
     /// decomposition of the whole lattice and then one label per cluster from
-    /// the relabel rule: a single move touching every site, not `n_vars` of
-    /// them.
+    /// the relabel rule; under [`Extent::Seeded`], one grown cluster and one
+    /// label. Either way a single move, not `n_vars` of them — and a seeded
+    /// sweep is *one cluster*, deliberately much less work than a sweep of any
+    /// other updater here; `docs/wolff.md` covers what that does to sweep
+    /// accounting.
     ///
     /// The returned `ΔE` is a from-scratch difference rather than an
     /// accumulation, since a cluster move does not price itself one site at a
-    /// time. That is two extra `O(D·V)` scans on top of a labeling pass that is
-    /// already `Θ(D·V)` — a constant factor, paid to keep the seam uniform.
+    /// time. That is two extra `O(D·V)` scans — for [`Extent::All`] a constant
+    /// factor on a labeling pass that is already `Θ(D·V)`, paid to keep the
+    /// seam uniform. For [`Extent::Seeded`] the scans dominate a small
+    /// cluster's growth, which is accepted for the same reason: the seam
+    /// promises the realized `ΔE`, and pricing a cluster boundary
+    /// incrementally would put an energy method on the extent.
     ///
     /// # Panics
     ///
@@ -524,11 +573,38 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for ClusterUpdate {
                     config.peek(i) == config.peek(j) && rng.next_f64() < p
                 });
 
-                let fresh: Vec<State<Q>> = (0..clusters.n_clusters())
-                    .map(|_| self.fresh_label(rng))
+                // Each cluster's current label, read off its first member —
+                // labels are compacted in site order, so first encounters walk
+                // the labels in order. A scan, not a draw, so the Redraw
+                // stream is untouched by the forced change needing it.
+                let mut current: Vec<State<Q>> = Vec::with_capacity(clusters.n_clusters());
+                for (site, &label) in clusters.labels().iter().enumerate() {
+                    if label == current.len() {
+                        current.push(config.peek(site));
+                    }
+                }
+                let fresh: Vec<State<Q>> = current
+                    .iter()
+                    .map(|&label| self.fresh_label(label, rng))
                     .collect();
                 for (site, &label) in clusters.labels().iter().enumerate() {
                     config.poke(site, fresh[label]);
+                }
+            }
+            Extent::Seeded => {
+                // A uniformly random site, not a uniformly random cluster:
+                // the seed lands in a cluster with probability proportional
+                // to its size, and that size bias is part of the algorithm.
+                let seed = rng.next_below(config.n_vars());
+                let members = cluster::grow_cluster(lattice, seed, |inside, outside| {
+                    // The same agreement short-circuit as above, with the same
+                    // stream contract: one uniform per offered bond whose far
+                    // end agrees, none otherwise.
+                    config.peek(inside) == config.peek(outside) && rng.next_f64() < p
+                });
+                let fresh = self.fresh_label(config.peek(seed), rng);
+                for &site in &members {
+                    config.poke(site, fresh);
                 }
             }
         }
@@ -1354,6 +1430,200 @@ mod tests {
             &action,
             1.0,
             &mut RandRng::seed_from_u64(1),
+        );
+    }
+
+    /// The one invalid composition is refused at construction: at two states a
+    /// forced change of every cluster is deterministic given the bonds, and
+    /// the chain two-cycles between the uniform configurations.
+    #[test]
+    #[should_panic(expected = "stops being ergodic")]
+    fn all_clusters_with_a_forced_change_is_refused_at_two_states() {
+        ClusterUpdate::new(
+            &Potts::<2>::symmetric(1.0),
+            Extent::All,
+            Relabel::ForcedChange,
+        );
+    }
+
+    /// The same composition at three states is exact and runs: at `beta = 0`
+    /// every site is its own cluster and the forced change moves every one of
+    /// them, drawing one alternative per cluster.
+    #[test]
+    fn at_three_states_all_clusters_with_a_forced_change_moves_every_site() {
+        let lat = Lattice::new([4, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+        let updater = ClusterUpdate::new(&action, Extent::All, Relabel::ForcedChange);
+        let mut config = Configuration::<3>::cold(&lat, Cell::Site);
+        let before = config.clone();
+        let mut rng = Counting::new(RandRng::seed_from_u64(6));
+
+        updater.sweep(&mut config, &lat, &action, 0.0, &mut rng);
+
+        assert!(
+            (0..lat.n_sites()).all(|s| config.peek(s) != before.peek(s)),
+            "a forced change must move every singleton cluster"
+        );
+        // One agreement uniform per bond (a cold start agrees everywhere) and
+        // one alternative draw per cluster; at p = 0 there are as many
+        // clusters as sites.
+        assert_eq!(rng.uniforms, 2 * lat.n_sites());
+        assert_eq!(rng.below, lat.n_sites());
+    }
+
+    /// The Wolff constructor inherits the symmetry guard the composed
+    /// constructor carries, on the model whose symmetry a field breaks.
+    #[test]
+    #[should_panic(expected = "invariant under relabeling")]
+    fn the_wolff_update_refuses_an_ising_model_with_a_field() {
+        ClusterUpdate::wolff(&Ising::new(1.0, 0.25));
+    }
+
+    /// At `beta = 0` no bond opens, so a Wolff move is the seed alone: exactly
+    /// one site changes, and it changes to a *different* label. The draw
+    /// counts pin the stream contract — one seed pick, one agreement uniform
+    /// per neighbor of the seed, and one alternative draw at `Q = 3` against
+    /// none at `Q = 2`, where the forced change is the flip.
+    #[test]
+    fn at_zero_beta_a_wolff_move_is_the_seed_alone() {
+        fn probe<const Q: usize>(expected_label_draws: usize) {
+            let lat = Lattice::new([4, 6]);
+            let action = Potts::<Q>::symmetric(1.0);
+            let updater = ClusterUpdate::wolff(&action);
+            let mut config = Configuration::<Q>::cold(&lat, Cell::Site);
+            let before = config.clone();
+            let mut rng = Counting::new(RandRng::seed_from_u64(12));
+
+            updater.sweep(&mut config, &lat, &action, 0.0, &mut rng);
+
+            let changed: Vec<usize> = (0..lat.n_sites())
+                .filter(|&s| config.peek(s) != before.peek(s))
+                .collect();
+            assert_eq!(changed.len(), 1, "Q = {Q}: only the seed moves at p = 0");
+            assert_eq!(
+                rng.uniforms,
+                2 * 2, // 2D agreeing neighbors of the seed, each offered once
+                "Q = {Q}: one uniform per offered bond"
+            );
+            assert_eq!(rng.below, 1 + expected_label_draws, "Q = {Q}");
+        }
+
+        probe::<2>(0);
+        probe::<3>(1);
+    }
+
+    /// At very large `beta` a uniform start grows the whole lattice into the
+    /// seeded cluster, and the forced change repaints all of it in one other
+    /// label — the global move a local update can essentially never make.
+    #[test]
+    fn at_large_beta_a_wolff_move_repaints_a_uniform_lattice() {
+        fn probe<const Q: usize>() {
+            let lat = Lattice::new([4, 6]);
+            let action = Potts::<Q>::symmetric(1.0);
+            let updater = ClusterUpdate::wolff(&action);
+            let mut config = Configuration::<Q>::cold(&lat, Cell::Site);
+            let before = config.peek(0);
+            let mut rng = RandRng::seed_from_u64(9);
+
+            updater.sweep(&mut config, &lat, &action, 40.0, &mut rng);
+
+            let first = config.peek(0);
+            assert_ne!(first, before, "Q = {Q}: the label must change");
+            assert!(
+                config.variables().iter().all(|&s| s == first),
+                "Q = {Q}: one cluster must land on one label"
+            );
+        }
+
+        probe::<2>();
+        probe::<3>();
+    }
+
+    /// The net `ΔE` a Wolff sweep returns equals `H(after) − H(before)`, the
+    /// invariant every updater here is held to.
+    #[test]
+    fn the_wolff_sweep_net_delta_equals_the_energy_change() {
+        fn probe<const Q: usize, const D: usize>(shape: [usize; D]) {
+            let lat = Lattice::new(shape);
+            let action = Potts::<Q>::symmetric(1.0);
+            let updater = ClusterUpdate::wolff(&action);
+            let mut rng = RandRng::seed_from_u64(20260815);
+            let mut config = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
+            let before = action.energy(&lat, &config);
+
+            let net = updater.sweep(&mut config, &lat, &action, 0.9, &mut rng);
+
+            assert_eq!(net, action.energy(&lat, &config) - before, "{shape:?}");
+        }
+
+        probe::<2, 2>([8, 8]);
+        probe::<3, 2>([8, 8]);
+        probe::<3, 3>([4, 4, 4]);
+    }
+
+    /// One seed, one chain, one answer — through a path whose draw count
+    /// depends on the configuration, as for Swendsen–Wang above.
+    #[test]
+    fn a_wolff_run_is_reproducible_from_its_seed() {
+        let lat = Lattice::new([6, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+        let updater = ClusterUpdate::wolff(&action);
+
+        let run = |seed: u64| {
+            let mut setup = RandRng::seed_from_u64(5);
+            let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut setup);
+            let mut rng = RandRng::seed_from_u64(seed);
+            let mut net = 0.0;
+            for _ in 0..32 {
+                net += updater.sweep(&mut config, &lat, &action, 0.8, &mut rng);
+            }
+            (config, net)
+        };
+
+        assert_eq!(run(42), run(42));
+        assert_ne!(
+            run(42).0,
+            run(43).0,
+            "a different seed should give a different chain"
+        );
+    }
+
+    /// The Wolff update reaches the same distribution the Metropolis schedule
+    /// does. One Wolff sweep is one cluster rather than a lattice of attempts,
+    /// so the chain decorrelates with more sweeps between samples than the
+    /// Swendsen–Wang comparison needs.
+    #[test]
+    fn the_wolff_update_matches_the_metropolis_distribution() {
+        fn mean_order(updater: &AnyUpdater, seed: u64, sweeps_between: usize) -> f64 {
+            let lat = Lattice::new([8, 8]);
+            let action = Potts::<3>::symmetric(1.0);
+            let mut rng = RandRng::seed_from_u64(seed);
+            let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
+            let mut chain = crate::chain::Chain::new(
+                &mut config,
+                &lat,
+                &action,
+                updater,
+                1.1,
+                &mut rng,
+                sweeps_between,
+            );
+            chain.advance(400);
+            let n = 400;
+            chain
+                .take(n)
+                .map(|c| action.order_parameter(&c))
+                .sum::<f64>()
+                / n as f64
+        }
+
+        let action = Potts::<3>::symmetric(1.0);
+        let metropolis = mean_order(&AnyUpdater::Local(METROPOLIS), 17, 2);
+        let wolff = mean_order(&AnyUpdater::Cluster(ClusterUpdate::wolff(&action)), 23, 8);
+
+        assert!(
+            (metropolis - wolff).abs() < 0.04,
+            "mean order parameter: metropolis {metropolis}, wolff {wolff}"
         );
     }
 

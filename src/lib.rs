@@ -24,16 +24,18 @@
 //! being named per model: the spin models color a *site* by the parity of its
 //! coordinate sum, while the Z2 gauge model colors a *link* by its direction
 //! as well as its base site's parity, so that no two links updated together
-//! share a plaquette. The two spin models also run the Swendsen–Wang cluster
-//! update — [`ClusterUpdate`], a second family with a composition of its own
-//! (an [`Extent`] with a [`Relabel`] rule) — which is not a kernel under a
-//! schedule: it builds its own set of sites stochastically, changes all of
-//! them at once, and is never rejected.
-//! Both run it on the CPU or the GPU, over one shared device chain that names
-//! no model. It is what to reach for near a continuous transition, where a
-//! local update stops decorrelating at all — see `docs/swendsen-wang.md` —
-//! and it is unavailable to the gauge model, whose plaquette energy has no
-//! pairwise bond graph to build clusters on. Each model has a sampler —
+//! share a plaquette. The two spin models also run the cluster updates —
+//! [`ClusterUpdate`], a second family with a composition of its own (an
+//! [`Extent`] with a [`Relabel`] rule), whose two named pairings are
+//! Swendsen–Wang and Wolff — which are not kernels under a schedule: each
+//! builds its own set of sites stochastically, changes all of them at once,
+//! and is never rejected.
+//! Both models run them on the CPU or the GPU, over one shared device chain
+//! that names no model. They are what to reach for near a continuous
+//! transition, where a local update stops decorrelating at all — see
+//! `docs/swendsen-wang.md` and `docs/wolff.md` — and they are unavailable to
+//! the gauge model, whose plaquette energy has no pairwise bond graph to
+//! build clusters on. Each model has a sampler —
 //! [`IsingSampler`](models::ising::IsingSampler),
 //! [`GaugeSampler`](models::gauge::GaugeSampler),
 //! [`PottsSampler`](models::potts::PottsSampler) — that builds a thermalized
@@ -78,7 +80,7 @@ pub mod updater;
 
 pub use action::{Action, BondAction};
 pub use chain::Chain;
-pub use cluster::{SiteClusters, site_clusters};
+pub use cluster::{SiteClusters, grow_cluster, site_clusters};
 pub use config::{BackendKind, ConfigError, ScheduleKind, Start, UpdaterRule};
 pub use configuration::{Cell, Configuration};
 pub use device::{Gpu, GpuChain};

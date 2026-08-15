@@ -75,13 +75,15 @@ pub struct GaugeRunConfig {
     // --- driver controls ---
     /// Which update rule advances the chain; defaults to
     /// [`UpdaterRule::Metropolis`], and [`validate`](GaugeRunConfig::validate)
-    /// rejects [`UpdaterRule::SwendsenWang`], which this model cannot run. A
+    /// rejects the cluster rules ([`UpdaterRule::SwendsenWang`] and
+    /// [`UpdaterRule::Wolff`]), which this model cannot run. A
     /// run parameter rather than a caller's choice, because two runs of the
     /// same physics under different algorithms are different runs.
     #[serde(default = "default_updater")]
     pub updater: UpdaterRule,
     /// Which schedule a local rule runs under; omitted means the random
-    /// schedule. Must stay unset for [`UpdaterRule::SwendsenWang`], which has
+    /// schedule. Must stay unset for the cluster rules
+    /// ([`UpdaterRule::SwendsenWang`] and [`UpdaterRule::Wolff`]), which have
     /// no schedule at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleKind>,
@@ -411,16 +413,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_the_cluster_rule() {
+    fn validate_rejects_the_cluster_rules() {
         // The rule the Ising schema does not have: the plaquette energy has no
         // pairwise bond graph, so there is nothing for a cluster update to
-        // build on, whatever the backend. (See the note on `Z2Gauge`.)
+        // build on, whatever the backend or the cluster rule. (See the note on
+        // `Z2Gauge`.)
         for backend in [BackendKind::Cpu, BackendKind::Gpu] {
-            let mut config = sample_config();
-            config.updater = UpdaterRule::SwendsenWang;
-            config.backend = backend;
-            let message = invalid_message(&config);
-            assert!(message.contains("bond graph"), "{backend:?}: {message}");
+            for rule in [UpdaterRule::SwendsenWang, UpdaterRule::Wolff] {
+                let mut config = sample_config();
+                config.updater = rule;
+                config.backend = backend;
+                let message = invalid_message(&config);
+                assert!(
+                    message.contains("bond graph"),
+                    "{backend:?} / {rule:?}: {message}"
+                );
+            }
         }
     }
 

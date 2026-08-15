@@ -85,6 +85,16 @@ pub enum UpdaterRule {
     /// which each schema checks against its own field or offsets, since what
     /// breaks the symmetry is the model's business and not this enum's.
     SwendsenWang,
+    /// The Wolff cluster update — [`ClusterUpdate`](crate::updater::ClusterUpdate)
+    /// with [`Extent::Seeded`](crate::updater::Extent::Seeded) and
+    /// [`Relabel::ForcedChange`](crate::updater::Relabel::ForcedChange): one
+    /// cluster grown from a random seed, forced onto a different label. The
+    /// same schedule, shape, backend, and symmetry rules as
+    /// [`SwendsenWang`](UpdaterRule::SwendsenWang) apply; the one difference a
+    /// config author must hold in mind is that a Wolff sweep is a single
+    /// cluster rather than a pass over the lattice, so `thermalize` and
+    /// `sweeps_between` count much smaller units — see `docs/wolff.md`.
+    Wolff,
 }
 
 impl UpdaterRule {
@@ -92,17 +102,34 @@ impl UpdaterRule {
     /// invariant under relabeling. The load-time counterpart of the panic in
     /// [`ClusterUpdate::new`](crate::updater::ClusterUpdate::new).
     pub fn builds_clusters(self) -> bool {
-        matches!(self, UpdaterRule::SwendsenWang)
+        matches!(self, UpdaterRule::SwendsenWang | UpdaterRule::Wolff)
     }
 
-    /// The kernel a local rule composes with, or `None` for the cluster
-    /// update. This is the whole config-to-updater mapping for the rule axis,
-    /// stated once so the samplers cannot drift from each other.
+    /// The kernel a local rule composes with, or `None` for a cluster rule.
+    /// With [`cluster_axes`](UpdaterRule::cluster_axes) this is the whole
+    /// config-to-updater mapping for the rule axis, stated once so the
+    /// samplers cannot drift from each other.
     pub fn kernel(self) -> Option<crate::updater::Kernel> {
         match self {
             UpdaterRule::Metropolis => Some(crate::updater::Kernel::Metropolis),
             UpdaterRule::HeatBath => Some(crate::updater::Kernel::HeatBath),
-            UpdaterRule::SwendsenWang => None,
+            UpdaterRule::SwendsenWang | UpdaterRule::Wolff => None,
+        }
+    }
+
+    /// The extent and relabel rule a cluster rule composes, or `None` for a
+    /// local rule — the counterpart of [`kernel`](UpdaterRule::kernel) for the
+    /// other family.
+    pub fn cluster_axes(self) -> Option<(crate::updater::Extent, crate::updater::Relabel)> {
+        match self {
+            UpdaterRule::Metropolis | UpdaterRule::HeatBath => None,
+            UpdaterRule::SwendsenWang => {
+                Some((crate::updater::Extent::All, crate::updater::Relabel::Redraw))
+            }
+            UpdaterRule::Wolff => Some((
+                crate::updater::Extent::Seeded,
+                crate::updater::Relabel::ForcedChange,
+            )),
         }
     }
 }
@@ -111,8 +138,9 @@ impl UpdaterRule {
 /// [`Schedule`](crate::updater::Schedule).
 ///
 /// In a config file the field is optional and means the random schedule when
-/// omitted; a run whose rule is [`UpdaterRule::SwendsenWang`] must leave it
-/// unset, since the cluster update has no schedule at all.
+/// omitted; a run naming a cluster rule ([`UpdaterRule::SwendsenWang`] or
+/// [`UpdaterRule::Wolff`]) must leave it unset, since a cluster update has no
+/// schedule at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleKind {

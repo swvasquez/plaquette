@@ -21,7 +21,7 @@ beta = 0.75        # inverse temperature; the transition sits at beta_c ~ 0.7613
                    # near a transition decorrelates slowly.
 
 # Driver controls. A run is named by three orthogonal fields: `updater` picks
-# the rule ("metropolis" or "heat_bath" here — "swendsen_wang" is rejected,
+# the rule ("metropolis" or "heat_bath" here — the cluster rules are rejected,
 # since a plaquette energy has no bond graph to build clusters on), `schedule`
 # picks the walk ("random" when omitted, or "checkerboard", which on this
 # model colors links by direction and base-site parity), and `backend` picks

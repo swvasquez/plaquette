@@ -70,6 +70,8 @@ fn driver_lines(name: &str) -> String {
         "gpu_checkerboard_heat_bath" => ("heat_bath", Some("checkerboard"), Some("gpu")),
         "swendsen_wang" => ("swendsen_wang", None, None),
         "gpu_swendsen_wang" => ("swendsen_wang", None, Some("gpu")),
+        "wolff" => ("wolff", None, None),
+        "gpu_wolff" => ("wolff", None, Some("gpu")),
         other => panic!("unknown updater shorthand {other}"),
     };
     let mut lines = format!("updater = \"{rule}\"\n");
@@ -175,6 +177,38 @@ fn run<const Q: usize, const D: usize>(
     updater: &str,
 ) -> Measured {
     drive::<Q, D>(&run_toml(shape, j, beta, seed, updater), N_SAMPLES)
+}
+
+/// Drive a Wolff run under the pacing its sweep unit needs.
+///
+/// A Wolff sweep is one seeded cluster move rather than a pass over the
+/// lattice (`docs/wolff.md`, W6), so the shared [`run_toml`] phasing — sized
+/// for lattice-scale sweeps — would under-thermalize and under-decorrelate it.
+/// The counts here do roughly comparable updating: several thousand moves of
+/// warmup, and a stride of several moves between samples. The comparisons this
+/// feeds are statistical through [`assert_matches`], whose errors already
+/// inflate by the measured autocorrelation, so the pacing buys resolution
+/// rather than correctness.
+fn wolff_run<const Q: usize, const D: usize>(
+    shape: [usize; D],
+    j: f64,
+    beta: f64,
+    seed: u64,
+    updater: &str,
+) -> Measured {
+    let toml = format!(
+        "shape = {shape:?}\n\
+         j = {j}\n\
+         beta = {beta}\n\
+         {driver}\
+         thermalize = 3000\n\
+         sweeps_between = 10\n\
+         n_samples = {N_SAMPLES}\n\
+         seed = {seed}\n\
+         start = \"hot\"\n",
+        driver = driver_lines(updater),
+    );
+    drive::<Q, D>(&toml, N_SAMPLES)
 }
 
 /// One line of a `Measured`, for the record a failing comparison is read from.
@@ -515,6 +549,104 @@ fn the_cluster_backends_agree() {
     assert_matches(&cpu, &gpu, "gpu_swendsen_wang");
 }
 
+/// The Wolff update samples the same distribution the local ones do — the
+/// counterpart of [`the_cluster_update_agrees_with_metropolis`] for the seeded
+/// extent, and the test that says Wolff is *right* at this level.
+///
+/// The same factor-of-two hazard in the bond gap applies, and one hazard is
+/// Wolff's own: a forced change that could land back on the current label, or
+/// a seed chosen per cluster rather than per site, would each shift the
+/// stationary distribution or the cluster-size weighting while leaving the run
+/// looking healthy. Agreement with an independent local run at a coupling off
+/// the saturation ceiling is what rules those out.
+#[test]
+fn the_wolff_update_agrees_with_metropolis() {
+    let shape = [16, 16];
+    let metropolis = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260980, "metropolis");
+    let wolff = wolff_run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260981, "wolff");
+    report("2D metropolis", &metropolis);
+    report("2D wolff", &wolff);
+    assert_matches(&metropolis, &wolff, "wolff");
+}
+
+/// The device Wolff backend agrees with the host one, on an odd lattice.
+///
+/// Sharper than shared-code agreement: the CPU grows one cluster from the seed
+/// and never sees the rest of the lattice, while the GPU labels the full
+/// decomposition and filters by the seed site's root — two independent
+/// realizations of the same move (`docs/wolff.md`, W5). The odd shape carries
+/// the same message as [`the_cluster_backends_agree`]: no even-extent rule
+/// leaked onto the cluster kinds.
+#[test]
+fn the_wolff_backends_agree() {
+    if !gpu_available() {
+        return;
+    }
+    let shape = [15, 15];
+    let cpu = wolff_run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260982, "wolff");
+    let gpu = wolff_run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260983, "gpu_wolff");
+    report("odd wolff", &cpu);
+    report("odd gpu_wolff", &gpu);
+    assert_matches(&cpu, &gpu, "gpu_wolff");
+}
+
+/// The Wolff chains of the two models reproduce each other configuration for
+/// configuration at `q = 2`, the way the Swendsen–Wang chains do above.
+///
+/// Bit-for-bit, not statistical: a two-state Potts run at `2J` and an Ising run
+/// at `J` share the bond gap, so their seed picks, growth draws, and forced
+/// flips consume the same stream — the flip at two states draws nothing, in
+/// both. This is the sharpest cross-check of the gap conventions the seeded
+/// extent gets, since a factor of two anywhere would desynchronize the streams
+/// at the first bond.
+#[test]
+fn the_wolff_update_reproduces_an_ising_run_at_two_states() {
+    const J: f64 = 1.0;
+    let shape = [16, 16];
+    let beta = 0.5; // ordered for Ising (beta_c ~ 0.4407), and so for Potts at 2J
+    let seed = 20260991;
+
+    let potts_toml = run_toml(shape, 2.0 * J, beta, seed, "wolff");
+    let potts_config = PottsRunConfig::parse(&potts_toml).expect("hand-written config is valid");
+    let mut potts = PottsSampler::<2, 2>::new(&potts_config);
+
+    let ising_toml = run_toml(shape, J, beta, seed, "wolff");
+    let ising_config = IsingRunConfig::parse(&ising_toml).expect("hand-written config is valid");
+    let mut ising = IsingSampler::<2>::new(&ising_config);
+
+    let lattice = potts.lattice();
+    let (potts_model, ising_model) = (potts.model(), ising.model());
+    let offset = -J * lattice.n_links() as f64;
+
+    let mut moved = false;
+    for (step, (from_potts, from_ising)) in potts
+        .samples()
+        .take(N_SAMPLES)
+        .zip(ising.samples().take(N_SAMPLES))
+        .enumerate()
+    {
+        assert_eq!(
+            from_potts, from_ising,
+            "the two Wolff chains diverged at sample {step}, which means the \
+             two models disagreed about the bond probability"
+        );
+        assert_eq!(
+            potts_measure(&potts_model, &lattice, &from_potts).energy,
+            measure(&ising_model, &lattice, &from_ising).energy + offset,
+            "per-sample energy correspondence at sample {step}"
+        );
+        // A frozen pair would satisfy the assertions above; a Wolff move
+        // *cannot* freeze — it always changes its cluster — but the guard is
+        // kept parallel to the Swendsen–Wang test so a regression that stopped
+        // sweeping entirely is caught the same way.
+        moved |= from_potts != Configuration::<2>::cold(&lattice, Cell::Site);
+    }
+    assert!(
+        moved,
+        "the chains never left the all-one-label configuration"
+    );
+}
+
 /// Samples the autocorrelation comparison takes, at a stride of one sweep.
 ///
 /// A stride of one is what makes the comparison readable: `reduce` reports
@@ -781,18 +913,19 @@ const CRITICAL_SAMPLES: usize = 2000;
 /// would gain, and the trade stops paying. The small box is therefore
 /// deliberate, and the residual gap is accounted for in the tolerance rather
 /// than sampled away.
-fn energy_at_criticality<const Q: usize>(seed: u64) -> Estimate {
+fn energy_at_criticality<const Q: usize>(seed: u64, updater: &str) -> Estimate {
     let toml = format!(
         "shape = [16, 16]\n\
          j = 1.0\n\
          beta = {}\n\
-         updater = \"metropolis\"\n\
+         {driver}\
          thermalize = 4000\n\
          sweeps_between = 10\n\
          n_samples = {CRITICAL_SAMPLES}\n\
          seed = {seed}\n\
          start = \"hot\"\n",
-        beta_c(Q)
+        beta_c(Q),
+        driver = driver_lines(updater),
     );
     drive::<Q, 2>(&toml, CRITICAL_SAMPLES).energy
 }
@@ -846,8 +979,8 @@ const CRITICAL_ENERGY_TOLERANCE: f64 = 0.06;
 /// decorrelated cannot pass by drifting near the answer for the wrong reason.
 #[test]
 fn the_critical_energy_sits_just_below_the_exact_duality_value() {
-    let two = energy_at_criticality::<2>(20260940);
-    let three = energy_at_criticality::<3>(20260941);
+    let two = energy_at_criticality::<2>(20260940, "metropolis");
+    let three = energy_at_criticality::<3>(20260941, "metropolis");
 
     for (q, measured) in [(2usize, &two), (3usize, &three)] {
         let exact = -(1.0 + 1.0 / (q as f64).sqrt());
@@ -876,6 +1009,58 @@ fn the_critical_energy_sits_just_below_the_exact_duality_value() {
         assert!(
             gap.abs() < CRITICAL_ENERGY_TOLERANCE,
             "q = {q}: measured critical energy {:.4} vs exact {exact:.4}, \
+             off by {gap:+.4}, more than a finite-size correction at this size",
+            measured.mean
+        );
+    }
+}
+
+/// The Wolff chain measures the same critical energy, sitting exactly on
+/// `beta_c` — the one test that pins Wolff at the coupling it exists for, and
+/// against a closed form rather than another sampler.
+///
+/// Everything the metropolis version above says about the finite-size gap
+/// carries over unchanged, because the gap is a property of the ensemble and
+/// not of the algorithm sampling it. What is specific to Wolff is that this
+/// point is its best case: the seeded cluster is a critical droplet, so the
+/// chain decorrelates in a few *moves* where the local one needs hundreds of
+/// sweeps — the same phasing therefore resolves the autocorrelation with room
+/// to spare, and `is_reliable` asserts that rather than assumes it. A wrong
+/// bond probability is at its most visible here too, since the energy's slope
+/// in `beta` is steepest near the transition.
+#[test]
+fn the_wolff_critical_energy_sits_just_below_the_exact_duality_value() {
+    let two = energy_at_criticality::<2>(20260942, "wolff");
+    let three = energy_at_criticality::<3>(20260943, "wolff");
+
+    for (q, measured) in [(2usize, &two), (3usize, &three)] {
+        let exact = -(1.0 + 1.0 / (q as f64).sqrt());
+        let gap = measured.mean - exact;
+        eprintln!(
+            "wolff q = {q} at beta_c = {:.6}: E/N = {:.4}({:.4}), exact {exact:.4}, \
+             gap {gap:+.4}, tau = {:.2}, n_eff = {:.0}",
+            beta_c(q),
+            measured.mean,
+            measured.stderr,
+            measured.tau_int,
+            measured.n_eff
+        );
+        assert!(
+            measured.is_reliable(),
+            "q = {q}: the Wolff chain did not resolve its own autocorrelation \
+             (n_eff = {:.0}), which at its best-case coupling would itself be \
+             a bug",
+            measured.n_eff
+        );
+        assert!(
+            gap < 0.0,
+            "q = {q}: a finite lattice should measure below the exact critical \
+             energy, but {:.4} sits above {exact:.4}",
+            measured.mean
+        );
+        assert!(
+            gap.abs() < CRITICAL_ENERGY_TOLERANCE,
+            "q = {q}: Wolff critical energy {:.4} vs exact {exact:.4}, \
              off by {gap:+.4}, more than a finite-size correction at this size",
             measured.mean
         );
