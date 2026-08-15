@@ -388,7 +388,9 @@ impl<const Q: usize> GpuClusterChain<Q> {
             n_sites,
             site_grid: grid_for(per_axis, n_sites),
             bond_grid: grid_for(per_axis, n_bonds),
-            pass_cap: pass_cap(n_sites),
+            // The torus diameter: the farthest any two sites sit apart, and
+            // the scale a label actually has to travel.
+            pass_cap: pass_cap(n_sites, lattice.shape().iter().map(|l| l / 2).sum()),
             sweeps_between,
             sweeps_done: 0,
             gpu,
@@ -436,8 +438,8 @@ impl<const Q: usize> GpuClusterChain<Q> {
             assert!(
                 passes <= self.pass_cap,
                 "cluster labeling did not converge in {passes} passes on \
-                 {} sites; pointer jumping should need about a logarithm of \
-                 that, so this is a bug rather than a hard lattice",
+                 {} sites; the cap already allows many times the lattice \
+                 diameter, so this is a bug rather than a hard lattice",
                 self.n_sites
             );
         }
@@ -530,16 +532,22 @@ impl<const Q: usize> GpuClusterChain<Q> {
 
 /// Propagation passes allowed before a sweep is declared broken.
 ///
-/// Pointer jumping roughly halves the distance to a cluster's root each pass, so
-/// a converged labeling needs about `log2(n_sites)` of them. Four times that,
-/// plus a constant floor for the smallest lattices, is generous enough that no
-/// correct run reaches it and tight enough that a stuck one stops rather than
-/// spinning.
-fn pass_cap(n_sites: usize) -> usize {
+/// The label still has to *reach* a site before pointer jumping can shorten
+/// its path, and it travels one lattice bond per pass, so a converged
+/// labeling needs about a cluster's chemical diameter of passes — near a
+/// critical point that is the lattice's linear extent times a slowly growing
+/// factor, not the logarithm the jumping alone would suggest. (A 128×128
+/// Ising run at its critical coupling converges in roughly 80–140 passes,
+/// where four logarithms allowed 92 and broke it.) Eight times the torus
+/// diameter, plus a log-and-constant floor for the smallest lattices, is
+/// generous enough that no correct run reaches it — the factor covers the
+/// mildly superlinear chemical distance of critical clusters — and still
+/// finite, so a genuinely stuck loop stops rather than spinning.
+fn pass_cap(n_sites: usize, torus_diameter: usize) -> usize {
     // `BITS - leading_zeros` is `floor(log2(n)) + 1`, which is at least the
     // ceiling the bound is quoted in terms of.
     let log2_ceiling = (usize::BITS - n_sites.max(1).leading_zeros()) as usize;
-    4 * log2_ceiling + 32
+    8 * torus_diameter + 4 * log2_ceiling + 32
 }
 
 impl<const Q: usize> Iterator for GpuClusterChain<Q> {
@@ -810,19 +818,48 @@ mod tests {
         );
     }
 
-    /// The pass cap grows with the lattice rather than being a flat number, and
-    /// leaves room above the logarithm a converged labeling actually needs.
+    /// A large lattice at the Ising critical coupling labels within the pass
+    /// cap. This is the case the old four-logarithm cap broke — near
+    /// criticality a label travels roughly the cluster's chemical diameter,
+    /// which scales with the lattice's linear extent, and a 128×128 sweep
+    /// needs on the order of a hundred passes where the old cap allowed 92.
     #[test]
-    fn the_pass_cap_leaves_room_above_the_logarithm() {
-        assert!(pass_cap(1) >= 32);
-        for n_sites in [16usize, 1_024, 1 << 20] {
-            let log2 = (n_sites as f64).log2();
-            assert!(
-                pass_cap(n_sites) as f64 > 4.0 * log2,
-                "{n_sites} sites: cap {} is not above four logarithms",
-                pass_cap(n_sites)
-            );
-        }
-        assert!(pass_cap(1 << 20) < pass_cap(1 << 30), "the cap must grow");
+    fn labeling_converges_on_a_large_critical_lattice() {
+        let Some(gpu) = require_gpu() else {
+            return;
+        };
+        let lat = Lattice::new([128, 128]);
+        // The two-state symmetric Potts model is the Ising model at 2J; its
+        // critical coupling in these conventions sits near 0.88.
+        let model = Potts::<2>::symmetric(1.0);
+        let mut rng = RandRng::seed_from_u64(20260718);
+        let start = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
+
+        let mut chain = GpuClusterChain::new(gpu, &lat, &model, 0.88, 7, &start, 2);
+        chain.advance(6);
+        let config = chain.next().expect("open-ended stream yields");
+        assert_eq!(config.n_vars(), lat.n_sites());
+    }
+
+    /// The pass cap grows with the lattice's diameter rather than only its
+    /// logarithm, and leaves room above what a critical run actually needs.
+    ///
+    /// The concrete anchor: a 128×128 run at the Ising critical coupling was
+    /// observed to need up to ~140 passes, so the cap for that shape must sit
+    /// comfortably above that — the old four-logarithm cap (92) is the bug
+    /// this pins against.
+    #[test]
+    fn the_pass_cap_leaves_room_above_the_diameter() {
+        assert!(pass_cap(1, 0) >= 32);
+        // 128 x 128: torus diameter 128, observed need ~140.
+        assert!(
+            pass_cap(128 * 128, 128) > 4 * 140,
+            "cap {} too tight",
+            pass_cap(128 * 128, 128)
+        );
+        assert!(
+            pass_cap(1 << 20, 1024) < pass_cap(1 << 30, 32 * 1024),
+            "the cap must grow"
+        );
     }
 }
