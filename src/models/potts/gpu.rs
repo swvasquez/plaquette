@@ -23,7 +23,16 @@
 //! count, which the source has no way to see. Substituting that one number is
 //! what lets the device path take any `Q` rather than a capped one.
 //!
-//! The coloring is compiled into the shader (`checkerboard.wgsl`), so this
+//! There are two shader templates rather than one, `checkerboard.wgsl` and
+//! `heatbath.wgsl`, picked by the [`Kernel`] the caller names. They share the
+//! coloring, the neighbor table and every dispatch. This is the model where they
+//! share least beyond that: the Metropolis kernel picks a candidate first and
+//! then needs one signed counter, while the heat bath commits to no candidate
+//! and needs how many neighbors carry each label. That is why the heat bath
+//! template carries a second token — the tallies are arrays, and a WGSL array
+//! length must be written literally in the source, exactly as the offsets are.
+//!
+//! The coloring is compiled into the shader, so this
 //! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
 //! counter-based, keyed on `(seed, site, sweep)`, so the result is independent of
 //! GPU thread order — the property that lets the CPU site checkerboard serve as a
@@ -31,7 +40,7 @@
 
 use crate::configuration::{Cell, Configuration};
 use crate::device::{
-    DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors,
+    DeviceSweeper, Gpu, Kernel, SweepSetup, assert_even_extents, fold_seed, site_colors,
     site_neighbor_table, state_words,
 };
 use crate::lattice::Lattice;
@@ -45,6 +54,17 @@ const N_COLORS: u32 = 2;
 /// The kernel *template*: the shared preamble followed by the site checkerboard,
 /// still carrying the one token the host has to fill in.
 const SHADER_TEMPLATE: &str = crate::device::shader_source!("checkerboard.wgsl");
+
+/// The heat bath kernel template, over the same preamble and the same coloring.
+/// It carries a second token, `$Q$`, because its per-label tallies are arrays
+/// and a WGSL array length must be a const-expression.
+const HEAT_BATH_TEMPLATE: &str = crate::device::shader_source!("heatbath.wgsl");
+
+/// The token standing for the state count itself, used by the heat bath kernel
+/// alone. `params.q` already carries the same number as a runtime uniform, which
+/// is all the Metropolis kernel needs of it; an array length is not something a
+/// uniform can be.
+const Q_TOKEN: &str = "$Q$";
 
 /// The token in that template standing for the number of `vec4` slots the
 /// per-label offsets occupy.
@@ -64,8 +84,10 @@ const H_VECTORS_TOKEN: &str = "$H_VECTORS$";
 const LABELS_PER_VECTOR: usize = 4;
 
 /// The kernel for `q` labels: the template with its one token filled in.
-fn shader_for(q: usize) -> String {
-    SHADER_TEMPLATE.replace(H_VECTORS_TOKEN, &q.div_ceil(LABELS_PER_VECTOR).to_string())
+fn shader_for(template: &str, q: usize) -> String {
+    template
+        .replace(H_VECTORS_TOKEN, &q.div_ceil(LABELS_PER_VECTOR).to_string())
+        .replace(Q_TOKEN, &q.to_string())
 }
 
 /// The static run parameters uploaded to the shader's uniform buffer.
@@ -130,7 +152,9 @@ impl<const Q: usize> GpuPottsChain<Q> {
     /// since the offsets are `Q` of them and the CPU path is handed the same
     /// value — and `beta` is the inverse temperature; `seed` keys the
     /// counter-based RNG. `sweeps_between` is the decorrelation stride, and
-    /// `batch` is how many samples are produced per device round-trip.
+    /// `batch` is how many samples are produced per device round-trip. `kernel`
+    /// picks which single-variable rule a thread runs; both sample the same
+    /// distribution over the same coloring.
     ///
     /// Runs no sweeps — like [`Chain::new`](crate::chain::Chain::new), warmup is
     /// the caller's job via [`advance`](GpuPottsChain::advance).
@@ -151,6 +175,7 @@ impl<const Q: usize> GpuPottsChain<Q> {
         start: &Configuration<Q>,
         sweeps_between: usize,
         batch: usize,
+        kernel: Kernel,
     ) -> Self {
         assert!(batch > 0, "batch size must be positive");
         // At one state the kernel would draw among zero alternatives, which is
@@ -206,8 +231,14 @@ impl<const Q: usize> GpuPottsChain<Q> {
             sweeper: DeviceSweeper::build(
                 gpu,
                 SweepSetup {
-                    label: "potts checkerboard",
-                    shader: &shader_for(Q),
+                    label: match kernel {
+                        Kernel::Metropolis => "potts checkerboard",
+                        Kernel::HeatBath => "potts heat bath",
+                    },
+                    shader: &match kernel {
+                        Kernel::Metropolis => shader_for(SHADER_TEMPLATE, Q),
+                        Kernel::HeatBath => shader_for(HEAT_BATH_TEMPLATE, Q),
+                    },
                     vars_init: &labels,
                     table: &neighbors,
                     site_color: &site_color,
@@ -270,7 +301,17 @@ mod tests {
             "the start should carry a label an Ising field could not"
         );
 
-        let mut chain = GpuPottsChain::new(gpu, &lat, &Potts::symmetric(1.0), 0.5, 7, &start, 0, 1);
+        let mut chain = GpuPottsChain::new(
+            gpu,
+            &lat,
+            &Potts::symmetric(1.0),
+            0.5,
+            7,
+            &start,
+            0,
+            1,
+            Kernel::Metropolis,
+        );
         let got = chain.next().expect("open-ended stream yields");
 
         assert_eq!(got, start, "zero-sweep round-trip must be the identity");
@@ -298,8 +339,17 @@ mod tests {
 
         // beta = 0 accepts every proposal, so a sweep writes a fresh draw at
         // every site rather than mostly rejecting back to the current label.
-        let mut chain =
-            GpuPottsChain::new(gpu, &lat, &Potts::symmetric(1.0), 0.0, 99, &start, 1, 4);
+        let mut chain = GpuPottsChain::new(
+            gpu,
+            &lat,
+            &Potts::symmetric(1.0),
+            0.0,
+            99,
+            &start,
+            1,
+            4,
+            Kernel::Metropolis,
+        );
         for config in chain.by_ref().take(4) {
             let mut seen = [false; Q];
             for state in config.variables() {
@@ -326,7 +376,8 @@ mod tests {
         let model = Potts::<3>::symmetric(1.0);
         let start = Configuration::<3>::cold(&lat, Cell::Site);
 
-        let mut chain = GpuPottsChain::new(gpu, &lat, &model, 4.0, 99, &start, 5, 4);
+        let mut chain =
+            GpuPottsChain::new(gpu, &lat, &model, 4.0, 99, &start, 5, 4, Kernel::Metropolis);
         chain.advance(20);
         let mean = chain
             .take(8)
@@ -396,8 +447,17 @@ mod tests {
         let (e_gpu, m_gpu) = {
             let mut rng = RandRng::seed_from_u64(22);
             let start = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
-            let mut chain =
-                GpuPottsChain::new(gpu, &lat, &model, beta, 12345, &start, sweeps_between, 64);
+            let mut chain = GpuPottsChain::new(
+                gpu,
+                &lat,
+                &model,
+                beta,
+                12345,
+                &start,
+                sweeps_between,
+                64,
+                Kernel::Metropolis,
+            );
             chain.advance(thermalize);
             means(chain.take(n).collect())
         };
@@ -455,7 +515,17 @@ mod tests {
 
         let mut rng = RandRng::seed_from_u64(7);
         let start = Configuration::<Q>::hot(&lat, Cell::Site, &mut rng);
-        let mut chain = GpuPottsChain::new(gpu, &lat, &model, beta, 4242, &start, 2, 16);
+        let mut chain = GpuPottsChain::new(
+            gpu,
+            &lat,
+            &model,
+            beta,
+            4242,
+            &start,
+            2,
+            16,
+            Kernel::Metropolis,
+        );
         chain.advance(50);
 
         let samples = 64;
@@ -495,6 +565,16 @@ mod tests {
         };
         let lat = Lattice::new([4, 3]);
         let start = Configuration::<3>::cold(&lat, Cell::Site);
-        let _ = GpuPottsChain::new(gpu, &lat, &Potts::symmetric(1.0), 0.5, 1, &start, 1, 1);
+        let _ = GpuPottsChain::new(
+            gpu,
+            &lat,
+            &Potts::symmetric(1.0),
+            0.5,
+            1,
+            &start,
+            1,
+            1,
+            Kernel::Metropolis,
+        );
     }
 }

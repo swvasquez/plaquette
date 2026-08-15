@@ -331,6 +331,38 @@ mod tests {
         );
     }
 
+    /// Both heat bath kinds a site model can name survive the round trip.
+    ///
+    /// The names are what a config file is written against, so they are checked
+    /// literally rather than by `Debug`. The CPU kind is grade-neutral like
+    /// `metropolis` and the GPU kind colors sites like `gpu_site_checkerboard`,
+    /// which is what `validate` reads them as.
+    #[test]
+    fn parses_and_round_trips_the_heat_bath_updaters() {
+        for (kind, name) in [
+            (UpdaterKind::HeatBath, r#"updater = "heat_bath""#),
+            (
+                UpdaterKind::SiteCheckerboardHeatBath,
+                r#"updater = "site_checkerboard_heat_bath""#,
+            ),
+            (
+                UpdaterKind::GpuSiteCheckerboardHeatBath,
+                r#"updater = "gpu_site_checkerboard_heat_bath""#,
+            ),
+        ] {
+            let mut config = sample_config();
+            config.updater = kind;
+
+            let text = config.to_toml().unwrap();
+            assert!(text.contains(name), "{kind:?} should serialize as {name}");
+            assert_eq!(IsingRunConfig::parse(&text).unwrap().updater, kind);
+            assert!(
+                IsingRunConfig::parse(&text).unwrap().validate().is_ok(),
+                "{kind:?} should be accepted on a site model"
+            );
+        }
+    }
+
     #[test]
     fn parses_and_round_trips_the_gpu_checkerboard_updater() {
         let mut config = sample_config();
@@ -456,6 +488,7 @@ mod tests {
         for kind in [
             UpdaterKind::LinkCheckerboard,
             UpdaterKind::GpuLinkCheckerboard,
+            UpdaterKind::GpuLinkCheckerboardHeatBath,
         ] {
             let mut config = sample_config();
             config.updater = kind;

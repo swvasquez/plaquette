@@ -150,6 +150,24 @@ macro_rules! shader_source {
 }
 pub(crate) use shader_source;
 
+/// Which single-variable kernel a device checkerboard sweep runs.
+///
+/// The coloring is the same either way — it comes from the schedule, not from
+/// the kernel — so the two share every table, every dispatch and the whole of
+/// [`DeviceSweeper`]. What differs is the body of one thread, and each model
+/// backend keeps the two as separate shader sources rather than one source with
+/// a branch in it. See `docs/heat-bath.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Kernel {
+    /// Propose one alternative state and accept or reject it, the rule
+    /// `docs/metropolis.md` derives.
+    #[default]
+    Metropolis,
+    /// Price every state the variable could take and draw one from the
+    /// conditional they define, the rule `docs/heat-bath.md` describes.
+    HeatBath,
+}
+
 /// Bytes of push constants a sweep dispatch carries: `(sweep, color)` as two
 /// `u32`, matching the `Push` struct the checkerboard shaders declare. It is
 /// also the limit [`Gpu::new`] requests, so raising it means raising that too.

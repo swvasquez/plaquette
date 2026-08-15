@@ -12,7 +12,14 @@
 //! the `Params` layout, the neighbor table, and the two-color site
 //! checkerboard the shader implements.
 //!
-//! The coloring is compiled into the shader (the Ising `checkerboard.wgsl`), so this
+//! There are two shaders rather than one, `checkerboard.wgsl` and
+//! `heatbath.wgsl`, picked by the [`Kernel`] the caller names. They share the
+//! coloring, the tables and every dispatch, and differ only in what one thread
+//! does once it has the energy change in hand — the coloring belongs to the
+//! schedule, not to the kernel, so a heat bath sweep needs exactly the
+//! independence a Metropolis sweep needs.
+//!
+//! The coloring is compiled into the shader, so this
 //! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
 //! counter-based, keyed on `(seed, site, sweep)`, so the result is independent of
 //! GPU thread order — the property that lets the CPU site checkerboard serve as a
@@ -20,7 +27,7 @@
 
 use crate::configuration::{Cell, Configuration};
 use crate::device::{
-    DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors,
+    DeviceSweeper, Gpu, Kernel, SweepSetup, assert_even_extents, fold_seed, site_colors,
     site_neighbor_table, state_words,
 };
 use crate::lattice::Lattice;
@@ -30,8 +37,12 @@ use crate::lattice::Lattice;
 /// dimension as in six — so unlike the link coloring this count is a constant.
 const N_COLORS: u32 = 2;
 
-/// The compiled kernel: the shared preamble followed by the site checkerboard.
-const SHADER: &str = crate::device::shader_source!("checkerboard.wgsl");
+/// The compiled Metropolis kernel: the shared preamble followed by the site
+/// checkerboard.
+const METROPOLIS_SHADER: &str = crate::device::shader_source!("checkerboard.wgsl");
+
+/// The compiled heat bath kernel, over the same preamble and the same coloring.
+const HEAT_BATH_SHADER: &str = crate::device::shader_source!("heatbath.wgsl");
 
 /// The static run parameters uploaded to the shader's uniform buffer.
 ///
@@ -74,7 +85,9 @@ impl GpuIsingChain {
     /// same configuration can seed a CPU run too. `j`, `h`, `beta` are the Ising
     /// parameters; `seed` keys the counter-based RNG. `sweeps_between` is the
     /// decorrelation stride, and `batch` is how many samples are produced per
-    /// device round-trip.
+    /// device round-trip. `kernel` picks which single-variable rule a thread
+    /// runs; both sample the same distribution over the same coloring, so it is
+    /// a choice of algorithm and not of physics.
     ///
     /// Runs no sweeps — like [`Chain::new`](crate::chain::Chain::new), warmup is
     /// the caller's job via [`advance`](GpuIsingChain::advance).
@@ -94,6 +107,7 @@ impl GpuIsingChain {
         start: &Configuration<2>,
         sweeps_between: usize,
         batch: usize,
+        kernel: Kernel,
     ) -> Self {
         assert!(batch > 0, "batch size must be positive");
         // The shader indexes the neighbor table by site, so a link field would
@@ -132,8 +146,14 @@ impl GpuIsingChain {
             sweeper: DeviceSweeper::build(
                 gpu,
                 SweepSetup {
-                    label: "ising checkerboard",
-                    shader: SHADER,
+                    label: match kernel {
+                        Kernel::Metropolis => "ising checkerboard",
+                        Kernel::HeatBath => "ising heat bath",
+                    },
+                    shader: match kernel {
+                        Kernel::Metropolis => METROPOLIS_SHADER,
+                        Kernel::HeatBath => HEAT_BATH_SHADER,
+                    },
                     vars_init: &spins,
                     table: &neighbors,
                     site_color: &site_color,
@@ -199,7 +219,18 @@ mod tests {
         let mut rng = RandRng::seed_from_u64(0);
         let start = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
 
-        let mut chain = GpuIsingChain::new(gpu, &lat, 1.0, 0.0, 0.5, 7, &start, 0, 1);
+        let mut chain = GpuIsingChain::new(
+            gpu,
+            &lat,
+            1.0,
+            0.0,
+            0.5,
+            7,
+            &start,
+            0,
+            1,
+            Kernel::Metropolis,
+        );
         let got = chain.next().expect("open-ended stream yields");
 
         assert_eq!(got, start, "zero-sweep round-trip must be the identity");
@@ -235,7 +266,18 @@ mod tests {
         );
 
         let start = Configuration::<2>::cold(&lat, Cell::Site);
-        let mut chain = GpuIsingChain::new(gpu, &lat, 0.0, -1.0, 1.0, 7, &start, 1, 1);
+        let mut chain = GpuIsingChain::new(
+            gpu,
+            &lat,
+            0.0,
+            -1.0,
+            1.0,
+            7,
+            &start,
+            1,
+            1,
+            Kernel::Metropolis,
+        );
         let after = chain.next().expect("open-ended stream yields");
 
         let model = Ising::new(0.0, -1.0);
@@ -289,8 +331,18 @@ mod tests {
             let lat = Lattice::new(shape);
             let mut rng = RandRng::seed_from_u64(22);
             let start = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
-            let mut chain =
-                GpuIsingChain::new(gpu, &lat, j, h, beta, 12345, &start, sweeps_between, 64);
+            let mut chain = GpuIsingChain::new(
+                gpu,
+                &lat,
+                j,
+                h,
+                beta,
+                12345,
+                &start,
+                sweeps_between,
+                64,
+                Kernel::Metropolis,
+            );
             chain.advance(thermalize);
             let samples: Vec<_> = chain.take(n).map(|c| measure(&model, &lat, &c)).collect();
             mean_densities(&samples, n_sites)

@@ -323,6 +323,81 @@ fn the_backends_agree_in_two_dimensions() {
     assert_matches(&metropolis, &gpu, "gpu_site_checkerboard");
 }
 
+/// The heat bath agrees with Metropolis on both backends, at three states and
+/// again at four.
+///
+/// This is the model where the heat bath is more than a different ending. The
+/// Metropolis kernel commits to a candidate first and needs one signed counter;
+/// the heat bath commits to none and needs how many neighbors carry *each*
+/// label, then a weight per label to draw against. So the state count is what
+/// this has to vary: at `q = 3` the tally array holds three entries and at
+/// `q = 4` it holds four, and on the GPU that length is a token substituted into
+/// the shader source before it compiles. A kernel that sized it wrong, or that
+/// walked the cumulative sum off its end, would show up at one state count and
+/// not the other.
+///
+/// `beta` moves with `q` because `beta_c` does, and the agreement tests need to
+/// sit inside the ordered phase without saturating — `beta_c(4) ~ 1.1`, so the
+/// three-state coupling would be the wrong side of the transition there.
+#[test]
+fn the_heat_bath_agrees_with_metropolis() {
+    let shape = [16, 16];
+
+    let metropolis = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260920, "metropolis");
+    let heat_bath = run::<3, 2>(shape, 1.0, AGREEMENT_BETA, 20260921, "heat_bath");
+    report("2D q=3 metropolis", &metropolis);
+    report("2D q=3 heat_bath", &heat_bath);
+    assert_matches(&metropolis, &heat_bath, "heat_bath");
+
+    let beta_four = 1.2;
+    let metropolis_four = run::<4, 2>(shape, 1.0, beta_four, 20260922, "metropolis");
+    let heat_bath_four = run::<4, 2>(shape, 1.0, beta_four, 20260923, "heat_bath");
+    report("2D q=4 metropolis", &metropolis_four);
+    report("2D q=4 heat_bath", &heat_bath_four);
+    assert_matches(&metropolis_four, &heat_bath_four, "heat_bath");
+
+    // The device kernel's sequential reference: same coloring, same kernel, one
+    // site at a time. The GPU arms are compared against it rather than against
+    // Metropolis, so a coloring and a kernel that were each wrong in
+    // compensating ways could not pass.
+    let reference = run::<3, 2>(
+        shape,
+        1.0,
+        AGREEMENT_BETA,
+        20260926,
+        "site_checkerboard_heat_bath",
+    );
+    report("2D q=3 site_checkerboard_heat_bath", &reference);
+    assert_matches(&metropolis, &reference, "site_checkerboard_heat_bath");
+
+    if !gpu_available() {
+        return;
+    }
+    let gpu = run::<3, 2>(
+        shape,
+        1.0,
+        AGREEMENT_BETA,
+        20260924,
+        "gpu_site_checkerboard_heat_bath",
+    );
+    report("2D q=3 gpu_site_checkerboard_heat_bath", &gpu);
+    assert_matches(&reference, &gpu, "gpu_site_checkerboard_heat_bath");
+
+    let gpu_four = run::<4, 2>(
+        shape,
+        1.0,
+        beta_four,
+        20260925,
+        "gpu_site_checkerboard_heat_bath",
+    );
+    report("2D q=4 gpu_site_checkerboard_heat_bath", &gpu_four);
+    assert_matches(
+        &metropolis_four,
+        &gpu_four,
+        "gpu_site_checkerboard_heat_bath",
+    );
+}
+
 /// Three dimensions: the ordering contrast, and the same backend agreement.
 ///
 /// This is the arm that says the genericity over `D` is real rather than

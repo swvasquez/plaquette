@@ -10,6 +10,14 @@
 //! symmetric, and why the checkerboard reorderings still sample the Boltzmann
 //! distribution — is derived in `docs/metropolis.md`.
 //!
+//! [`HeatBath`] is the second kernel. Rather than proposing one alternative and
+//! accepting or rejecting it, it prices every state the variable could take and
+//! draws one from the conditional distribution they define, so the update lands
+//! somewhere every time. It reaches the same Boltzmann distribution and asks
+//! nothing of a model that [`Action::energy_delta`] does not already give, which
+//! is what lets one kernel serve every model here, on links as readily as on
+//! sites. `docs/heat-bath.md` describes it.
+//!
 //! [`SwendsenWang`] is the one updater here that is not a Metropolis schedule at
 //! all. It builds its own set of variables stochastically, changes all of them
 //! at once, and is accepted with probability one, so it shares no kernel with
@@ -80,6 +88,77 @@ fn step<const Q: usize, const D: usize>(
     }
 }
 
+/// The shared single-variable **heat bath** kernel, at a variable the schedule
+/// hands in: price all `Q` states the variable could take, then draw one from
+/// the conditional distribution they define, returning the realized `ΔE`
+/// (`0.0` when the draw lands back on the state it started from).
+///
+/// Where [`step`] proposes a single alternative and may reject it, this one
+/// lands somewhere every time, because the draw *is* the conditional and there
+/// is nothing left to accept against. It reads only [`Action::energy_delta`],
+/// so like [`step`] it is grade-neutral — `var` names a site on a site field
+/// and a link on a link field — and it carries no requirement on the model
+/// beyond `Q ≥ 2`. See `docs/heat-bath.md`.
+fn heat_bath_step<const Q: usize, const D: usize>(
+    config: &mut Configuration<Q>,
+    lattice: &Lattice<D>,
+    action: &impl Action<Q, D>,
+    var: usize,
+    beta: f64,
+    rng: &mut impl Rng,
+) -> f64 {
+    debug_assert!(Q >= 2, "a heat bath draw needs a state to choose between");
+
+    let current = config.peek(var);
+
+    // Every candidate priced against the *current* state, which is the common
+    // factor the conditional is defined up to: the terms of `H` that do not
+    // touch `var` cancel from the ratio, and what is left is one `ΔE` per state
+    // with the current state's own entry at zero. That entry is written as zero
+    // rather than asked for, which saves a call and does not rest on every
+    // model short-circuiting a poke to the state already there.
+    let deltas: [f64; Q] = std::array::from_fn(|index| {
+        let candidate = State::new(index).expect("index < Q");
+        if candidate == current {
+            0.0
+        } else {
+            action.energy_delta(lattice, config, var, candidate)
+        }
+    });
+
+    // Shifting by the smallest delta puts the largest exponent at zero, so the
+    // biggest weight is exactly one and the rest fall away below it. Without the
+    // shift a strongly downhill candidate at large β overflows `exp` while the
+    // current state sits at weight one, and the walk below would be comparing
+    // against an infinity.
+    let floor = deltas.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut weights = [0.0; Q];
+    let mut total = 0.0;
+    for (weight, &delta) in weights.iter_mut().zip(deltas.iter()) {
+        *weight = (-beta * (delta - floor)).exp();
+        total += *weight;
+    }
+
+    // One uniform per variable whatever the outcome, walked against the
+    // unnormalized cumulative sum so the weights never have to be divided
+    // through. The last state is the structural fallback rather than a case:
+    // it takes every target the earlier states do not claim, so rounding in
+    // `total` cannot leave the walk without an answer.
+    let target = rng.next_f64() * total;
+    let mut chosen = Q - 1;
+    let mut cumulative = 0.0;
+    for (index, &weight) in weights.iter().enumerate().take(Q - 1) {
+        cumulative += weight;
+        if target < cumulative {
+            chosen = index;
+            break;
+        }
+    }
+
+    config.poke(var, State::new(chosen).expect("chosen < Q"));
+    deltas[chosen]
+}
+
 /// The single-variable Metropolis update with a **random-site** schedule: a
 /// stateless unit struct, implementing [`Updater`] for any `Q` in any dimension.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,6 +178,48 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for Metropolis {
         for _ in 0..config.n_vars() {
             let site = rng.next_below(config.n_vars());
             net += step(config, lattice, action, site, beta, rng);
+        }
+        net
+    }
+}
+
+/// The single-variable heat bath update with a **random-variable** schedule: a
+/// stateless unit struct, implementing [`Updater`] for any `Q` in any dimension.
+///
+/// Deliberately the same schedule as [`Metropolis`], so that the two differ in
+/// the kernel they call and in nothing else. It states no model requirement of
+/// its own — no relabeling symmetry the way [`SwendsenWang`] needs one, and no
+/// cell kind — because the conditional it draws from is built out of
+/// [`Action::energy_delta`] and nothing else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeatBath;
+
+impl<const Q: usize, const D: usize> Updater<Q, D> for HeatBath {
+    /// `n_vars` single-variable heat bath draws at uniformly-random variables —
+    /// the same schedule a [`Metropolis`] sweep walks, and the same count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `Q` is below two, since the draw needs states to choose
+    /// between.
+    fn sweep(
+        &self,
+        config: &mut Configuration<Q>,
+        lattice: &Lattice<D>,
+        action: &impl Action<Q, D>,
+        beta: f64,
+        rng: &mut impl Rng,
+    ) -> f64 {
+        assert!(
+            Q >= 2,
+            "the heat bath draws a state from among the Q available, which needs \
+             at least two"
+        );
+
+        let mut net = 0.0;
+        for _ in 0..config.n_vars() {
+            let var = rng.next_below(config.n_vars());
+            net += heat_bath_step(config, lattice, action, var, beta, rng);
         }
         net
     }
@@ -207,6 +328,106 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for LinkCheckerboard {
                     if lattice.site_parity(site) == color {
                         let link = lattice.site_link(site, dir);
                         net += step(config, lattice, action, link, beta, rng);
+                    }
+                }
+            }
+        }
+        net
+    }
+}
+
+/// The single-variable heat bath under a **site checkerboard** schedule: a
+/// stateless unit struct, implementing [`Updater`] for any `Q` in any dimension.
+///
+/// The kernel-swapped twin of [`SiteCheckerboard`], walking the same colors in
+/// the same order. Its purpose is the same too, and is the reason it exists at
+/// all: it is the sequential reference for the parallel heat bath sweep the
+/// device runs, so `GpuSiteCheckerboardHeatBath` has a host counterpart to be checked
+/// against rather than only a Metropolis run at the same temperature.
+///
+/// The schedule is duplicated from [`SiteCheckerboard`] rather than shared,
+/// because the color walk and the kernel call are fused in both. Factoring the
+/// kernel out of the schedules would collapse this type and its link twin into
+/// the Metropolis ones; that is a change to the seam and is deliberately not
+/// made here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SiteCheckerboardHeatBath;
+
+impl<const Q: usize, const D: usize> Updater<Q, D> for SiteCheckerboardHeatBath {
+    /// Two color passes, together drawing once per site — the same schedule
+    /// [`SiteCheckerboard`] walks, with `heat_bath_step` in place of `step`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `Q` is below two.
+    fn sweep(
+        &self,
+        config: &mut Configuration<Q>,
+        lattice: &Lattice<D>,
+        action: &impl Action<Q, D>,
+        beta: f64,
+        rng: &mut impl Rng,
+    ) -> f64 {
+        assert!(
+            Q >= 2,
+            "the heat bath draws a state from among the Q available, which needs \
+             at least two"
+        );
+
+        let mut net = 0.0;
+        for color in [0, 1] {
+            for site in 0..config.n_vars() {
+                if lattice.site_parity(site) == color {
+                    net += heat_bath_step(config, lattice, action, site, beta, rng);
+                }
+            }
+        }
+        net
+    }
+}
+
+/// The single-variable heat bath under a **link checkerboard** schedule: a
+/// stateless unit struct, implementing [`Updater`] for any `Q` in any dimension.
+///
+/// The kernel-swapped twin of [`LinkCheckerboard`], walking the same `2D` colors
+/// in the same order, and the sequential reference for the device's
+/// `GpuLinkCheckerboardHeatBath` for the reason [`SiteCheckerboardHeatBath`] gives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkCheckerboardHeatBath;
+
+impl<const Q: usize, const D: usize> Updater<Q, D> for LinkCheckerboardHeatBath {
+    /// `2D` color passes — each direction in turn, even base sites then odd —
+    /// together drawing once per link.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config` is not a link field, or if `Q` is below two.
+    fn sweep(
+        &self,
+        config: &mut Configuration<Q>,
+        lattice: &Lattice<D>,
+        action: &impl Action<Q, D>,
+        beta: f64,
+        rng: &mut impl Rng,
+    ) -> f64 {
+        assert_eq!(
+            config.cell(),
+            Cell::Link,
+            "the link checkerboard schedules links, so the configuration must be a link field"
+        );
+        assert!(
+            Q >= 2,
+            "the heat bath draws a state from among the Q available, which needs \
+             at least two"
+        );
+
+        let mut net = 0.0;
+        for dir in 0..D {
+            for color in [0, 1] {
+                for site in 0..lattice.n_sites() {
+                    if lattice.site_parity(site) == color {
+                        let link = lattice.site_link(site, dir);
+                        net += heat_bath_step(config, lattice, action, link, beta, rng);
                     }
                 }
             }
@@ -347,6 +568,12 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for SwendsenWang {
 pub enum AnyUpdater {
     /// The random-site schedule, [`Metropolis`].
     Metropolis(Metropolis),
+    /// The random-variable heat bath, [`HeatBath`].
+    HeatBath(HeatBath),
+    /// The site checkerboard heat bath, [`SiteCheckerboardHeatBath`].
+    SiteCheckerboardHeatBath(SiteCheckerboardHeatBath),
+    /// The link checkerboard heat bath, [`LinkCheckerboardHeatBath`].
+    LinkCheckerboardHeatBath(LinkCheckerboardHeatBath),
     /// The site checkerboard schedule, [`SiteCheckerboard`].
     SiteCheckerboard(SiteCheckerboard),
     /// The link checkerboard schedule, [`LinkCheckerboard`].
@@ -366,6 +593,9 @@ impl<const Q: usize, const D: usize> Updater<Q, D> for AnyUpdater {
     ) -> f64 {
         match self {
             AnyUpdater::Metropolis(u) => u.sweep(config, lattice, action, beta, rng),
+            AnyUpdater::HeatBath(u) => u.sweep(config, lattice, action, beta, rng),
+            AnyUpdater::SiteCheckerboardHeatBath(u) => u.sweep(config, lattice, action, beta, rng),
+            AnyUpdater::LinkCheckerboardHeatBath(u) => u.sweep(config, lattice, action, beta, rng),
             AnyUpdater::SiteCheckerboard(u) => u.sweep(config, lattice, action, beta, rng),
             AnyUpdater::LinkCheckerboard(u) => u.sweep(config, lattice, action, beta, rng),
             AnyUpdater::SwendsenWang(u) => u.sweep(config, lattice, action, beta, rng),
@@ -1169,6 +1399,249 @@ mod tests {
             &action,
             1.0,
             &mut RandRng::seed_from_u64(1),
+        );
+    }
+
+    /// Both checkerboard heat baths satisfy the telescoping identity every
+    /// updater here is held to, on the grade each schedules.
+    ///
+    /// They exist to be the sequential reference for the device kernels, so what
+    /// matters most is that they are the *same* schedule as their Metropolis
+    /// twins: `site_checkerboard_sweep_attempts_every_site_once` and
+    /// `a_link_pass_covers_every_link_once` already pin those color walks, and
+    /// these were copied from them unchanged.
+    #[test]
+    fn the_checkerboard_heat_baths_net_delta_equals_the_energy_change() {
+        let lat = Lattice::new([4, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+        let mut rng = RandRng::seed_from_u64(31);
+        let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
+        let before = action.energy(&lat, &config);
+        let net = SiteCheckerboardHeatBath.sweep(&mut config, &lat, &action, 0.6, &mut rng);
+        assert_eq!(net, action.energy(&lat, &config) - before);
+        assert_ne!(net, 0.0, "a hot lattice should move");
+
+        let lat = Lattice::new([4, 4, 4]);
+        let action = Z2Gauge::new(1.0);
+        let mut rng = RandRng::seed_from_u64(32);
+        let mut config = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
+        let before = action.energy(&lat, &config);
+        let net = LinkCheckerboardHeatBath.sweep(&mut config, &lat, &action, 0.6, &mut rng);
+        assert_eq!(net, action.energy(&lat, &config) - before);
+        assert_ne!(net, 0.0, "a hot gauge field should move");
+    }
+
+    /// Each checkerboard heat bath draws exactly one uniform per variable and
+    /// picks nothing at random, the way its Metropolis twin does — the schedule
+    /// is deterministic and only the kernel consumes the generator.
+    #[test]
+    fn the_checkerboard_heat_baths_draw_one_uniform_per_variable() {
+        let lat = Lattice::new([4, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+        let mut config = Configuration::<3>::cold(&lat, Cell::Site);
+        let mut rng = Counting::new(RandRng::seed_from_u64(2));
+        SiteCheckerboardHeatBath.sweep(&mut config, &lat, &action, 0.7, &mut rng);
+        assert_eq!(rng.uniforms, lat.n_sites(), "one uniform per site");
+        assert_eq!(rng.below, 0, "the site checkerboard picks no random sites");
+
+        let lat = Lattice::new([4, 4, 4]);
+        let action = Z2Gauge::new(1.0);
+        let mut config = Configuration::<2>::cold(&lat, Cell::Link);
+        let mut rng = Counting::new(RandRng::seed_from_u64(2));
+        LinkCheckerboardHeatBath.sweep(&mut config, &lat, &action, 0.7, &mut rng);
+        assert_eq!(rng.uniforms, lat.n_links(), "one uniform per link");
+        assert_eq!(
+            rng.below, 0,
+            "the link checkerboard picks nothing at random"
+        );
+    }
+
+    /// A site field is rejected by the link checkerboard heat bath, the same
+    /// guard its Metropolis twin carries.
+    #[test]
+    #[should_panic(expected = "must be a link field")]
+    fn the_link_checkerboard_heat_bath_rejects_a_site_field() {
+        let lat = Lattice::new([4, 4, 4]);
+        let action = Z2Gauge::new(1.0);
+        let mut config = Configuration::<2>::cold(&lat, Cell::Site);
+        LinkCheckerboardHeatBath.sweep(
+            &mut config,
+            &lat,
+            &action,
+            1.0,
+            &mut RandRng::seed_from_u64(1),
+        );
+    }
+
+    /// At `beta = 0` the conditional is flat, so the draw is uniform over the
+    /// `Q` states — the infinite-temperature limit, and the case that catches a
+    /// cumulative walk skewed toward either end of the weight array.
+    #[test]
+    fn at_zero_beta_the_heat_bath_draws_uniformly() {
+        const Q: usize = 4;
+        const DRAWS: usize = 4_000;
+
+        let lat = Lattice::new([4, 4]);
+        let action = Potts::<Q>::symmetric(1.0);
+        let mut config = Configuration::<Q>::cold(&lat, Cell::Site);
+        let mut rng = RandRng::seed_from_u64(11);
+
+        let mut seen = [0usize; Q];
+        for _ in 0..DRAWS {
+            heat_bath_step(&mut config, &lat, &action, 0, 0.0, &mut rng);
+            seen[config.peek(0).index()] += 1;
+        }
+
+        for (index, &count) in seen.iter().enumerate() {
+            // Four states share 4000 draws, so each expects 1000 with a standard
+            // deviation near 27; this window is wide enough to be seed-robust
+            // and far too narrow for a walk that favored a state to pass.
+            assert!(
+                (870..1_130).contains(&count),
+                "state {index}: {count} of {DRAWS}"
+            );
+        }
+    }
+
+    /// At large `beta` the draw collapses onto the lowest-energy candidate, and
+    /// the arithmetic that gets there stays finite. Both halves matter: the
+    /// shift by the smallest delta is the only thing keeping `exp` from
+    /// overflowing on a strongly downhill state, and an infinite weight would
+    /// poison the cumulative walk rather than fail outright.
+    #[test]
+    fn at_large_beta_the_heat_bath_lands_on_the_lowest_energy_state() {
+        let lat = Lattice::new([4, 4]);
+        let action = Potts::<3>::symmetric(1.0);
+        let mut config = Configuration::<3>::cold(&lat, Cell::Site);
+        // One site moved off the aligned background, so agreeing with its four
+        // neighbors again is the unique lowest-energy candidate.
+        config.poke(0, State::new(2).unwrap());
+        let mut rng = RandRng::seed_from_u64(3);
+
+        for draw in 0..32 {
+            let delta = heat_bath_step(&mut config, &lat, &action, 0, 500.0, &mut rng);
+            assert!(
+                delta.is_finite(),
+                "draw {draw}: the weights must stay finite"
+            );
+            assert_eq!(
+                config.peek(0).index(),
+                0,
+                "draw {draw}: the aligned state should win at large beta"
+            );
+        }
+    }
+
+    /// A heat bath sweep draws exactly one uniform per variable whatever the
+    /// configuration. That is the contract that separates it from a Metropolis
+    /// sweep, whose downhill moves skip the accept draw and so leave the stream
+    /// position depending on the state.
+    #[test]
+    fn a_heat_bath_sweep_draws_one_uniform_per_variable() {
+        let lat = Lattice::new([4, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+        let n = lat.n_sites();
+
+        // Both a cold start, where every step is uphill, and a hot one, where
+        // the mix varies site to site: the count must not notice the difference.
+        for cold in [true, false] {
+            let mut setup = RandRng::seed_from_u64(8);
+            let mut config = if cold {
+                Configuration::<3>::cold(&lat, Cell::Site)
+            } else {
+                Configuration::<3>::hot(&lat, Cell::Site, &mut setup)
+            };
+
+            let mut rng = Counting::new(RandRng::seed_from_u64(2));
+            HeatBath.sweep(&mut config, &lat, &action, 0.7, &mut rng);
+
+            assert_eq!(rng.uniforms, n, "cold = {cold}: one uniform per variable");
+            assert_eq!(rng.below, n, "cold = {cold}: one variable pick per step");
+        }
+    }
+
+    /// The net `ΔE` a heat bath sweep returns equals `H(after) − H(before)`, the
+    /// invariant every updater here is held to. The couplings are integer-valued
+    /// so the comparison is bit-exact.
+    #[test]
+    fn heat_bath_sweep_net_delta_equals_energy_change() {
+        let lat = Lattice::new([4, 6]);
+        let action = Potts::<3>::symmetric(1.0);
+        let mut rng = RandRng::seed_from_u64(7);
+        let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
+        let before = action.energy(&lat, &config);
+
+        let net = HeatBath.sweep(&mut config, &lat, &action, 0.6, &mut rng);
+
+        assert_eq!(net, action.energy(&lat, &config) - before);
+        assert_ne!(net, 0.0, "a hot lattice should move");
+    }
+
+    /// The same kernel runs on a link field with no change of its own, which is
+    /// what grade-neutrality buys: the gauge model is served by the code that
+    /// serves the spin models, and not by a variant of it.
+    #[test]
+    fn the_heat_bath_runs_on_a_link_field() {
+        let lat = Lattice::new([4, 4, 4]);
+        let action = Z2Gauge::new(1.0);
+        let mut rng = RandRng::seed_from_u64(5);
+        let mut config = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
+        let before = action.energy(&lat, &config);
+
+        let net = HeatBath.sweep(&mut config, &lat, &action, 0.6, &mut rng);
+
+        assert_eq!(net, action.energy(&lat, &config) - before);
+        assert_ne!(net, 0.0, "a hot gauge field should move");
+    }
+
+    /// A model whose energy is not invariant under relabeling runs here without
+    /// comment, which is the whole difference from the cluster update:
+    /// `SwendsenWang::for_model` refuses an Ising field outright, while the heat
+    /// bath simply carries it in `ΔE` and tilts the conditional.
+    #[test]
+    fn the_heat_bath_accepts_a_model_with_a_field() {
+        let lat = Lattice::new([6, 6]);
+        let action = Ising::new(1.0, 0.25); // exactly representable; sums stay exact
+        let mut rng = RandRng::seed_from_u64(4);
+        let mut config = Configuration::<2>::hot(&lat, Cell::Site, &mut rng);
+        let before = action.energy(&lat, &config);
+
+        let net = HeatBath.sweep(&mut config, &lat, &action, 0.5, &mut rng);
+
+        assert_eq!(net, action.energy(&lat, &config) - before);
+    }
+
+    /// The heat bath reaches the same distribution the Metropolis schedule
+    /// does, on a lattice small enough that the mean order parameter is a sharp
+    /// enough statistic to separate a mispriced conditional.
+    ///
+    /// A sign error in the exponent — the likeliest implementation mistake, and
+    /// one that leaves every other test here passing — moves this far outside
+    /// the window.
+    #[test]
+    fn the_heat_bath_matches_the_metropolis_distribution() {
+        fn mean_order<U: Updater<3, 2>>(updater: &U, seed: u64) -> f64 {
+            let lat = Lattice::new([8, 8]);
+            let action = Potts::<3>::symmetric(1.0);
+            let mut rng = RandRng::seed_from_u64(seed);
+            let mut config = Configuration::<3>::hot(&lat, Cell::Site, &mut rng);
+            let mut chain =
+                crate::chain::Chain::new(&mut config, &lat, &action, updater, 1.1, &mut rng, 2);
+            chain.advance(200);
+            let n = 400;
+            chain
+                .take(n)
+                .map(|c| action.order_parameter(&c))
+                .sum::<f64>()
+                / n as f64
+        }
+
+        let metropolis = mean_order(&Metropolis, 17);
+        let heat_bath = mean_order(&HeatBath, 23);
+
+        assert!(
+            (metropolis - heat_bath).abs() < 0.04,
+            "mean order parameter: metropolis {metropolis}, heat bath {heat_bath}"
         );
     }
 }

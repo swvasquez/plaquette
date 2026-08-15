@@ -15,18 +15,25 @@ cargo build
 
 ## Models
 
-`plaquette` currently implements three models:
+`plaquette` currently implements several models, each with multiple update
+implementations across the CPU and GPU:
 
-| Model    | Dimension | Implementation     | Device   |
-| -------- | --------- | ------------------ | -------- |
-| Ising    | D ≥ 1     | Metropolis         | CPU      |
-| Ising    | D ≥ 1     | Site checkerboard  | CPU, GPU |
-| Ising    | D ≥ 1     | Swendsen–Wang      | CPU, GPU |
-| Potts    | D ≥ 1     | Metropolis         | CPU      |
-| Potts    | D ≥ 1     | Site checkerboard  | CPU, GPU |
-| Potts    | D ≥ 1     | Swendsen–Wang      | CPU, GPU |
-| Z2 gauge | D ≥ 2     | Metropolis         | CPU      |
-| Z2 gauge | D ≥ 2     | Link checkerboard  | CPU, GPU |
+| Model    | Dimension | Implementation                | Device   |
+| -------- | --------- | ----------------------------- | -------- |
+| Ising    | D ≥ 1     | Metropolis                    | CPU      |
+| Ising    | D ≥ 1     | Metropolis, site checkerboard | CPU, GPU |
+| Ising    | D ≥ 1     | Heat bath                     | CPU      |
+| Ising    | D ≥ 1     | Heat bath, site checkerboard  | CPU, GPU |
+| Ising    | D ≥ 1     | Swendsen–Wang                 | CPU, GPU |
+| Potts    | D ≥ 1     | Metropolis                    | CPU      |
+| Potts    | D ≥ 1     | Metropolis, site checkerboard | CPU, GPU |
+| Potts    | D ≥ 1     | Heat bath                     | CPU      |
+| Potts    | D ≥ 1     | Heat bath, site checkerboard  | CPU, GPU |
+| Potts    | D ≥ 1     | Swendsen–Wang                 | CPU, GPU |
+| Z2 gauge | D ≥ 2     | Metropolis                    | CPU      |
+| Z2 gauge | D ≥ 2     | Metropolis, link checkerboard | CPU, GPU |
+| Z2 gauge | D ≥ 2     | Heat bath                     | CPU      |
+| Z2 gauge | D ≥ 2     | Heat bath, link checkerboard  | CPU, GPU |
 
 Note that memory use grows quickly with the dimension: the lattice stores about
 `48 * D * (D - 1)` bytes of precomputed geometry per site. In 16 GB that allows a lattice of size 360³ sites in three dimensions, but only 5¹⁰ sites in ten.

@@ -423,6 +423,60 @@ fn gpu_link_checkerboard_matches_metropolis() {
     assert_matches(&metropolis, &checkerboard, "gpu_link_checkerboard");
 }
 
+/// CPU heat bath: drawing the link from its conditional rather than proposing a
+/// flip measures the same physics, through the whole public stack.
+///
+/// The comparison is the statistical one `assert_matches` makes, and it has to
+/// be: the heat bath consumes one uniform per link where Metropolis skips the
+/// draw on a downhill move, so the two run on different streams however they are
+/// seeded. What it is sensitive to is the exponent. A sign error or a stray
+/// factor of two in the conditional would move the mean plaquette far outside
+/// four combined standard errors while leaving the chain looking perfectly
+/// healthy.
+#[test]
+fn cpu_heat_bath_matches_metropolis() {
+    let metropolis = run([6, 6, 6], AGREEMENT_BETA, 20260805, "metropolis");
+    let heat_bath = run([6, 6, 6], AGREEMENT_BETA, 20260806, "heat_bath");
+    report("metropolis", &metropolis);
+    report("heat_bath", &heat_bath);
+
+    assert_matches(&metropolis, &heat_bath, "heat_bath");
+}
+
+/// GPU link heat bath: the device kernel measures it too, on the same coloring
+/// the Metropolis kernel uses.
+///
+/// This is the arm that says the heat bath shader is right about the staple sum
+/// as well as about the conditional, and that the coloring carries over: a heat
+/// bath thread conditions on a frozen neighborhood, so a color that was not
+/// actually independent would show up here as a shifted mean plaquette rather
+/// than as a crash.
+#[test]
+fn gpu_link_checkerboard_heat_bath_matches_metropolis() {
+    if !gpu_available() {
+        return;
+    }
+    // Compared against its sequential reference — the same coloring and the same
+    // kernel, one link at a time — rather than against Metropolis, so a coloring
+    // and a kernel that were each wrong in compensating ways could not pass.
+    let reference = run(
+        [6, 6, 6],
+        AGREEMENT_BETA,
+        20260807,
+        "link_checkerboard_heat_bath",
+    );
+    let gpu = run(
+        [6, 6, 6],
+        AGREEMENT_BETA,
+        20260808,
+        "gpu_link_checkerboard_heat_bath",
+    );
+    report("link_checkerboard_heat_bath", &reference);
+    report("gpu_link_checkerboard_heat_bath", &gpu);
+
+    assert_matches(&reference, &gpu, "gpu_link_checkerboard_heat_bath");
+}
+
 /// The backends agree at a dimension the GPU kernel was not written for.
 ///
 /// This is the arm that would catch a mismatch between the dimension the host

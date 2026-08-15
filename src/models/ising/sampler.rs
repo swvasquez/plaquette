@@ -28,14 +28,16 @@
 use crate::chain::Chain;
 use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
-use crate::device::{GPU_BATCH, Gpu};
+use crate::device::{GPU_BATCH, Gpu, Kernel};
 use crate::gpu_cluster::GpuClusterChain;
 use crate::lattice::Lattice;
 use crate::models::ising::Ising;
 use crate::models::ising::gpu::GpuIsingChain;
 use crate::models::ising::run_config::IsingRunConfig;
 use crate::rng::RandRng;
-use crate::updater::{AnyUpdater, Metropolis, SiteCheckerboard, SwendsenWang};
+use crate::updater::{
+    AnyUpdater, HeatBath, Metropolis, SiteCheckerboard, SiteCheckerboardHeatBath, SwendsenWang,
+};
 
 /// The evolving state an [`IsingSampler`] streams from, one variant per backend.
 ///
@@ -134,7 +136,15 @@ impl<const D: usize> IsingSampler<D> {
         // A `match` over the device kinds rather than a chain of `if let`s: there
         // are two of them now, and they build different types.
         let engine = match config.updater {
-            UpdaterKind::GpuSiteCheckerboard => {
+            // The two device checkerboard kinds share everything but the kernel
+            // a thread runs, so they share an arm rather than repeating the
+            // construction.
+            kind
+            @ (UpdaterKind::GpuSiteCheckerboard | UpdaterKind::GpuSiteCheckerboardHeatBath) => {
+                let kernel = match kind {
+                    UpdaterKind::GpuSiteCheckerboardHeatBath => Kernel::HeatBath,
+                    _ => Kernel::Metropolis,
+                };
                 let mut chain = GpuIsingChain::new(
                     require_adapter(),
                     &lattice,
@@ -145,6 +155,7 @@ impl<const D: usize> IsingSampler<D> {
                     &state,
                     sweeps_between,
                     GPU_BATCH,
+                    kernel,
                 );
                 chain.advance(config.thermalize);
                 Engine::Gpu(Box::new(chain))
@@ -165,7 +176,11 @@ impl<const D: usize> IsingSampler<D> {
             on_cpu => {
                 let updater = match on_cpu {
                     UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
+                    UpdaterKind::HeatBath => AnyUpdater::HeatBath(HeatBath),
                     UpdaterKind::SiteCheckerboard => AnyUpdater::SiteCheckerboard(SiteCheckerboard),
+                    UpdaterKind::SiteCheckerboardHeatBath => {
+                        AnyUpdater::SiteCheckerboardHeatBath(SiteCheckerboardHeatBath)
+                    }
                     UpdaterKind::SwendsenWang => {
                         AnyUpdater::SwendsenWang(SwendsenWang::for_model(&model))
                     }

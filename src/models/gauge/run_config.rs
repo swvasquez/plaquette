@@ -399,6 +399,7 @@ mod tests {
         for kind in [
             UpdaterKind::SiteCheckerboard,
             UpdaterKind::GpuSiteCheckerboard,
+            UpdaterKind::GpuSiteCheckerboardHeatBath,
             UpdaterKind::SwendsenWang,
             UpdaterKind::GpuSwendsenWang,
         ] {
@@ -418,6 +419,15 @@ mod tests {
         for (kind, rendered) in [
             (UpdaterKind::LinkCheckerboard, "link_checkerboard"),
             (UpdaterKind::GpuLinkCheckerboard, "gpu_link_checkerboard"),
+            (UpdaterKind::HeatBath, "heat_bath"),
+            (
+                UpdaterKind::LinkCheckerboardHeatBath,
+                "link_checkerboard_heat_bath",
+            ),
+            (
+                UpdaterKind::GpuLinkCheckerboardHeatBath,
+                "gpu_link_checkerboard_heat_bath",
+            ),
         ] {
             let mut config = sample_config();
             config.updater = kind;

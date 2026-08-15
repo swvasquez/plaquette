@@ -54,13 +54,15 @@
 use crate::chain::Chain;
 use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
-use crate::device::{GPU_BATCH, Gpu};
+use crate::device::{GPU_BATCH, Gpu, Kernel};
 use crate::lattice::Lattice;
 use crate::models::gauge::Z2Gauge;
 use crate::models::gauge::gpu::GpuGaugeChain;
 use crate::models::gauge::run_config::GaugeRunConfig;
 use crate::rng::RandRng;
-use crate::updater::{AnyUpdater, LinkCheckerboard, Metropolis};
+use crate::updater::{
+    AnyUpdater, HeatBath, LinkCheckerboard, LinkCheckerboardHeatBath, Metropolis,
+};
 
 /// The evolving state a [`GaugeSampler`] streams from, one variant per backend.
 ///
@@ -148,7 +150,14 @@ impl<const D: usize> GaugeSampler<D> {
     pub fn new(config: &GaugeRunConfig) -> Self {
         let (lattice, model, mut rng, mut state, beta) = config.build::<D>();
 
-        let engine = if let UpdaterKind::GpuLinkCheckerboard = config.updater {
+        // The two device kinds differ only in the kernel a thread runs — the link
+        // coloring and every table are the same — so one arm builds both.
+        let device_kernel = match config.updater {
+            UpdaterKind::GpuLinkCheckerboard => Some(Kernel::Metropolis),
+            UpdaterKind::GpuLinkCheckerboardHeatBath => Some(Kernel::HeatBath),
+            _ => None,
+        };
+        let engine = if let Some(kernel) = device_kernel {
             let gpu = Gpu::new().expect("GPU backend requested but no GPU adapter is available");
             let mut chain = GpuGaugeChain::new(
                 gpu,
@@ -159,13 +168,18 @@ impl<const D: usize> GaugeSampler<D> {
                 &state,
                 config.sweeps_between,
                 GPU_BATCH,
+                kernel,
             );
             chain.advance(config.thermalize);
             Engine::Gpu(Box::new(chain))
         } else {
             let updater = match config.updater {
                 UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
+                UpdaterKind::HeatBath => AnyUpdater::HeatBath(HeatBath),
                 UpdaterKind::LinkCheckerboard => AnyUpdater::LinkCheckerboard(LinkCheckerboard),
+                UpdaterKind::LinkCheckerboardHeatBath => {
+                    AnyUpdater::LinkCheckerboardHeatBath(LinkCheckerboardHeatBath)
+                }
                 other => unreachable!("rejected by GaugeRunConfig::validate: {other:?}"),
             };
             // Warm up a transient chain over the loose pieces, then stow them.

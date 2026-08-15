@@ -49,14 +49,16 @@
 use crate::chain::Chain;
 use crate::config::UpdaterKind;
 use crate::configuration::Configuration;
-use crate::device::{GPU_BATCH, Gpu};
+use crate::device::{GPU_BATCH, Gpu, Kernel};
 use crate::gpu_cluster::GpuClusterChain;
 use crate::lattice::Lattice;
 use crate::models::potts::Potts;
 use crate::models::potts::gpu::GpuPottsChain;
 use crate::models::potts::run_config::PottsRunConfig;
 use crate::rng::RandRng;
-use crate::updater::{AnyUpdater, Metropolis, SiteCheckerboard, SwendsenWang};
+use crate::updater::{
+    AnyUpdater, HeatBath, Metropolis, SiteCheckerboard, SiteCheckerboardHeatBath, SwendsenWang,
+};
 
 /// The evolving state a [`PottsSampler`] streams from, one variant per backend.
 ///
@@ -156,7 +158,15 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
         // A `match` over the device kinds rather than a chain of `if let`s: there
         // are two of them now, and they build different types.
         let engine = match config.updater {
-            UpdaterKind::GpuSiteCheckerboard => {
+            // The two device checkerboard kinds share everything but the kernel
+            // a thread runs, so they share an arm rather than repeating the
+            // construction.
+            kind
+            @ (UpdaterKind::GpuSiteCheckerboard | UpdaterKind::GpuSiteCheckerboardHeatBath) => {
+                let kernel = match kind {
+                    UpdaterKind::GpuSiteCheckerboardHeatBath => Kernel::HeatBath,
+                    _ => Kernel::Metropolis,
+                };
                 let mut chain = GpuPottsChain::new(
                     require_adapter(),
                     &lattice,
@@ -166,6 +176,7 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
                     &state,
                     sweeps_between,
                     GPU_BATCH,
+                    kernel,
                 );
                 chain.advance(config.thermalize);
                 Engine::Gpu(Box::new(chain))
@@ -186,7 +197,11 @@ impl<const Q: usize, const D: usize> PottsSampler<Q, D> {
             on_cpu => {
                 let updater = match on_cpu {
                     UpdaterKind::Metropolis => AnyUpdater::Metropolis(Metropolis),
+                    UpdaterKind::HeatBath => AnyUpdater::HeatBath(HeatBath),
                     UpdaterKind::SiteCheckerboard => AnyUpdater::SiteCheckerboard(SiteCheckerboard),
+                    UpdaterKind::SiteCheckerboardHeatBath => {
+                        AnyUpdater::SiteCheckerboardHeatBath(SiteCheckerboardHeatBath)
+                    }
                     UpdaterKind::SwendsenWang => {
                         AnyUpdater::SwendsenWang(SwendsenWang::for_model(&model))
                     }

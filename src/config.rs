@@ -68,12 +68,30 @@ pub enum UpdaterKind {
     /// Single-variable-flip Metropolis on the CPU
     /// ([`Metropolis`](crate::updater::Metropolis)).
     Metropolis,
+    /// Single-variable heat bath on the CPU
+    /// ([`HeatBath`](crate::updater::HeatBath)).
+    ///
+    /// The same random-variable schedule as
+    /// [`Metropolis`](UpdaterKind::Metropolis), differing only in the kernel, so
+    /// it is grade-neutral for the same reason and every model can name it.
+    HeatBath,
     /// Metropolis under a site checkerboard schedule, on the CPU
     /// ([`SiteCheckerboard`](crate::updater::SiteCheckerboard)).
     SiteCheckerboard,
     /// Metropolis under a link checkerboard schedule, on the CPU
     /// ([`LinkCheckerboard`](crate::updater::LinkCheckerboard)).
     LinkCheckerboard,
+    /// The heat bath under a site checkerboard schedule, on the CPU
+    /// ([`SiteCheckerboardHeatBath`](crate::updater::SiteCheckerboardHeatBath)).
+    ///
+    /// The sequential reference for
+    /// [`GpuSiteCheckerboardHeatBath`](UpdaterKind::GpuSiteCheckerboardHeatBath), which is why it is
+    /// nameable rather than being only a test fixture.
+    SiteCheckerboardHeatBath,
+    /// The heat bath under a link checkerboard schedule, on the CPU
+    /// ([`LinkCheckerboardHeatBath`](crate::updater::LinkCheckerboardHeatBath)),
+    /// the reference for [`GpuLinkCheckerboardHeatBath`](UpdaterKind::GpuLinkCheckerboardHeatBath).
+    LinkCheckerboardHeatBath,
     /// The site checkerboard schedule run on the GPU
     /// ([`GpuIsingChain`](crate::models::ising::gpu::GpuIsingChain)). Backend
     /// and schedule are one variant, so a GPU run cannot be named without the
@@ -84,6 +102,20 @@ pub enum UpdaterKind {
     /// the same reason as
     /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard).
     GpuLinkCheckerboard,
+    /// The site checkerboard schedule run on the GPU with the heat bath kernel
+    /// ([`Kernel::HeatBath`](crate::device::Kernel::HeatBath)).
+    ///
+    /// Its own variant rather than a kernel axis on
+    /// [`GpuSiteCheckerboard`](UpdaterKind::GpuSiteCheckerboard), because this
+    /// enum is what a config file names and a flat closed set is what makes that
+    /// choice recordable. The coloring and its even-extent requirement are
+    /// identical; only the body of a thread differs. Its sequential reference is
+    /// [`SiteCheckerboardHeatBath`](UpdaterKind::SiteCheckerboardHeatBath).
+    GpuSiteCheckerboardHeatBath,
+    /// The link checkerboard schedule run on the GPU with the heat bath kernel,
+    /// the gauge counterpart of
+    /// [`GpuSiteCheckerboardHeatBath`](UpdaterKind::GpuSiteCheckerboardHeatBath).
+    GpuLinkCheckerboardHeatBath,
     /// The Swendsen–Wang cluster update on the CPU
     /// ([`SwendsenWang`](crate::updater::SwendsenWang)).
     ///
@@ -112,12 +144,17 @@ impl UpdaterKind {
     /// variant must answer it to compile rather than the two rules drifting.
     pub fn cell(self) -> Option<Cell> {
         match self {
-            UpdaterKind::Metropolis => None,
+            UpdaterKind::Metropolis | UpdaterKind::HeatBath => None,
             UpdaterKind::SiteCheckerboard
+            | UpdaterKind::SiteCheckerboardHeatBath
             | UpdaterKind::GpuSiteCheckerboard
+            | UpdaterKind::GpuSiteCheckerboardHeatBath
             | UpdaterKind::SwendsenWang
             | UpdaterKind::GpuSwendsenWang => Some(Cell::Site),
-            UpdaterKind::LinkCheckerboard | UpdaterKind::GpuLinkCheckerboard => Some(Cell::Link),
+            UpdaterKind::LinkCheckerboard
+            | UpdaterKind::LinkCheckerboardHeatBath
+            | UpdaterKind::GpuLinkCheckerboard
+            | UpdaterKind::GpuLinkCheckerboardHeatBath => Some(Cell::Link),
         }
     }
 
@@ -155,7 +192,10 @@ impl UpdaterKind {
     pub fn colors_in_parallel(self) -> bool {
         matches!(
             self,
-            UpdaterKind::GpuSiteCheckerboard | UpdaterKind::GpuLinkCheckerboard
+            UpdaterKind::GpuSiteCheckerboard
+                | UpdaterKind::GpuLinkCheckerboard
+                | UpdaterKind::GpuSiteCheckerboardHeatBath
+                | UpdaterKind::GpuLinkCheckerboardHeatBath
         )
     }
 }

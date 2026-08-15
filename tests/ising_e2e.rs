@@ -139,6 +139,117 @@ fn gpu_checkerboard_orders_at_low_temperature() {
     );
 }
 
+/// The heat bath agrees with Metropolis on both backends, through the whole
+/// public stack.
+///
+/// `beta = 0.5` is the same window
+/// [`the_cluster_update_agrees_with_metropolis`] uses and for the same reason:
+/// `|m|` there is about 0.91 and still moving, so an effective coupling that
+/// came out half or double this would land at 0.25 or 1.0 and miss the window
+/// by more than ten times its width. That is the failure a heat bath is most
+/// likely to have — the conditional is one rearrangement away from a sign error
+/// or a factor of two in the exponent, and a chain carrying either still runs,
+/// still orders, and still looks healthy.
+///
+/// The GPU arm is what makes the shader's correctness a claim about the stack
+/// rather than about a kernel: the config names `gpu_site_checkerboard_heat_bath`,
+/// `IsingSampler` builds the device chain with `Kernel::HeatBath`, and the same
+/// comparison decides it. The three runs cannot be compared bit-for-bit —
+/// Metropolis draws a site index per step, the CPU heat bath draws one uniform
+/// per variable, and the GPU keys a counter on `(seed, site, sweep)` — so the
+/// agreement is distributional.
+#[test]
+fn the_heat_bath_agrees_with_metropolis() {
+    let shape = [16, 16];
+    let beta = 0.5;
+
+    let metropolis = mean_abs_magnetization(shape, beta, "metropolis");
+    let heat_bath = mean_abs_magnetization(shape, beta, "heat_bath");
+    assert!(
+        (0.7..0.99).contains(&metropolis),
+        "the reference should be ordered without saturating: {metropolis:.4}"
+    );
+    assert!(
+        (metropolis - heat_bath).abs() < 0.05,
+        "heat bath disagrees on the CPU: metropolis {metropolis:.4} vs heat bath {heat_bath:.4}"
+    );
+
+    // The device kernel's sequential reference: the same coloring, the same
+    // kernel, run one site at a time. Comparing the GPU against this rather than
+    // only against Metropolis is what makes the check specific to the shader —
+    // agreement with a differently-scheduled run leaves open that the coloring
+    // and the kernel are each wrong in compensating ways.
+    let cpu_checkerboard = mean_abs_magnetization(shape, beta, "site_checkerboard_heat_bath");
+    assert!(
+        (metropolis - cpu_checkerboard).abs() < 0.05,
+        "the checkerboard heat bath disagrees: metropolis {metropolis:.4} \
+         vs checkerboard {cpu_checkerboard:.4}"
+    );
+
+    if !gpu_available() {
+        return;
+    }
+    let gpu = mean_abs_magnetization(shape, beta, "gpu_site_checkerboard_heat_bath");
+    assert!(
+        (cpu_checkerboard - gpu).abs() < 0.05,
+        "the GPU heat bath disagrees with its sequential reference: \
+         checkerboard {cpu_checkerboard:.4} vs gpu {gpu:.4}"
+    );
+}
+
+/// The heat bath runs a model the cluster update refuses.
+///
+/// An external field breaks the relabeling symmetry Swendsen–Wang needs, so a
+/// cluster run of this config fails to load at all. The heat bath carries the
+/// field in `ΔE` and needs no symmetry, and both backends have to agree with
+/// Metropolis on where the field drives the magnetization. On the GPU that also
+/// exercises the one term of the kernel the field-free tests leave at zero.
+#[test]
+fn the_heat_bath_runs_with_an_external_field() {
+    let shape = [16, 16];
+    let beta = 0.3;
+    let h = 0.3;
+
+    let with_field = |updater: &str| {
+        // `run_toml` leaves `h` at its default of zero, so the field is added
+        // here rather than by substitution.
+        let text = format!("{}h = {h}\n", run_toml(shape, beta, updater, N_SAMPLES));
+        let config = IsingRunConfig::parse(&text).expect("run config should parse");
+        let mut sampler = IsingSampler::<2>::new(&config);
+        let lattice = sampler.lattice();
+        let model = sampler.model();
+        let n_sites = lattice.n_sites() as f64;
+        sampler
+            .samples()
+            .take(N_SAMPLES)
+            .map(|c| measure(&model, &lattice, &c).magnetization / n_sites)
+            .sum::<f64>()
+            / N_SAMPLES as f64
+    };
+
+    // The signed mean, not |m|: the field picks the well, so the sign is the
+    // part a mishandled offset term would get wrong.
+    let metropolis = with_field("metropolis");
+    let heat_bath = with_field("heat_bath");
+    assert!(
+        (0.4..0.95).contains(&metropolis),
+        "the field should magnetize the reference without saturating it: {metropolis:.4}"
+    );
+    assert!(
+        (metropolis - heat_bath).abs() < 0.05,
+        "heat bath disagrees under a field: metropolis {metropolis:.4} vs heat bath {heat_bath:.4}"
+    );
+
+    if !gpu_available() {
+        return;
+    }
+    let gpu = with_field("gpu_site_checkerboard_heat_bath");
+    assert!(
+        (metropolis - gpu).abs() < 0.05,
+        "GPU heat bath disagrees under a field: metropolis {metropolis:.4} vs gpu {gpu:.4}"
+    );
+}
+
 /// One dimension, against the exact finite-`N` correlator.
 ///
 /// This is the only test in the suite comparing a sampled chain to a closed

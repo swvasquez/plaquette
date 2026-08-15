@@ -19,6 +19,7 @@
 use std::time::Instant;
 
 use plaquette::chain::Chain;
+use plaquette::device::Kernel;
 use plaquette::models::ising::GpuIsingChain;
 use plaquette::models::ising::Ising;
 use plaquette::rng::RandRng;
@@ -80,7 +81,18 @@ fn gpu_mups(l: usize, sweeps: usize) -> f64 {
     let lattice = Lattice::new([l, l]);
     let mut rng = RandRng::seed_from_u64(2);
     let start = Configuration::<2>::hot(&lattice, Cell::Site, &mut rng);
-    let mut chain = GpuIsingChain::new(gpu, &lattice, J, H, BETA, 12345, &start, 1, 1);
+    let mut chain = GpuIsingChain::new(
+        gpu,
+        &lattice,
+        J,
+        H,
+        BETA,
+        12345,
+        &start,
+        1,
+        1,
+        Kernel::Metropolis,
+    );
 
     // Warmup pays the one-time device/pipeline cost; `next` forces a sync.
     chain.advance(50);

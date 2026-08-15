@@ -13,7 +13,12 @@
 //! about the gauge model: the `Params` layout, the staple table, and the
 //! `2D`-color link checkerboard the shader implements.
 //!
-//! The coloring is compiled into the shader (`checkerboard.wgsl`), so this
+//! There are two shaders rather than one, `checkerboard.wgsl` and
+//! `heatbath.wgsl`, picked by the [`Kernel`] the caller names. They share the
+//! `2D`-color link coloring, the staple table and every dispatch, differing only
+//! in what a thread does once the staple sum is in hand.
+//!
+//! The coloring is compiled into the shader, so this
 //! does not use the [`Updater`](crate::updater::Updater) seam. Its randomness is
 //! counter-based, keyed on `(seed, link, sweep)`, so the result is independent of
 //! GPU thread order — the property that lets the CPU link checkerboard serve as a
@@ -22,14 +27,18 @@
 
 use crate::configuration::{Cell, Configuration};
 use crate::device::{
-    DeviceSweeper, Gpu, SweepSetup, assert_even_extents, fold_seed, site_colors, state_words,
+    DeviceSweeper, Gpu, Kernel, SweepSetup, assert_even_extents, fold_seed, site_colors,
+    state_words,
 };
 use crate::lattice::Lattice;
 use crate::models::gauge::Z2Gauge;
 use crate::updater::LinkCheckerboard;
 
 /// The compiled kernel: the shared preamble followed by the link checkerboard.
-const SHADER: &str = crate::device::shader_source!("checkerboard.wgsl");
+const METROPOLIS_SHADER: &str = crate::device::shader_source!("checkerboard.wgsl");
+
+/// The compiled heat bath kernel, over the same preamble and the same coloring.
+const HEAT_BATH_SHADER: &str = crate::device::shader_source!("heatbath.wgsl");
 
 /// The static run parameters uploaded to the shader's uniform buffer.
 ///
@@ -88,6 +97,7 @@ impl GpuGaugeChain {
         start: &Configuration<2>,
         sweeps_between: usize,
         batch: usize,
+        kernel: Kernel,
     ) -> Self {
         assert!(batch > 0, "batch size must be positive");
         // Below two dimensions there is no direction pair, so the lattice has no
@@ -139,8 +149,14 @@ impl GpuGaugeChain {
             sweeper: DeviceSweeper::build(
                 gpu,
                 SweepSetup {
-                    label: "gauge checkerboard",
-                    shader: SHADER,
+                    label: match kernel {
+                        Kernel::Metropolis => "gauge checkerboard",
+                        Kernel::HeatBath => "gauge heat bath",
+                    },
+                    shader: match kernel {
+                        Kernel::Metropolis => METROPOLIS_SHADER,
+                        Kernel::HeatBath => HEAT_BATH_SHADER,
+                    },
                     vars_init: &links,
                     table: &staples,
                     site_color: &site_color,
@@ -205,7 +221,8 @@ mod tests {
             let mut rng = RandRng::seed_from_u64(0);
             let start = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
 
-            let mut chain = GpuGaugeChain::new(gpu, &lat, 1.0, 0.5, 7, &start, 0, 1);
+            let mut chain =
+                GpuGaugeChain::new(gpu, &lat, 1.0, 0.5, 7, &start, 0, 1, Kernel::Metropolis);
             let got = chain.next().expect("open-ended stream yields");
 
             assert_eq!(
@@ -242,7 +259,8 @@ mod tests {
         let start = Configuration::<2>::cold(&lat, Cell::Link);
         let n_plaquettes = lat.n_plaquettes() as f64;
 
-        let mut chain = GpuGaugeChain::new(gpu, &lat, 1.0, 4.0, 99, &start, 5, 4);
+        let mut chain =
+            GpuGaugeChain::new(gpu, &lat, 1.0, 4.0, 99, &start, 5, 4, Kernel::Metropolis);
         chain.advance(20);
         let mean = chain
             .take(8)
@@ -303,8 +321,17 @@ mod tests {
         let gpu_mean = {
             let mut rng = RandRng::seed_from_u64(22);
             let start = Configuration::<2>::hot(&lat, Cell::Link, &mut rng);
-            let mut chain =
-                GpuGaugeChain::new(gpu, &lat, j, beta, 12345, &start, sweeps_between, 64);
+            let mut chain = GpuGaugeChain::new(
+                gpu,
+                &lat,
+                j,
+                beta,
+                12345,
+                &start,
+                sweeps_between,
+                64,
+                Kernel::Metropolis,
+            );
             chain.advance(thermalize);
             mean_plaquette(chain.take(n).collect())
         };
@@ -338,6 +365,6 @@ mod tests {
         };
         let lat = Lattice::new([4, 3, 4]);
         let start = Configuration::<2>::cold(&lat, Cell::Link);
-        let _ = GpuGaugeChain::new(gpu, &lat, 1.0, 0.5, 1, &start, 1, 1);
+        let _ = GpuGaugeChain::new(gpu, &lat, 1.0, 0.5, 1, &start, 1, 1, Kernel::Metropolis);
     }
 }
